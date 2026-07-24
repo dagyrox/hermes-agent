@@ -129,6 +129,11 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         assert resp.status == 200
         data = await resp.json()
 
+    assert data["object"] == "hermes.api_server.capabilities"
+    assert data["platform"] == "hermes-agent"
+    assert data["revision"] == "occ.conversation_gateway.h1-h2-h3.v1"
+    assert len(data["build_id"]) == 40
+    assert int(data["build_id"], 16) >= 0
     features = data["features"]
     assert features["session_resources"] is True
     assert features["session_chat"] is True
