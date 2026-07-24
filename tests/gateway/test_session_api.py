@@ -164,6 +164,9 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "owner_max_chars": 256,
         "source": "api_server",
     }
+    assert data["session_turns"]["input_text"]["max_chars"] == 65_536
+    assert data["session_turns"]["inline_images"]["max_frames"] == 256
+    assert data["session_turns"]["transport"]["max_request_bytes"] == 16 * 1024 * 1024
 
 
 @pytest.mark.asyncio

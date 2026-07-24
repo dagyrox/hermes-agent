@@ -36,6 +36,7 @@ MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_INLINE_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 16_384
 MAX_IMAGE_PIXELS = 40_000_000
+MAX_IMAGE_FRAMES = 256
 MAX_SLACK_ROUTED_CHARS = 3_000
 INLINE_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 _TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -130,7 +131,7 @@ def _validated_image_dimensions(decoded: bytes, declared_mime: str) -> tuple[int
                 if image.format != expected_format or image.size != (width, height):
                     raise TurnInputError("Image payload changed during verification")
                 frame_count = int(getattr(image, "n_frames", 1) or 1)
-                if frame_count > 256:
+                if frame_count > MAX_IMAGE_FRAMES:
                     raise TurnInputError("Image frame count exceeds the safe limit")
                 for frame in range(frame_count):
                     image.seek(frame)
@@ -1399,6 +1400,7 @@ SESSION_TURN_CAPABILITIES = {
         "max_bytes_total": MAX_INLINE_IMAGE_TOTAL_BYTES,
         "max_dimension": MAX_IMAGE_DIMENSION,
         "max_pixels": MAX_IMAGE_PIXELS,
+        "max_frames": MAX_IMAGE_FRAMES,
         "mime_types": sorted(INLINE_IMAGE_MIME_TYPES),
     },
     "cancellation": "cooperative_truthful",
