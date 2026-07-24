@@ -6,6 +6,8 @@ import io
 import json
 import sqlite3
 import struct
+import threading
+import time
 import zlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -293,6 +295,63 @@ def _app(adapter: APIServerAdapter) -> web.Application:
         if "/api/sessions/{session_id}/turns" in path or path == "/v1/capabilities":
             app.router.add_route(method, path, handler)
     return app
+
+
+@pytest.mark.asyncio
+async def test_image_normalization_never_blocks_aiohttp_event_loop(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = AsyncMock(
+        return_value=({"final_response": "done", "messages": []}, {})
+    )
+    original = session_turns.normalize_turn_payload
+    started = threading.Event()
+    release = threading.Event()
+    worker_threads: list[int] = []
+
+    def deliberately_slow_normalize(body):
+        worker_threads.append(threading.get_ident())
+        started.set()
+        release.wait(timeout=1.0)
+        return original(body)
+
+    monkeypatch.setattr(
+        session_turns, "normalize_turn_payload", deliberately_slow_normalize
+    )
+    fallback = threading.Timer(1.0, release.set)
+    fallback.start()
+    loop_thread = threading.get_ident()
+    started_at = time.perf_counter()
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            submit_task = asyncio.create_task(
+                client.post(
+                    "/api/sessions/s1/turns",
+                    headers={"Idempotency-Key": "turn-responsive"},
+                    json=_payload(),
+                )
+            )
+            while not started.is_set():
+                await asyncio.sleep(0)
+            capability = await asyncio.wait_for(
+                client.get("/v1/capabilities"), timeout=0.4
+            )
+            assert capability.status == 200
+            assert time.perf_counter() - started_at < 0.5
+            release.set()
+            submitted = await asyncio.wait_for(submit_task, timeout=1.0)
+            assert submitted.status == 202
+            await adapter._session_turn_service.wait_for_turn("turn-responsive")
+    finally:
+        release.set()
+        fallback.cancel()
+
+    assert len(worker_threads) >= 2
+    assert all(thread_id != loop_thread for thread_id in worker_threads)
 
 
 @pytest.mark.asyncio
@@ -707,6 +766,10 @@ def test_capabilities_advertise_durable_turn_contract():
             assert turns["events"]["resumable"] is True
             assert turns["events"]["last_event_id"] is True
             assert turns["safe_progress"] is True
+            assert turns["input_text"] == {"max_chars": 65_536}
+            from gateway.platforms.api_server import MAX_REQUEST_BYTES
+
+            assert turns["transport"] == {"max_request_bytes": MAX_REQUEST_BYTES}
             assert turns["inline_images"]["remote_urls"] is False
             assert turns["inline_images"]["max_dimension"] == 16_384
             assert turns["inline_images"]["max_pixels"] == 40_000_000

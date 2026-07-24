@@ -868,7 +868,10 @@ class SessionTurnService:
             return session_err
         try:
             turn_id = self._turn_id(request, body)
-            payload = normalize_turn_payload(body)
+            # Full payload validation decodes every inline image with Pillow.
+            # That CPU-heavy work must never run on the aiohttp event loop —
+            # a single large submit would freeze every in-flight request.
+            payload = await asyncio.to_thread(normalize_turn_payload, body)
         except TurnInputError as exc:
             return _error(str(exc), "invalid_turn", 400)
 
@@ -1388,6 +1391,7 @@ SESSION_TURN_CAPABILITIES = {
     "routing": "session_origin_only",
     "events": {"transport": "sse", "resumable": True, "last_event_id": True, "sequence": True},
     "safe_progress": True,
+    "input_text": {"max_chars": MAX_INPUT_TEXT_LENGTH},
     "inline_images": {
         "remote_urls": False,
         "max_count": MAX_INLINE_IMAGES,

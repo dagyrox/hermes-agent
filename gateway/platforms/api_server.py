@@ -103,13 +103,15 @@ from gateway.session_execution_lease import (
     SessionExecutionLease,
 )
 from gateway.platforms.session_turns import (
+    MAX_INLINE_IMAGE_TOTAL_BYTES,
+    MAX_INPUT_TEXT_LENGTH,
     SESSION_TURN_CAPABILITIES,
     SessionTurnService,
 )
 
 logger = logging.getLogger(__name__)
 
-OCC_CAPABILITY_REVISION = "occ.conversation_gateway.h1-h2-h3.v1"
+OCC_CAPABILITY_REVISION = "occ.conversation_gateway.h1-h2-h3.v2"
 
 
 def _capability_build_id() -> str:
@@ -166,7 +168,18 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+# The transport cap must truthfully carry the advertised durable-turn payload:
+# the 10 MiB decoded inline-image budget grows by 4/3 as base64 on the wire,
+# plus the 64 KiB text cap at up to 6 bytes per JSON-escaped character, plus
+# JSON framing. 16 MiB bounds that envelope with headroom and still keeps a
+# hard, safe ceiling; long agent conversations with tool calls also fit.
+_TURN_WIRE_ENVELOPE_BYTES = (
+    ((MAX_INLINE_IMAGE_TOTAL_BYTES + 2) // 3) * 4  # base64 of decoded budget
+    + 6 * MAX_INPUT_TEXT_LENGTH                    # worst-case escaped text
+    + 64 * 1024                                    # JSON framing / headers slack
+)
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+assert _TURN_WIRE_ENVELOPE_BYTES <= MAX_REQUEST_BYTES
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -1664,6 +1677,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
+    _MAX_OWNER_USER_ID_LEN = 256
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -2187,12 +2201,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
+                "session_create_owner_bound": True,
                 "session_search": session_search_available,
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "session_fork_anchored_preserve_source": True,
                 "session_fork_anchor_field": "anchor_message_id",
+                "session_fork_user_message_anchor": True,
                 "durable_session_turns": True,
                 "conversation_turn_contract": "h1",
                 "durable_turn_idempotency": True,
@@ -2231,7 +2247,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     if session_search_available
                     else {}
                 ),
-                "session_create": {"method": "POST", "path": "/api/sessions"},
+                "session_create": {
+                    "method": "POST",
+                    "path": "/api/sessions",
+                    "owner_field": "user_id",
+                    "owner_max_chars": self._MAX_OWNER_USER_ID_LEN,
+                    "source": "api_server",
+                },
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
@@ -2250,7 +2272,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_turn_stop": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/stop"},
                 "conversation_turn_deliver": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/deliver"},
             },
-            "session_turns": SESSION_TURN_CAPABILITIES,
+            "session_turns": {
+                **SESSION_TURN_CAPABILITIES,
+                "transport": {"max_request_bytes": MAX_REQUEST_BYTES},
+            },
         })
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
@@ -2836,6 +2861,24 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(session_id) > self._MAX_SESSION_HEADER_LEN:
             return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
 
+        user_id = body.get("user_id")
+        if user_id is not None:
+            if not isinstance(user_id, str):
+                return web.json_response(
+                    _openai_error("user_id must be a string", code="invalid_user_id"),
+                    status=400,
+                )
+            user_id = user_id.strip()
+            if (
+                not user_id
+                or len(user_id) > self._MAX_OWNER_USER_ID_LEN
+                or re.search(r'[\x00-\x1f\x7f]', user_id)
+            ):
+                return web.json_response(
+                    _openai_error("Invalid user_id", code="invalid_user_id"),
+                    status=400,
+                )
+
         model = body.get("model") or self._model_name
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
@@ -2857,11 +2900,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 import time as _time
                 conn.execute(
                     """INSERT INTO sessions (
-                       id, source, model, system_prompt, started_at
-                    ) VALUES (?, ?, ?, ?, ?)""",
+                       id, source, user_id, model, system_prompt, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         "api_server",
+                        user_id,
                         str(model) if model else None,
                         system_prompt,
                         _time.time(),
@@ -2888,7 +2932,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ).fetchone()
                 return (dict(session_row) if session_row else {
                     "id": session_id, "source": "api_server",
-                    "model": model, "title": title,
+                    "user_id": user_id, "model": model, "title": title,
                 }), None
             return db._execute_write(_atomic)
 
@@ -3113,7 +3157,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if result == "unsafe_anchor":
             return web.json_response(
                 _openai_error(
-                    "anchor_message_id is not a completed assistant response safe for continuation",
+                    "anchor_message_id is not a canonical user message or "
+                    "completed assistant response safe for continuation",
                     code="unsafe_anchor",
                 ),
                 status=400,

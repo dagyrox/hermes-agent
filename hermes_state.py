@@ -3663,7 +3663,8 @@ class SessionDB:
 
             prefix = conn.execute(
                 "SELECT id, role, content, api_content, tool_call_id, tool_calls, "
-                "finish_reason FROM messages "
+                "finish_reason, reasoning, reasoning_content, reasoning_details, "
+                "codex_reasoning_items FROM messages "
                 "WHERE session_id = ? AND active = 1 AND id <= ? ORDER BY id",
                 (source_session_id, anchor_message_id),
             ).fetchall()
@@ -3683,6 +3684,22 @@ class SessionDB:
                 }:
                     return True
                 return any(_contains_tool_block(item) for item in value.values())
+
+            def _contains_reasoning_block(value: Any) -> bool:
+                if isinstance(value, list):
+                    return any(_contains_reasoning_block(item) for item in value)
+                if not isinstance(value, dict):
+                    return False
+                if value.get("type") in {"reasoning", "thinking", "redacted_thinking"}:
+                    return True
+                return any(
+                    (
+                        key in {"reasoning", "reasoning_content", "thinking"}
+                        and item not in (None, "", [], {})
+                    )
+                    or _contains_reasoning_block(item)
+                    for key, item in value.items()
+                )
 
             def _normalized_finish_reason(value: Any) -> Optional[str]:
                 if not isinstance(value, str) or not value.strip():
@@ -3704,17 +3721,6 @@ class SessionDB:
                 "function_call",
                 "function_calls",
             }
-            assistant_rows = [row for row in prefix if row["role"] == "assistant"]
-            # Legacy compatibility is intentionally transcript-wide and narrow:
-            # only a canonical prefix whose assistant rows ALL predate finish
-            # metadata may infer completion from a strict user/assistant boundary.
-            # Once any assistant row has finish evidence, every assistant row in
-            # the prefix must carry recognized evidence appropriate to its shape.
-            legacy_without_finish_metadata = bool(assistant_rows) and all(
-                _normalized_finish_reason(row["finish_reason"]) is None
-                for row in assistant_rows
-            )
-
             def _parse_arguments(value: Any) -> bool:
                 if isinstance(value, dict):
                     return True
@@ -3779,17 +3785,11 @@ class SessionDB:
                     if not isinstance(tool_calls, list):
                         return "unsafe_anchor", None
                     if not tool_calls:
-                        if (
-                            not legacy_without_finish_metadata
-                            and finish_reason not in complete_finish_reasons
-                        ):
+                        if finish_reason not in complete_finish_reasons:
                             return "unsafe_anchor", None
                         expected = "user"
                         continue
-                    if (
-                        not legacy_without_finish_metadata
-                        and finish_reason not in tool_finish_reasons
-                    ):
+                    if finish_reason not in tool_finish_reasons:
                         return "unsafe_anchor", None
                     validated_ids = [_validated_tool_call(call) for call in tool_calls]
                     if any(call_id is None for call_id in validated_ids):
@@ -3813,10 +3813,42 @@ class SessionDB:
                 if not pending_call_ids:
                     expected = "assistant"
 
-            # Only a completed final assistant response is a continuation-safe
-            # anchor. A user, tool, partial assistant, or unresolved tool group
-            # can never be repaired after the fork.
-            if expected != "user" or pending_call_ids:
+            # Two anchor shapes are continuation-safe: a fully completed final
+            # assistant response (the walk expects a new user turn next), or a
+            # canonical user message the child will answer next (the walk
+            # expects an assistant turn and the anchor row itself is that user
+            # message). A tool row, partial/truncated assistant, or unresolved
+            # tool group can never be repaired after the fork — when the walk
+            # ends expecting "assistant" after a resolved tool group, the
+            # anchor row is a tool result, so the role check rejects it.
+            if pending_call_ids:
+                return "unsafe_anchor", None
+            anchor_is_completed_assistant = expected == "user"
+            anchor_is_canonical_user = (
+                expected == "assistant" and prefix[-1]["role"] == "user"
+            )
+            anchor = prefix[-1]
+            if anchor_is_canonical_user:
+                anchor_content = self._decode_content(anchor["content"])
+                if anchor_content in (None, "", [], {}):
+                    return "unsafe_anchor", None
+            reasoning_values = (
+                anchor["reasoning"],
+                anchor["reasoning_content"],
+                anchor["reasoning_details"],
+                anchor["codex_reasoning_items"],
+            )
+            if (
+                any(
+                    value not in (None, "", "[]", "{}")
+                    for value in reasoning_values
+                )
+                or _contains_reasoning_block(
+                    self._decode_content(anchor["content"])
+                )
+            ):
+                return "unsafe_anchor", None
+            if not (anchor_is_completed_assistant or anchor_is_canonical_user):
                 return "unsafe_anchor", None
 
             if conn.execute(
