@@ -2327,6 +2327,24 @@ class SlackAdapter(BasePlatformAdapter):
         return ""
 
     @staticmethod
+    def _metadata_client_msg_id(metadata: Optional[Dict[str, Any]]) -> str:
+        """Return a validated Slack client_msg_id for transport deduplication.
+
+        Slack accepts UUID-shaped client ids on chat.postMessage. Keep this an
+        adapter-only routing field: invalid/browser-controlled values are
+        dropped rather than forwarded to Slack.
+        """
+        if not metadata:
+            return ""
+        value = str(metadata.get("client_msg_id") or "").strip().lower()
+        if re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            value,
+        ):
+            return value
+        return ""
+
+    @staticmethod
     def _workspace_event_id(team_id: str, event_id: str) -> str:
         """Scope Slack's workspace-local event/message ids for deduplication."""
         return f"{team_id}:{event_id}" if team_id else str(event_id)
@@ -2537,15 +2555,18 @@ class SlackAdapter(BasePlatformAdapter):
             # 3000-char limits, so those fall back to plain text. The ``text``
             # field is always kept as the notification/accessibility fallback.
             blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+            client_msg_id = self._metadata_client_msg_id(metadata)
 
             for i, chunk in enumerate(chunks):
-                kwargs = {
+                kwargs: Dict[str, Any] = {
                     "channel": chat_id,
                     "text": chunk,
                     "mrkdwn": True,
                 }
                 if blocks and i == 0:
                     kwargs["blocks"] = blocks
+                if client_msg_id and i == 0:
+                    kwargs["client_msg_id"] = client_msg_id
                 if thread_ts:
                     kwargs["thread_ts"] = thread_ts
                     # Only broadcast the first chunk of the first reply

@@ -42,7 +42,9 @@ def _runner(monkeypatch, tmp_path):
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._handle_active_session_busy_message = AsyncMock(return_value=False)
-    runner._session_db = MagicMock()
+    # These focused response-filter tests use the mocked SessionStore below;
+    # they do not provide a canonical SessionDB execution-lease backend.
+    runner._session_db = None
     runner._recover_telegram_topic_thread_id = lambda _source: None
     runner._cache_session_source = lambda _key, _source: None
     runner._is_session_run_current = lambda _key, _gen: True
@@ -163,3 +165,21 @@ async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path
     )
 
     assert response == text
+
+
+@pytest.mark.asyncio
+async def test_real_gateway_history_failure_stops_before_agent_execution(monkeypatch, tmp_path):
+    from gateway.session import CanonicalSessionHistoryError
+
+    runner = _runner(monkeypatch, tmp_path)
+    runner.session_store.load_transcript.side_effect = CanonicalSessionHistoryError(
+        "sensitive sqlite detail"
+    )
+    runner._run_agent = AsyncMock()
+
+    with pytest.raises(CanonicalSessionHistoryError):
+        await runner._handle_message_with_agent(
+            _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+        )
+
+    runner._run_agent.assert_not_awaited()

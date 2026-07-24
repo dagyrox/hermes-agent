@@ -1157,6 +1157,10 @@ class AsyncSessionStore:
         return _offloaded
 
 
+class CanonicalSessionHistoryError(RuntimeError):
+    """The canonical SessionDB transcript could not be read safely."""
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
@@ -3112,7 +3116,7 @@ class SessionStore:
         migrated (their DB row holds the full message history).
         """
         if not self._db:
-            return []
+            raise CanonicalSessionHistoryError("session database unavailable")
         try:
             # repair_alternation: this load feeds LIVE REPLAY. A durable
             # user;user wedge (e.g. a turn that persisted no assistant row)
@@ -3121,9 +3125,9 @@ class SessionStore:
             return self._db.get_messages_as_conversation(
                 session_id, repair_alternation=True
             )
-        except Exception as e:
-            logger.debug("Could not load messages from DB: %s", e)
-            return []
+        except Exception as exc:
+            logger.warning("Could not load canonical SessionDB history for %s", session_id)
+            raise CanonicalSessionHistoryError("session history unavailable") from exc
 
     def rewind_session(self, session_id: str, n: int = 1) -> Optional[Dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete, keeping rows for audit.
