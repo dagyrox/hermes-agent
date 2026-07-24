@@ -9,6 +9,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
+- GET  /api/sessions/search        — owner-scoped full-text message search
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
@@ -40,10 +41,14 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import errno
 import hashlib
 import hmac
+import html
 import json
+import unicodedata
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
@@ -91,6 +96,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from hermes_state import SessionSearchUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -1563,6 +1569,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
+            # Static route must precede /api/sessions/{session_id}.
+            ("GET", "/api/sessions/search", self._handle_session_search),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
@@ -2081,6 +2089,25 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        session_db = await self._ensure_session_db_async()
+        session_search_available = bool(
+            self._search_cursor_signing_key()
+            and session_db
+            and await asyncio.to_thread(session_db.session_search_available)
+        )
+        session_search_endpoint = {
+            "method": "GET",
+            "path": "/api/sessions/search",
+            "owner_scope": ["user_id", "source"],
+            "pagination": {
+                "type": "cursor",
+                "parameter": "cursor",
+                "ordering": ["timestamp_desc", "message_id_desc"],
+                "snapshot": "message_id_high_water",
+                "cursor": "hmac_authenticated_v2",
+            },
+        }
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -2112,6 +2139,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
+                "session_search": session_search_available,
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
@@ -2141,6 +2169,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
+                **(
+                    {"session_search": session_search_endpoint}
+                    if session_search_available
+                    else {}
+                ),
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
@@ -2353,6 +2386,340 @@ class APIServerAdapter(BasePlatformAdapter):
             "limit": limit,
             "offset": offset,
             "has_more": len(sessions) == limit,
+        })
+
+    _SEARCH_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+        r"(?i)(?<![A-Za-z0-9_.-])"
+        r"(?P<key>[A-Za-z0-9_.-]{0,64}"
+        r"(?:api[_. -]?key|access[_. -]?token|refresh[_. -]?token|token|secret|"
+        r"password|passwd|credential|authorization|auth)"
+        r"[A-Za-z0-9_.-]{0,64})"
+        r"(?P<sep>\s*(?:=|:)\s*)"
+        r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&]+)"
+    )
+    _SEARCH_AUTHORIZATION_RE = re.compile(
+        r"(?i)((?:proxy-)?authorization\s*:\s*)"
+        r"(?:(?:bearer|basic|token|digest)\s+)?[^\s,;]+"
+    )
+    _SEARCH_BEARER_RE = re.compile(
+        r"(?i)(?<![A-Za-z0-9_-])(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"
+    )
+    _SEARCH_JWT_RE = re.compile(
+        r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}"
+    )
+    _SEARCH_REDACTED_SENTINEL_RE = re.compile(r"«redacted(?::[^»]*)?»")
+    _SEARCH_CURSOR_VERSION = 2
+    _SEARCH_CURSOR_TTL_SECONDS = 900
+
+    @classmethod
+    def _redact_search_content(cls, value: Any) -> str:
+        """Completely remove credential values before any snippet slicing."""
+        text = str(value or "")
+        text = cls._SEARCH_AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
+        text = cls._SEARCH_BEARER_RE.sub(r"\1[REDACTED]", text)
+        text = cls._SEARCH_JWT_RE.sub("[REDACTED]", text)
+        text = cls._SEARCH_CREDENTIAL_ASSIGNMENT_RE.sub(
+            lambda match: f"{match.group('key')}{match.group('sep')}[REDACTED]",
+            text,
+        )
+        redacted = redact_sensitive_text(
+            text,
+            force=True,
+            file_read=True,
+            redact_url_credentials=True,
+        )
+        return cls._SEARCH_REDACTED_SENTINEL_RE.sub("[REDACTED]", redacted)
+
+    @classmethod
+    def _bounded_search_snippet(cls, value: Any, maximum: int = 480) -> str:
+        """Return one globally redacted, query-independent prefix per message."""
+        redacted = " ".join(cls._redact_search_content(value).split())
+        if not redacted or maximum < 2:
+            return "…"
+
+        # Never return a complete body, even when it is shorter than the bound.
+        excerpt = redacted[:192]
+        if len(excerpt) == len(redacted):
+            excerpt = excerpt[:-1]
+        if not excerpt:
+            return "…"
+
+        output: List[str] = []
+        used = 0
+        for character in excerpt:
+            escaped = html.escape(character, quote=True)
+            if used + len(escaped) > maximum - 1:
+                break
+            output.append(escaped)
+            used += len(escaped)
+        return "".join(output) + "…"
+
+    @staticmethod
+    def _search_cursor_scope_hash(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _normalize_search_query(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).split())
+
+    def _search_cursor_signing_key(self) -> Optional[bytes]:
+        if not self._api_key:
+            return None
+        return hmac.new(
+            self._api_key.encode("utf-8"),
+            b"hermes-session-search-cursor:v2",
+            hashlib.sha256,
+        ).digest()
+
+    def _encode_search_cursor(
+        self,
+        *,
+        query: str,
+        user_id: str,
+        source: str,
+        snapshot_message_id: int,
+        boundary: Dict[str, Any],
+    ) -> str:
+        signing_key = self._search_cursor_signing_key()
+        if signing_key is None:
+            raise SessionSearchUnavailable("Session search cursor signing unavailable")
+        now = int(time.time())
+        payload = {
+            "v": self._SEARCH_CURSOR_VERSION,
+            "q": self._search_cursor_scope_hash(self._normalize_search_query(query)),
+            "u": self._search_cursor_scope_hash(user_id),
+            "s": self._search_cursor_scope_hash(source),
+            "h": snapshot_message_id,
+            "t": boundary["timestamp"],
+            "i": int(boundary["message_id"]),
+            "e": now + self._SEARCH_CURSOR_TTL_SECONDS,
+        }
+        encoded_payload = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        ).rstrip(b"=")
+        signature = base64.urlsafe_b64encode(
+            hmac.new(signing_key, encoded_payload, hashlib.sha256).digest()
+        ).rstrip(b"=")
+        return f"{encoded_payload.decode('ascii')}.{signature.decode('ascii')}"
+
+    def _decode_search_cursor(
+        self,
+        value: str,
+        *,
+        query: str,
+        user_id: str,
+        source: str,
+    ) -> Optional[Dict[str, Any]]:
+        signing_key = self._search_cursor_signing_key()
+        if (
+            signing_key is None
+            or not value
+            or len(value) > 2_048
+            or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value)
+        ):
+            return None
+        try:
+            encoded_payload, encoded_signature = value.split(".", 1)
+            signature = base64.b64decode(
+                encoded_signature + "=" * (-len(encoded_signature) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            expected_signature = hmac.new(
+                signing_key, encoded_payload.encode("ascii"), hashlib.sha256
+            ).digest()
+            if not hmac.compare_digest(signature, expected_signature):
+                return None
+            payload_bytes = base64.b64decode(
+                encoded_payload + "=" * (-len(encoded_payload) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            payload = json.loads(payload_bytes)
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"v", "q", "u", "s", "h", "t", "i", "e"}
+                or payload.get("v") != self._SEARCH_CURSOR_VERSION
+            ):
+                return None
+            expected = (
+                self._search_cursor_scope_hash(self._normalize_search_query(query)),
+                self._search_cursor_scope_hash(user_id),
+                self._search_cursor_scope_hash(source),
+            )
+            actual = (payload.get("q"), payload.get("u"), payload.get("s"))
+            if any(
+                not isinstance(left, str)
+                or not isinstance(right, str)
+                or not hmac.compare_digest(left, right)
+                for left, right in zip(actual, expected)
+            ):
+                return None
+            high_water = int(payload["h"])
+            message_id = int(payload["i"])
+            timestamp = payload["t"]
+            expires_at = int(payload["e"])
+            if (
+                high_water < 0
+                or message_id <= 0
+                or not isinstance(timestamp, (int, float))
+                or timestamp < 0
+                or expires_at < int(time.time())
+            ):
+                return None
+            return {
+                "snapshot_message_id": high_water,
+                "after": (timestamp, message_id),
+            }
+        except (
+            binascii.Error,
+            KeyError,
+            TypeError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return None
+
+    async def _handle_session_search(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/search — safe exact-owner FTS search."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        query = request.rel_url.query
+        allowed = {"q", "user_id", "source", "limit", "cursor"}
+        if any(key not in allowed for key in query):
+            return web.json_response(
+                _openai_error("Invalid search query parameters", code="invalid_query"),
+                status=400,
+            )
+        for key in allowed:
+            if len(query.getall(key, [])) > 1:
+                return web.json_response(
+                    _openai_error("Duplicate search query parameter", code="invalid_query"),
+                    status=400,
+                )
+
+        q = (query.get("q") or "").strip()
+        user_id = (query.get("user_id") or "").strip()
+        source = (query.get("source") or "").strip()
+        if (
+            not q
+            or not user_id
+            or not source
+            or len(q) > 256
+            or len(user_id) > 256
+            or len(source) > 64
+            or any(
+                "\x00" in value or "\r" in value or "\n" in value
+                for value in (q, user_id, source)
+            )
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Invalid or missing owner-scoped search query",
+                    code="invalid_query",
+                ),
+                status=400,
+            )
+
+        raw_limit = query.get("limit")
+        if raw_limit is None:
+            limit = 20
+        elif re.fullmatch(r"[0-9]+", raw_limit):
+            limit = int(raw_limit)
+        else:
+            limit = 0
+        if not 1 <= limit <= 50:
+            return web.json_response(
+                _openai_error("Invalid search pagination", code="invalid_query"),
+                status=400,
+            )
+
+        cursor_value = query.get("cursor")
+        cursor = None
+        if cursor_value is not None:
+            cursor = self._decode_search_cursor(
+                cursor_value,
+                query=q,
+                user_id=user_id,
+                source=source,
+            )
+            if cursor is None:
+                return web.json_response(
+                    _openai_error("Invalid search cursor", code="invalid_query"),
+                    status=400,
+                )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session search unavailable", code="session_search_unavailable"
+                ),
+                status=503,
+            )
+        try:
+            if self._search_cursor_signing_key() is None:
+                raise SessionSearchUnavailable(
+                    "Session search cursor signing unavailable"
+                )
+            if not await asyncio.to_thread(db.session_search_available):
+                raise SessionSearchUnavailable("Session full-text search is unavailable")
+            rows, snapshot_message_id = await asyncio.to_thread(
+                db.search_messages_scoped,
+                q,
+                user_id=user_id,
+                source=source,
+                limit=limit + 1,
+                snapshot_message_id=(
+                    cursor["snapshot_message_id"] if cursor is not None else None
+                ),
+                after=cursor["after"] if cursor is not None else None,
+            )
+        except SessionSearchUnavailable:
+            logger.warning("Owner-scoped session search unavailable", exc_info=True)
+            return web.json_response(
+                _openai_error(
+                    "Session search unavailable", code="session_search_unavailable"
+                ),
+                status=503,
+            )
+        except Exception:
+            logger.exception("Owner-scoped session search failed")
+            return web.json_response(
+                _openai_error("Session search failed", err_type="server_error"),
+                status=500,
+            )
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        data = [
+            {
+                "session_id": row["session_id"],
+                "message_id": row["message_id"],
+                "role": row["role"],
+                "timestamp": row["timestamp"],
+                "snippet": self._bounded_search_snippet(row.get("content")),
+            }
+            for row in page_rows
+        ]
+        next_cursor = None
+        if has_more and page_rows:
+            next_cursor = self._encode_search_cursor(
+                query=q,
+                user_id=user_id,
+                source=source,
+                snapshot_message_id=snapshot_message_id,
+                boundary=page_rows[-1],
+            )
+        return web.json_response({
+            "object": "list",
+            "data": data,
+            "limit": limit,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
         })
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":

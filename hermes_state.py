@@ -38,6 +38,11 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
 
 logger = logging.getLogger(__name__)
 
+
+class SessionSearchUnavailable(RuntimeError):
+    """The authoritative FTS index cannot safely serve session search."""
+
+
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
 
@@ -7605,6 +7610,135 @@ class SessionDB:
                     len(rows) if rows is not None else "err",
                     query[:200],
                 )
+
+    def session_search_available(self) -> bool:
+        """Execute a harmless scoped MATCH probe against the production query shape."""
+        if not self._fts_enabled or self._conn is None:
+            return False
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    SELECT m.id, m.timestamp, s.user_id, s.source
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE messages_fts MATCH ?
+                      AND s.user_id = ?
+                      AND s.source = ?
+                      AND m.role IN ('user', 'assistant')
+                    ORDER BY m.timestamp DESC, m.id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        '"__hermes_session_search_readiness_probe_7f31c9__"',
+                        "__readiness_owner__",
+                        "__readiness_source__",
+                    ),
+                ).fetchall()
+            return True
+        except (sqlite3.DatabaseError, TypeError, ValueError):
+            return False
+
+    def search_messages_scoped(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        source: str,
+        limit: int = 20,
+        snapshot_message_id: Optional[int] = None,
+        after: Optional[Tuple[Any, int]] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Return a minimal exact-owner FTS page using immutable keyset order.
+
+        Results are ordered only by message timestamp and id. BM25 rank is mutable
+        when the FTS corpus changes and therefore must never participate in a
+        cross-request cursor boundary. ``snapshot_message_id`` excludes later
+        inserts while ``after`` advances over the fixed immutable sort tuple.
+        """
+        if not self.session_search_available():
+            raise SessionSearchUnavailable("Session full-text search is unavailable")
+        if not user_id or not source:
+            return [], 0
+        if not query or not query.strip() or limit <= 0:
+            return [], 0
+
+        fts_query = self._sanitize_fts5_query(query)
+        if not fts_query:
+            return [], 0
+
+        assert self._conn is not None
+        try:
+            with self._lock:
+                if snapshot_message_id is None:
+                    snapshot_row = self._conn.execute(
+                        """
+                        SELECT COALESCE(MAX(m.id), 0)
+                        FROM messages m
+                        JOIN sessions s ON s.id = m.session_id
+                        WHERE (m.active = 1 OR m.compacted = 1)
+                          AND s.user_id = ?
+                          AND s.source = ?
+                          AND m.role IN ('user', 'assistant')
+                        """,
+                        (user_id, source),
+                    ).fetchone()
+                    snapshot_message_id = int(snapshot_row[0] or 0)
+
+                params: List[Any] = [
+                    fts_query,
+                    user_id,
+                    source,
+                    snapshot_message_id,
+                ]
+                keyset_clause = ""
+                if after is not None:
+                    after_timestamp, after_message_id = after
+                    keyset_clause = """
+                      AND (
+                            m.timestamp < ?
+                         OR (m.timestamp = ? AND m.id < ?)
+                      )
+                    """
+                    params.extend([after_timestamp, after_timestamp, after_message_id])
+
+                params.append(limit)
+                sql = f"""
+                    SELECT
+                        m.id AS message_id,
+                        m.session_id,
+                        m.role,
+                        m.timestamp,
+                        m.content
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE messages_fts MATCH ?
+                      AND (m.active = 1 OR m.compacted = 1)
+                      AND s.user_id = ?
+                      AND s.source = ?
+                      AND m.role IN ('user', 'assistant')
+                      AND m.id <= ?
+                    {keyset_clause}
+                    ORDER BY m.timestamp DESC, m.id DESC
+                    LIMIT ?
+                """
+                rows = [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+                return rows, snapshot_message_id
+        except sqlite3.DatabaseError as exc:
+            if self._try_runtime_fts_rebuild(exc):
+                return self.search_messages_scoped(
+                    query,
+                    user_id=user_id,
+                    source=source,
+                    limit=limit,
+                    snapshot_message_id=snapshot_message_id,
+                    after=after,
+                )
+            raise SessionSearchUnavailable(
+                "Session full-text search is operationally unavailable"
+            ) from exc
 
     def _describe_search_path(self, query: str) -> str:
         """Best-effort name of the routing path a query takes (log-only)."""
