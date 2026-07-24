@@ -210,7 +210,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
 # state_meta key ``fts_storage_version``. The main schema version advances
@@ -1170,6 +1170,17 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     holder TEXT NOT NULL,
     acquired_at REAL NOT NULL,
     expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_fork_requests (
+    idempotency_key TEXT PRIMARY KEY,
+    source_session_id TEXT NOT NULL,
+    anchor_message_id INTEGER NOT NULL,
+    preserve_source INTEGER NOT NULL,
+    requested_title TEXT,
+    requested_session_id TEXT,
+    child_session_id TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS async_delegations (
@@ -2929,6 +2940,43 @@ class SessionDB:
 
         cursor.executescript(SCHEMA_SQL)
 
+        # v24 fork reservations are durable tombstones, not child-owned rows.
+        # Early review builds declared child_session_id with ON DELETE CASCADE,
+        # which silently made a consumed key reusable after child cleanup. Heal
+        # that pre-release shape by rebuilding the table without the foreign key
+        # while preserving every reservation. This is intentionally structural,
+        # not version-gated: an early build may already have stamped v24.
+        fork_request_fks = cursor.execute(
+            "PRAGMA foreign_key_list(session_fork_requests)"
+        ).fetchall()
+        if any(row["from"] == "child_session_id" for row in fork_request_fks):
+            cursor.executescript(
+                """
+                ALTER TABLE session_fork_requests
+                    RENAME TO session_fork_requests_child_owned;
+                CREATE TABLE session_fork_requests (
+                    idempotency_key TEXT PRIMARY KEY,
+                    source_session_id TEXT NOT NULL,
+                    anchor_message_id INTEGER NOT NULL,
+                    preserve_source INTEGER NOT NULL,
+                    requested_title TEXT,
+                    requested_session_id TEXT,
+                    child_session_id TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                INSERT INTO session_fork_requests (
+                    idempotency_key, source_session_id, anchor_message_id,
+                    preserve_source, requested_title, requested_session_id,
+                    child_session_id, created_at
+                )
+                SELECT idempotency_key, source_session_id, anchor_message_id,
+                       preserve_source, requested_title, requested_session_id,
+                       child_session_id, created_at
+                FROM session_fork_requests_child_owned;
+                DROP TABLE session_fork_requests_child_owned;
+                """
+            )
+
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
         # This is idempotent and self-healing: even if a version-gated
@@ -3501,6 +3549,335 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def fork_session_at_message(
+        self,
+        source_session_id: str,
+        child_session_id: str,
+        anchor_message_id: int,
+        idempotency_key: str,
+        *,
+        title: Optional[str] = None,
+        requested_child_session_id: Optional[str] = None,
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Atomically create a non-mutating child through an exact message.
+
+        The source row and all of its messages are read-only in this transaction.
+        The child row, copied transcript, lineage markers, title, and idempotency
+        record commit together or are all rolled back. The return status is one
+        of ``created``, ``replayed``, ``source_missing``, ``invalid_anchor``,
+        ``unsafe_anchor``, ``session_exists``, ``invalid_title``,
+        ``idempotency_stale``, or ``idempotency_conflict``.
+
+        Idempotency reservations intentionally outlive their child session. A
+        consumed key can therefore never create a second child after cleanup;
+        replay against a deleted child returns ``idempotency_stale``.
+
+        Gateway peer identifiers are intentionally not copied. Reusing the
+        source's ``session_key``/chat/thread tuple would make the newer child the
+        gateway's active head. The stable owner and execution routing snapshots
+        (source, user, model/model_config, billing route, prompt, cwd/profile)
+        are safe to inherit; delivery can resolve messaging targets through the
+        parent lineage without stealing the live source lane.
+        """
+
+        def _do(conn):
+            prior = conn.execute(
+                "SELECT * FROM session_fork_requests WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if prior is not None:
+                same_request = (
+                    prior["source_session_id"] == source_session_id
+                    and int(prior["anchor_message_id"]) == anchor_message_id
+                    and int(prior["preserve_source"]) == 1
+                    and prior["requested_title"] == title
+                    and prior["requested_session_id"] == requested_child_session_id
+                )
+                if not same_request:
+                    return "idempotency_conflict", None
+                child = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?",
+                    (prior["child_session_id"],),
+                ).fetchone()
+                if child is None:
+                    # The durable reservation is a tombstone: a consumed key
+                    # never becomes reusable merely because cleanup removed the
+                    # child session.
+                    return "idempotency_stale", None
+                result = dict(child)
+                result["branch_point_message_id"] = int(prior["anchor_message_id"])
+                return "replayed", result
+
+            source = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (source_session_id,)
+            ).fetchone()
+            if source is None:
+                return "source_missing", None
+
+            prefix = conn.execute(
+                "SELECT id, role, content, api_content, tool_call_id, tool_calls, "
+                "finish_reason FROM messages "
+                "WHERE session_id = ? AND active = 1 AND id <= ? ORDER BY id",
+                (source_session_id, anchor_message_id),
+            ).fetchall()
+            if not prefix or int(prefix[-1]["id"]) != anchor_message_id:
+                return "invalid_anchor", None
+
+            def _contains_tool_block(value: Any) -> bool:
+                if isinstance(value, list):
+                    return any(_contains_tool_block(item) for item in value)
+                if not isinstance(value, dict):
+                    return False
+                if value.get("type") in {
+                    "tool_use",
+                    "tool_result",
+                    "function_call",
+                    "function_call_output",
+                }:
+                    return True
+                return any(_contains_tool_block(item) for item in value.values())
+
+            def _normalized_finish_reason(value: Any) -> Optional[str]:
+                if not isinstance(value, str) or not value.strip():
+                    return None
+                return value.strip().lower().replace("-", "_")
+
+            complete_finish_reasons = {
+                "stop",
+                "completed",
+                "complete",
+                "end_turn",
+                "endturn",
+            }
+            tool_finish_reasons = {
+                "tool_calls",
+                "tool_call",
+                "tool_use",
+                "tooluse",
+                "function_call",
+                "function_calls",
+            }
+            assistant_rows = [row for row in prefix if row["role"] == "assistant"]
+            # Legacy compatibility is intentionally transcript-wide and narrow:
+            # only a canonical prefix whose assistant rows ALL predate finish
+            # metadata may infer completion from a strict user/assistant boundary.
+            # Once any assistant row has finish evidence, every assistant row in
+            # the prefix must carry recognized evidence appropriate to its shape.
+            legacy_without_finish_metadata = bool(assistant_rows) and all(
+                _normalized_finish_reason(row["finish_reason"]) is None
+                for row in assistant_rows
+            )
+
+            def _parse_arguments(value: Any) -> bool:
+                if isinstance(value, dict):
+                    return True
+                if not isinstance(value, str) or not value.strip():
+                    return False
+                try:
+                    return isinstance(json.loads(value), dict)
+                except (json.JSONDecodeError, TypeError):
+                    return False
+
+            def _validated_tool_call(call: Any) -> Optional[str]:
+                if not isinstance(call, dict):
+                    return None
+                call_type = call.get("type")
+                if call_type == "function":
+                    call_id = call.get("id")
+                    function = call.get("function")
+                    if not isinstance(function, dict):
+                        return None
+                    name = function.get("name")
+                    arguments = function.get("arguments")
+                elif call_type == "function_call":
+                    call_id = call.get("call_id")
+                    name = call.get("name")
+                    arguments = call.get("arguments")
+                elif call_type == "tool_use":
+                    call_id = call.get("id")
+                    name = call.get("name")
+                    arguments = call.get("input")
+                else:
+                    return None
+                if not isinstance(call_id, str) or not call_id.strip():
+                    return None
+                if not isinstance(name, str) or not name.strip():
+                    return None
+                if not _parse_arguments(arguments):
+                    return None
+                return call_id
+
+            expected = "user"
+            pending_call_ids: set[str] = set()
+            for row in prefix:
+                role = row["role"]
+                try:
+                    tool_calls = json.loads(row["tool_calls"]) if row["tool_calls"] else []
+                except (json.JSONDecodeError, TypeError):
+                    return "unsafe_anchor", None
+                content = self._decode_content(row["content"])
+                if _contains_tool_block(content) or _contains_tool_block(row["api_content"]):
+                    return "unsafe_anchor", None
+
+                if expected == "user":
+                    if role != "user" or tool_calls or row["tool_call_id"]:
+                        return "unsafe_anchor", None
+                    expected = "assistant"
+                    continue
+
+                if expected == "assistant":
+                    if role != "assistant" or row["tool_call_id"]:
+                        return "unsafe_anchor", None
+                    finish_reason = _normalized_finish_reason(row["finish_reason"])
+                    if not isinstance(tool_calls, list):
+                        return "unsafe_anchor", None
+                    if not tool_calls:
+                        if (
+                            not legacy_without_finish_metadata
+                            and finish_reason not in complete_finish_reasons
+                        ):
+                            return "unsafe_anchor", None
+                        expected = "user"
+                        continue
+                    if (
+                        not legacy_without_finish_metadata
+                        and finish_reason not in tool_finish_reasons
+                    ):
+                        return "unsafe_anchor", None
+                    validated_ids = [_validated_tool_call(call) for call in tool_calls]
+                    if any(call_id is None for call_id in validated_ids):
+                        return "unsafe_anchor", None
+                    pending_call_ids = {call_id for call_id in validated_ids if call_id}
+                    if len(pending_call_ids) != len(validated_ids):
+                        return "unsafe_anchor", None
+                    expected = "tool"
+                    continue
+
+                if role != "tool" or tool_calls:
+                    return "unsafe_anchor", None
+                call_id = row["tool_call_id"]
+                if (
+                    not isinstance(call_id, str)
+                    or not call_id
+                    or call_id not in pending_call_ids
+                ):
+                    return "unsafe_anchor", None
+                pending_call_ids.remove(call_id)
+                if not pending_call_ids:
+                    expected = "assistant"
+
+            # Only a completed final assistant response is a continuation-safe
+            # anchor. A user, tool, partial assistant, or unresolved tool group
+            # can never be repaired after the fork.
+            if expected != "user" or pending_call_ids:
+                return "unsafe_anchor", None
+
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (child_session_id,)
+            ).fetchone():
+                return "session_exists", None
+            if title and conn.execute(
+                "SELECT 1 FROM sessions WHERE title = ?", (title,)
+            ).fetchone():
+                return "invalid_title", None
+
+            source_config = source["model_config"]
+            try:
+                model_config = json.loads(source_config) if source_config else {}
+            except (json.JSONDecodeError, TypeError):
+                model_config = {}
+            if not isinstance(model_config, dict):
+                model_config = {}
+            model_config = dict(model_config)
+            model_config["_branched_from"] = source_session_id
+            model_config["_branch_point_message_id"] = anchor_message_id
+
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, user_id, model, model_config, system_prompt,
+                   parent_session_id, started_at, cwd, git_branch, git_repo_root,
+                   billing_provider, billing_base_url, billing_mode, profile_name,
+                   pricing_version, title
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    child_session_id,
+                    source["source"],
+                    source["user_id"],
+                    source["model"],
+                    json.dumps(model_config),
+                    source["system_prompt"],
+                    source_session_id,
+                    time.time(),
+                    source["cwd"],
+                    source["git_branch"],
+                    source["git_repo_root"],
+                    source["billing_provider"],
+                    source["billing_base_url"],
+                    source["billing_mode"],
+                    source["profile_name"],
+                    source["pricing_version"],
+                    title,
+                ),
+            )
+
+            message_columns = (
+                "role, content, tool_call_id, tool_calls, tool_name, "
+                "effect_disposition, timestamp, token_count, finish_reason, "
+                "reasoning, reasoning_content, reasoning_details, "
+                "codex_reasoning_items, codex_message_items, "
+                "platform_message_id, observed, active, compacted, api_content, "
+                "display_kind, display_metadata"
+            )
+            conn.execute(
+                f"INSERT INTO messages (session_id, {message_columns}) "
+                f"SELECT ?, {message_columns} FROM messages "
+                "WHERE session_id = ? AND active = 1 AND id <= ? ORDER BY id",
+                (child_session_id, source_session_id, anchor_message_id),
+            )
+
+            copied = conn.execute(
+                "SELECT tool_calls FROM messages WHERE session_id = ? ORDER BY id",
+                (child_session_id,),
+            ).fetchall()
+            tool_call_count = 0
+            for row in copied:
+                raw_tool_calls = row["tool_calls"]
+                if not raw_tool_calls:
+                    continue
+                try:
+                    parsed = json.loads(raw_tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = raw_tool_calls
+                tool_call_count += len(parsed) if isinstance(parsed, list) else 1
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (len(copied), tool_call_count, child_session_id),
+            )
+            conn.execute(
+                """INSERT INTO session_fork_requests (
+                   idempotency_key, source_session_id, anchor_message_id,
+                   preserve_source, requested_title, requested_session_id,
+                   child_session_id, created_at
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?)""",
+                (
+                    idempotency_key,
+                    source_session_id,
+                    anchor_message_id,
+                    title,
+                    requested_child_session_id,
+                    child_session_id,
+                    time.time(),
+                ),
+            )
+            child = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (child_session_id,)
+            ).fetchone()
+            result = dict(child)
+            result["branch_point_message_id"] = anchor_message_id
+            return "created", result
+
+        return self._execute_write(_do)
 
     def record_gateway_session_peer(
         self,
