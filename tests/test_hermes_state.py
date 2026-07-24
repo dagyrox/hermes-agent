@@ -77,6 +77,106 @@ def db(tmp_path):
     session_db.close()
 
 
+def test_session_fork_request_schema_uses_canonical_anchor(db):
+    columns = {
+        row["name"]
+        for row in db._conn.execute("PRAGMA table_info(session_fork_requests)").fetchall()
+    }
+    assert "anchor_message_id" in columns
+    assert "from_message_id" not in columns
+    assert not any(
+        row["from"] == "child_session_id"
+        for row in db._conn.execute(
+            "PRAGMA foreign_key_list(session_fork_requests)"
+        ).fetchall()
+    )
+    assert db._conn.execute("SELECT version FROM schema_version").fetchone()["version"] == SCHEMA_VERSION
+
+
+def test_session_fork_same_key_race_replays_one_durable_child(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "fork-race.db"
+    setup = SessionDB(path)
+    setup.create_session("source", "api_server")
+    setup.append_message("source", "user", "question")
+    anchor = setup.append_message(
+        "source", "assistant", "answer", finish_reason="stop"
+    )
+    setup.close()
+
+    def fork_once():
+        worker = SessionDB(path)
+        try:
+            return worker.fork_session_at_message(
+                "source",
+                "same-child",
+                anchor,
+                "same-key",
+                requested_child_session_id="same-child",
+            )[0]
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = sorted(pool.map(lambda _: fork_once(), range(2)))
+
+    verify = SessionDB(path)
+    try:
+        assert outcomes == ["created", "replayed"]
+        assert verify._conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE parent_session_id = 'source'"
+        ).fetchone()[0] == 1
+        assert verify._conn.execute(
+            "SELECT COUNT(*) FROM session_fork_requests WHERE idempotency_key = 'same-key'"
+        ).fetchone()[0] == 1
+    finally:
+        verify.close()
+
+
+def test_session_fork_conflicting_key_race_creates_only_winner(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "fork-conflict-race.db"
+    setup = SessionDB(path)
+    setup.create_session("source", "api_server")
+    setup.append_message("source", "user", "question")
+    anchor = setup.append_message(
+        "source", "assistant", "answer", finish_reason="stop"
+    )
+    setup.close()
+
+    def fork_once(index):
+        worker = SessionDB(path)
+        try:
+            child = f"child-{index}"
+            return worker.fork_session_at_message(
+                "source",
+                child,
+                anchor,
+                "conflicting-key",
+                title=f"title-{index}",
+                requested_child_session_id=child,
+            )[0]
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = sorted(pool.map(fork_once, range(2)))
+
+    verify = SessionDB(path)
+    try:
+        assert outcomes == ["created", "idempotency_conflict"]
+        assert verify._conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE parent_session_id = 'source'"
+        ).fetchone()[0] == 1
+        assert verify._conn.execute(
+            "SELECT COUNT(*) FROM session_fork_requests WHERE idempotency_key = 'conflicting-key'"
+        ).fetchone()[0] == 1
+    finally:
+        verify.close()
+
+
 # =========================================================================
 # Session lifecycle
 # =========================================================================
