@@ -275,6 +275,27 @@ async def test_session_chat_fails_closed_on_history_error_before_model(auth_adap
 
 
 @pytest.mark.asyncio
+async def test_session_chat_stream_fails_closed_on_history_error_before_model(adapter, session_db):
+    session_id = session_db.create_session("stream-history-fail", "api_server")
+    mock_run = AsyncMock()
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run), patch.object(
+        session_db, "get_messages_as_conversation", side_effect=sqlite3.DatabaseError("secret db path")
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream", json={"message": "next"}
+            )
+            body = await resp.text()
+
+    assert resp.status == 200
+    assert "session_history_unavailable" in body
+    assert "secret db path" not in body
+    assert "event: run.started" not in body
+    mock_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_session_chat_conflicts_with_canonical_durable_owner(auth_adapter, session_db):
     session_id = session_db.create_session("chat-lease-conflict", "api_server")
     assert session_db.acquire_session_execution_lease(session_id, "gateway-owner") is True

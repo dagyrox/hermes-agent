@@ -12,12 +12,12 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import io
 import json
 import re
-import struct
 import time
 import uuid
-import zlib
+import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -94,103 +94,82 @@ def project_safe_tool_event(event_type: str, **event: Any) -> Dict[str, Any]:
 
 
 def _validated_image_dimensions(decoded: bytes, declared_mime: str) -> tuple[int, int]:
-    """Validate container magic/structure and read dimensions without decoding pixels."""
-    actual_mime = ""
-    width = height = 0
-    if decoded.startswith(b"\x89PNG\r\n\x1a\n"):
-        actual_mime = "image/png"
-        offset = 8
-        saw_ihdr = saw_iend = False
-        while offset + 12 <= len(decoded):
-            length = struct.unpack(">I", decoded[offset:offset + 4])[0]
-            kind = decoded[offset + 4:offset + 8]
-            end = offset + 12 + length
-            if end > len(decoded):
-                raise TurnInputError("Image payload is truncated")
-            data = decoded[offset + 8:offset + 8 + length]
-            crc = struct.unpack(">I", decoded[offset + 8 + length:end])[0]
-            if zlib.crc32(kind + data) != crc:
-                raise TurnInputError("Image payload is truncated or corrupt")
-            if not saw_ihdr:
-                if kind != b"IHDR" or length != 13:
-                    raise TurnInputError("Image payload is truncated or corrupt")
-                width, height = struct.unpack(">II", data[:8])
-                saw_ihdr = True
-            if kind == b"IEND":
-                if length != 0 or end != len(decoded):
-                    raise TurnInputError("Image payload is truncated or corrupt")
-                saw_iend = True
-                break
-            offset = end
-        if not saw_ihdr or not saw_iend:
-            raise TurnInputError("Image payload is truncated")
-    elif decoded[:6] in {b"GIF87a", b"GIF89a"}:
-        actual_mime = "image/gif"
-        if len(decoded) < 14 or decoded[-1:] != b"\x3b":
-            raise TurnInputError("Image payload is truncated")
-        width, height = struct.unpack("<HH", decoded[6:10])
-    elif decoded.startswith(b"\xff\xd8"):
-        actual_mime = "image/jpeg"
-        if len(decoded) < 4 or not decoded.endswith(b"\xff\xd9"):
-            raise TurnInputError("Image payload is truncated")
-        offset = 2
-        sof = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
-        while offset < len(decoded) - 2:
-            if decoded[offset] != 0xFF:
-                offset += 1
-                continue
-            while offset < len(decoded) and decoded[offset] == 0xFF:
-                offset += 1
-            if offset >= len(decoded):
-                break
-            marker = decoded[offset]
-            offset += 1
-            if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
-                continue
-            if offset + 2 > len(decoded):
-                raise TurnInputError("Image payload is truncated")
-            length = struct.unpack(">H", decoded[offset:offset + 2])[0]
-            if length < 2 or offset + length > len(decoded):
-                raise TurnInputError("Image payload is truncated")
-            if marker in sof:
-                if length < 7:
-                    raise TurnInputError("Image payload is truncated")
-                height, width = struct.unpack(">HH", decoded[offset + 3:offset + 7])
-                break
-            offset += length
-        if not width or not height:
-            raise TurnInputError("Image payload is truncated or has no dimensions")
-    elif len(decoded) >= 16 and decoded[:4] == b"RIFF" and decoded[8:12] == b"WEBP":
-        actual_mime = "image/webp"
-        if struct.unpack("<I", decoded[4:8])[0] + 8 != len(decoded):
-            raise TurnInputError("Image payload is truncated")
-        kind = decoded[12:16]
-        if kind == b"VP8X" and len(decoded) >= 30:
-            width = 1 + int.from_bytes(decoded[24:27], "little")
-            height = 1 + int.from_bytes(decoded[27:30], "little")
-        elif kind == b"VP8 " and len(decoded) >= 30 and decoded[23:26] == b"\x9d\x01\x2a":
-            width, height = struct.unpack("<HH", decoded[26:30])
-            width &= 0x3FFF
-            height &= 0x3FFF
-        elif kind == b"VP8L" and len(decoded) >= 25 and decoded[20] == 0x2F:
-            bits = int.from_bytes(decoded[21:25], "little")
-            width = (bits & 0x3FFF) + 1
-            height = ((bits >> 14) & 0x3FFF) + 1
-        else:
-            raise TurnInputError("Image payload is truncated or corrupt")
-    else:
-        raise TurnInputError("Image magic does not match a supported MIME type")
+    """Verify the container and fully decode pixels with Pillow."""
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError as exc:
+        raise TurnInputError("Inline image decoder is unavailable") from exc
 
-    if actual_mime != declared_mime:
-        raise TurnInputError("Image magic/MIME mismatch")
-    if width <= 0 or height <= 0 or width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
-        raise TurnInputError("Image dimensions exceed the safe limit")
-    if width * height > MAX_IMAGE_PIXELS:
-        raise TurnInputError("Image dimensions exceed the safe pixel limit")
+    expected_format = {
+        "image/png": "PNG",
+        "image/jpeg": "JPEG",
+        "image/gif": "GIF",
+        "image/webp": "WEBP",
+    }[declared_mime]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(decoded)) as image:
+                if image.format != expected_format:
+                    raise TurnInputError("Image magic/MIME mismatch")
+                width, height = image.size
+                if (
+                    width <= 0
+                    or height <= 0
+                    or width > MAX_IMAGE_DIMENSION
+                    or height > MAX_IMAGE_DIMENSION
+                ):
+                    raise TurnInputError("Image dimensions exceed the safe limit")
+                if width * height > MAX_IMAGE_PIXELS:
+                    raise TurnInputError("Image dimensions exceed the safe pixel limit")
+                image.verify()
+            # ``verify`` checks container integrity but deliberately does not
+            # decode image data. Re-open and load every frame/pixel so corrupt,
+            # truncated, and invalid compressed payloads fail before admission.
+            with Image.open(io.BytesIO(decoded)) as image:
+                if image.format != expected_format or image.size != (width, height):
+                    raise TurnInputError("Image payload changed during verification")
+                frame_count = int(getattr(image, "n_frames", 1) or 1)
+                if frame_count > 256:
+                    raise TurnInputError("Image frame count exceeds the safe limit")
+                for frame in range(frame_count):
+                    image.seek(frame)
+                    image.load()
+    except TurnInputError:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        # Pillow rejects extreme pixel counts while opening the container,
+        # before our explicit width/height checks can run.  Keep that bounded
+        # input failure deterministic instead of misclassifying it as corrupt
+        # image data.
+        raise TurnInputError("Image dimensions exceed the safe pixel limit") from exc
+    except (
+        UnidentifiedImageError,
+        OSError,
+        SyntaxError,
+        ValueError,
+    ) as exc:
+        raise TurnInputError("Image payload is malformed, truncated, or unsafe") from exc
     return width, height
 
 
+def _image_decoder_readiness_probe() -> bool:
+    try:
+        from PIL import Image
+
+        probe = io.BytesIO()
+        Image.new("RGB", (1, 1), "black").save(probe, format="PNG")
+        return _validated_image_dimensions(probe.getvalue(), "image/png") == (1, 1)
+    except Exception:
+        return False
+
+
+IMAGE_DECODER_READY = _image_decoder_readiness_probe()
+
+
 def _normalize_inline_image(value: Any) -> tuple[str, int]:
+    if not IMAGE_DECODER_READY:
+        raise TurnInputError("Inline image decoder is unavailable")
     if isinstance(value, dict):
         value = value.get("data_url") or value.get("url") or value.get("image_url")
     if not isinstance(value, str) or not value.lower().startswith("data:image/"):
@@ -299,6 +278,7 @@ class SessionTurnStore:
                     started_at REAL,
                     finished_at REAL,
                     effective_session_id TEXT,
+                    assistant_message_id TEXT,
                     FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_api_session_turns_one_active
@@ -319,6 +299,7 @@ class SessionTurnStore:
                     turn_id TEXT NOT NULL,
                     destination TEXT NOT NULL,
                     delivery_id TEXT,
+                    provider_message_id TEXT,
                     state TEXT NOT NULL,
                     safe_error_code TEXT,
                     created_at REAL NOT NULL,
@@ -328,11 +309,22 @@ class SessionTurnStore:
                 );
                 """
             )
-            columns = {
+            outbox_columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(api_session_turn_outbox)").fetchall()
             }
-            if "delivery_id" not in columns:
+            if "delivery_id" not in outbox_columns:
                 conn.execute("ALTER TABLE api_session_turn_outbox ADD COLUMN delivery_id TEXT")
+            if "provider_message_id" not in outbox_columns:
+                conn.execute(
+                    "ALTER TABLE api_session_turn_outbox ADD COLUMN provider_message_id TEXT"
+                )
+            turn_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(api_session_turns)").fetchall()
+            }
+            if "assistant_message_id" not in turn_columns:
+                conn.execute(
+                    "ALTER TABLE api_session_turns ADD COLUMN assistant_message_id TEXT"
+                )
         self.db._execute_write(create)
 
     @staticmethod
@@ -399,11 +391,13 @@ class SessionTurnStore:
         keys = (
             "turn_id", "session_id", "delivery_mode", "status", "safe_error_code",
             "created_at", "updated_at", "started_at", "finished_at", "effective_session_id",
+            "assistant_message_id",
         )
         result = {key: row.get(key) for key in keys}
         with self.db._lock:
             deliveries = self.db._conn.execute(
-                "SELECT destination, delivery_id, state, safe_error_code, created_at, updated_at "
+                "SELECT destination, delivery_id, provider_message_id, state, safe_error_code, "
+                "created_at, updated_at "
                 "FROM api_session_turn_outbox WHERE turn_id = ? ORDER BY destination",
                 (turn_id,),
             ).fetchall()
@@ -448,6 +442,50 @@ class SessionTurnStore:
             raise ValueError("finish requires a terminal status")
         return self._set_status(turn_id, status, safe_error_code, effective_session_id)
 
+    def message_high_water(self) -> int:
+        with self.db._lock:
+            row = self.db._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS high FROM messages"
+            ).fetchone()
+        return int(row["high"])
+
+    def anchor_completed_assistant(
+        self, turn_id: str, effective_session_id: str, *, after_message_id: int
+    ) -> Optional[str]:
+        """Persist the exact final assistant row created after turn admission."""
+        def anchor(conn):
+            tail = conn.execute(
+                "SELECT id, role FROM messages WHERE session_id = ? AND active = 1 "
+                "AND id > ? ORDER BY id DESC LIMIT 1",
+                (effective_session_id, after_message_id),
+            ).fetchone()
+            if tail is None or tail["role"] != "assistant":
+                return None
+            message_id = str(tail["id"])
+            cursor = conn.execute(
+                "UPDATE api_session_turns SET assistant_message_id = ?, "
+                "effective_session_id = ?, updated_at = ? WHERE turn_id = ? "
+                "AND status IN ('running','stopping') AND assistant_message_id IS NULL",
+                (message_id, effective_session_id, time.time(), turn_id),
+            )
+            return message_id if cursor.rowcount == 1 else None
+        return self.db._execute_write(anchor)
+
+    def anchored_assistant_content(self, turn_id: str) -> Optional[str]:
+        """Fetch only the assistant row durably anchored to this turn."""
+        with self.db._lock:
+            row = self.db._conn.execute(
+                "SELECT m.content FROM api_session_turns t JOIN messages m "
+                "ON CAST(m.id AS TEXT) = t.assistant_message_id "
+                "AND m.session_id = t.effective_session_id "
+                "WHERE t.turn_id = ? AND m.role = 'assistant' AND m.active = 1",
+                (turn_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        content = self.db._decode_content(row["content"])
+        return content if isinstance(content, str) else None
+
     def request_stop(self, turn_id: str) -> Optional[Dict[str, Any]]:
         now = time.time()
 
@@ -474,7 +512,14 @@ class SessionTurnStore:
 
     def append_event(self, turn_id: str, event_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         now = time.time()
-        clean_data = dict(data)
+        if event_type == "assistant.delta":
+            clean_data = {"volatile": True}
+        else:
+            forbidden = {
+                "content", "delta", "text", "input", "prompt", "response",
+                "reasoning", "output", "preview", "args", "messages",
+            }
+            clean_data = {key: value for key, value in data.items() if key not in forbidden}
 
         def append(conn):
             row = conn.execute(
@@ -533,13 +578,28 @@ class SessionTurnStore:
             return True
         return bool(self.db._execute_write(begin))
 
-    def finish_delivery(self, turn_id: str, destination: str, state: str,
-                        safe_error_code: Optional[str] = None) -> None:
+    def finish_delivery(
+        self,
+        turn_id: str,
+        destination: str,
+        state: str,
+        safe_error_code: Optional[str] = None,
+        *,
+        provider_message_id: Optional[str] = None,
+    ) -> None:
         now = time.time()
         self.db._execute_write(lambda conn: conn.execute(
-            "UPDATE api_session_turn_outbox SET state = ?, safe_error_code = ?, updated_at = ? "
+            "UPDATE api_session_turn_outbox SET state = ?, safe_error_code = ?, "
+            "provider_message_id = COALESCE(?, provider_message_id), updated_at = ? "
             "WHERE turn_id = ? AND destination = ?",
-            (state, safe_error_code, now, turn_id, destination),
+            (
+                state,
+                safe_error_code,
+                provider_message_id,
+                now,
+                turn_id,
+                destination,
+            ),
         ))
 
     def get_delivery(self, turn_id: str, destination: str) -> Optional[Dict[str, Any]]:
@@ -551,35 +611,67 @@ class SessionTurnStore:
         return dict(row) if row else None
 
     def reconcile_uncertain(self) -> int:
+        """Interrupt only work whose persistent execution owner is not live."""
         now = time.time()
 
         def reconcile(conn):
             turns = conn.execute(
-                "SELECT turn_id FROM api_session_turns WHERE status IN ('queued','running','stopping')"
+                "SELECT turn_id, session_id FROM api_session_turns "
+                "WHERE status IN ('queued','running','stopping')"
             ).fetchall()
+            interrupted = 0
             for row in turns:
                 turn_id = row["turn_id"]
+                lease = conn.execute(
+                    "SELECT * FROM session_execution_leases WHERE session_id = ?",
+                    (row["session_id"],),
+                ).fetchone()
+                if lease is not None:
+                    owner_state = self.db.session_execution_lease_owner_state(
+                        lease, now=now
+                    )
+                    if owner_state == "live":
+                        continue
+                    conn.execute(
+                        "DELETE FROM session_execution_leases "
+                        "WHERE session_id = ? AND owner_id = ?",
+                        (row["session_id"], lease["owner_id"]),
+                    )
                 conn.execute(
                     "UPDATE api_session_turns SET status='interrupted', "
-                    "safe_error_code='process_restarted', updated_at=?, finished_at=? WHERE turn_id=?",
+                    "safe_error_code='process_restarted', updated_at=?, finished_at=? "
+                    "WHERE turn_id=? AND status IN ('queued','running','stopping')",
                     (now, now, turn_id),
                 )
                 seq_row = conn.execute(
-                    "SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM api_session_turn_events WHERE turn_id=?",
+                    "SELECT COALESCE(MAX(seq), 0) + 1 AS seq "
+                    "FROM api_session_turn_events WHERE turn_id=?",
                     (turn_id,),
                 ).fetchone()
                 conn.execute(
-                    "INSERT INTO api_session_turn_events (turn_id, seq, event_type, data_json, created_at) "
+                    "INSERT INTO api_session_turn_events "
+                    "(turn_id, seq, event_type, data_json, created_at) "
                     "VALUES (?, ?, 'turn.interrupted', ?, ?)",
-                    (turn_id, int(seq_row["seq"]), json.dumps({"status": "interrupted", "error_code": "process_restarted"}), now),
+                    (
+                        turn_id,
+                        int(seq_row["seq"]),
+                        json.dumps({
+                            "status": "interrupted",
+                            "error_code": "process_restarted",
+                        }),
+                        now,
+                    ),
                 )
+                interrupted += 1
             conn.execute(
                 "UPDATE api_session_turn_outbox SET state='needs_manual_retry', "
-                "safe_error_code='delivery_outcome_unknown', updated_at=? WHERE state='sending'",
+                "safe_error_code='delivery_outcome_unknown', updated_at=? "
+                "WHERE state='sending'",
                 (now,),
             )
-            return len(turns)
+            return interrupted
         return int(self.db._execute_write(reconcile) or 0)
+
 
 
 def _json_object(value: Any) -> Optional[Dict[str, Any]]:
@@ -654,38 +746,54 @@ def resolve_slack_binding(session_db: Any, session_id: Optional[str] = None) -> 
                 entry.setdefault("session_key", route_row["session_key"])
                 routing.append(entry)
 
-    aggregate = {key: set() for key in ("platform", "chat", "thread", "workspace")}
-    found = False
     for row in rows:
-        evidence = {key: set() for key in aggregate}
+        evidence = {
+            key: set() for key in ("platform", "chat", "thread", "workspace")
+        }
         _add_slack_evidence(evidence, row)
         origin = _json_object(row.get("origin_json"))
         if origin:
-            _add_slack_evidence(evidence, origin, session_key=str(row.get("session_key") or ""))
+            _add_slack_evidence(
+                evidence,
+                origin,
+                session_key=str(row.get("session_key") or ""),
+            )
         for entry in routing:
             if str(entry.get("session_id") or "") == str(row.get("id") or ""):
                 _add_slack_evidence(evidence, entry)
-        has_route_fields = any(evidence[key] for key in ("chat", "thread", "workspace"))
-        if "slack" not in evidence["platform"] and not has_route_fields:
-            continue
-        found = True
-        for key in aggregate:
-            aggregate[key].update(evidence[key])
 
-    if not found:
-        raise SlackBindingError("no_slack_binding")
-    if aggregate["platform"] != {"slack"} or len(aggregate["chat"]) != 1 or len(aggregate["workspace"]) != 1:
-        code = "ambiguous_slack_binding" if any(len(aggregate[key]) > 1 for key in aggregate) else "no_slack_binding"
-        raise SlackBindingError(code)
-    if len(aggregate["thread"]) > 1:
-        raise SlackBindingError("ambiguous_slack_binding")
-    chat_id = next(iter(aggregate["chat"]))
-    thread_id = next(iter(aggregate["thread"]), None)
-    workspace = next(iter(aggregate["workspace"]))
-    metadata: Dict[str, Any] = {"scope_id": workspace}
-    if thread_id:
-        metadata["thread_id"] = thread_id
-    return SlackBinding(chat_id, thread_id, metadata)
+        # A continuation row may retain source='slack' while intentionally
+        # inheriting routing from its parent. It becomes the nearest *bound*
+        # row only when durable target evidence exists on that row.
+        if not any(evidence[key] for key in ("chat", "thread", "workspace")):
+            continue
+        if evidence["platform"] != {"slack"}:
+            code = (
+                "ambiguous_slack_binding"
+                if len(evidence["platform"]) > 1
+                else "no_slack_binding"
+            )
+            raise SlackBindingError(code)
+        if len(evidence["chat"]) != 1 or len(evidence["workspace"]) != 1:
+            code = (
+                "ambiguous_slack_binding"
+                if len(evidence["chat"]) > 1 or len(evidence["workspace"]) > 1
+                else "no_slack_binding"
+            )
+            raise SlackBindingError(code)
+        if len(evidence["thread"]) > 1:
+            raise SlackBindingError("ambiguous_slack_binding")
+
+        chat_id = next(iter(evidence["chat"]))
+        thread_id = next(iter(evidence["thread"]), None)
+        workspace = next(iter(evidence["workspace"]))
+        metadata: Dict[str, Any] = {"scope_id": workspace}
+        if thread_id:
+            metadata["thread_id"] = thread_id
+        return SlackBinding(chat_id, thread_id, metadata)
+
+    raise SlackBindingError("no_slack_binding")
+
 
 
 def _resync_error(message: str, code: str, *, high_water: int) -> web.Response:
@@ -717,6 +825,9 @@ class SessionTurnService:
         self._store_lock = asyncio.Lock()
         self._tasks: Dict[str, asyncio.Task[Any]] = {}
         self._agent_refs: Dict[str, list[Any]] = {}
+        # Assistant text deltas are intentionally process-local. Canonical
+        # SessionDB messages are the only durable transcript authority.
+        self._volatile_events: Dict[str, Dict[int, Dict[str, Any]]] = {}
 
     async def _store(self) -> Optional[SessionTurnStore]:
         db = await self.adapter._ensure_session_db_async()
@@ -834,9 +945,16 @@ class SessionTurnService:
         execution_lease = None
         self._agent_refs[turn_id] = agent_ref
         try:
+            def interrupt_on_lease_loss() -> None:
+                agent = agent_ref[0]
+                if agent is not None:
+                    agent.interrupt("Persistent session execution lease lost")
+
             try:
                 execution_lease = await self.adapter._acquire_session_execution_lease(
-                    session_id, owner_prefix=f"api:durable-turn:{turn_id}"
+                    session_id,
+                    owner_prefix=f"api:durable-turn:{turn_id}",
+                    on_lost=interrupt_on_lease_loss,
                 )
             except SessionExecutionConflict:
                 store.finish(turn_id, "failed", safe_error_code="active_session_execution")
@@ -863,14 +981,22 @@ class SessionTurnService:
                     {"status": "interrupted", "error_code": "stopped_before_execution"},
                 )
                 return
+            message_high_water = await asyncio.to_thread(store.message_high_water)
+
             def append(event_type: str, data: Dict[str, Any]) -> None:
-                # Agent callbacks run in the executor thread. A short SQLite
-                # append here preserves callback order durably before the final
-                # terminal event; it does not block aiohttp's event loop.
-                store.append_event(turn_id, event_type, data)
+                durable = store.append_event(turn_id, event_type, data)
+                if event_type == "assistant.delta" and payload["delivery_mode"] != "slack_only":
+                    self._volatile_events.setdefault(turn_id, {})[durable["seq"]] = {
+                        **durable,
+                        "data": dict(data),
+                    }
 
             def on_delta(delta: Any) -> None:
-                if isinstance(delta, str) and delta:
+                if (
+                    payload["delivery_mode"] != "slack_only"
+                    and isinstance(delta, str)
+                    and delta
+                ):
                     append("assistant.delta", {"delta": delta})
 
             def on_tool_start(tool_call_id: Any, function_name: Any, function_args: Any) -> None:
@@ -905,6 +1031,19 @@ class SessionTurnService:
                 agent_ref=agent_ref,
             )
             effective_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+            if execution_lease is None or not await execution_lease.still_owned():
+                store.finish(
+                    turn_id,
+                    "interrupted",
+                    safe_error_code="execution_lease_lost",
+                    effective_session_id=effective_id,
+                )
+                store.append_event(
+                    turn_id,
+                    "turn.interrupted",
+                    {"status": "interrupted", "error_code": "execution_lease_lost"},
+                )
+                return
             if store.stop_requested(turn_id):
                 store.finish(turn_id, "interrupted", safe_error_code="stop_requested", effective_session_id=effective_id)
                 store.append_event(turn_id, "turn.interrupted", {"status": "interrupted", "error_code": "stop_requested"})
@@ -914,11 +1053,44 @@ class SessionTurnService:
                 store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "run_failed"})
                 return
 
-            final_response = result.get("final_response") or ""
-            store.append_event(turn_id, "assistant.completed", {"completed": True})
+            assistant_message_id = await asyncio.to_thread(
+                store.anchor_completed_assistant,
+                turn_id,
+                effective_id,
+                after_message_id=message_high_water,
+            )
+            anchored_content = await asyncio.to_thread(
+                store.anchored_assistant_content, turn_id
+            )
+            final_response = result.get("final_response")
+            if (
+                assistant_message_id is None
+                or not isinstance(anchored_content, str)
+                or not isinstance(final_response, str)
+                or anchored_content != final_response
+            ):
+                store.finish(
+                    turn_id,
+                    "failed",
+                    safe_error_code="assistant_anchor_mismatch",
+                    effective_session_id=effective_id,
+                )
+                store.append_event(
+                    turn_id,
+                    "turn.failed",
+                    {"status": "failed", "error_code": "assistant_anchor_mismatch"},
+                )
+                return
+            store.append_event(
+                turn_id,
+                "assistant.completed",
+                {"completed": True, "assistant_message_id": assistant_message_id},
+            )
             if payload["delivery_mode"] in {"slack_only", "both"}:
                 assert binding is not None and slack_adapter is not None
-                await self._deliver_slack(store, turn_id, binding, slack_adapter, final_response)
+                await self._deliver_slack(
+                    store, turn_id, binding, slack_adapter, anchored_content
+                )
             store.finish(turn_id, "completed", effective_session_id=effective_id)
             store.append_event(turn_id, "turn.completed", {"status": "completed"})
         except asyncio.CancelledError:
@@ -958,7 +1130,30 @@ class SessionTurnService:
             store.append_event(turn_id, "delivery.failed", {"destination": "slack", "status": "needs_manual_retry", "error_code": "delivery_outcome_unknown"})
             return
         if getattr(result, "success", False):
-            store.finish_delivery(turn_id, "slack", "delivered")
+            provider_message_id = getattr(result, "message_id", None)
+            if not isinstance(provider_message_id, str) or not provider_message_id:
+                store.finish_delivery(
+                    turn_id,
+                    "slack",
+                    "needs_manual_retry",
+                    "provider_receipt_missing",
+                )
+                store.append_event(
+                    turn_id,
+                    "delivery.failed",
+                    {
+                        "destination": "slack",
+                        "status": "needs_manual_retry",
+                        "error_code": "provider_receipt_missing",
+                    },
+                )
+                return
+            store.finish_delivery(
+                turn_id,
+                "slack",
+                "delivered",
+                provider_message_id=provider_message_id,
+            )
             store.append_event(turn_id, "delivery.completed", {"destination": "slack", "status": "delivered"})
         else:
             # Once chat.postMessage was attempted, a timeout/error can be
@@ -1009,6 +1204,18 @@ class SessionTurnService:
                 "event_gap",
                 high_water=high_water,
             )
+        initial_rows = await asyncio.to_thread(store.events_after, turn_id, sequence)
+        volatile = self._volatile_events.get(turn_id, {})
+        missing_volatile = any(
+            row["event"] == "assistant.delta" and row["seq"] not in volatile
+            for row in initial_rows
+        )
+        if missing_volatile and turn["status"] in TERMINAL_STATUSES:
+            return _resync_error(
+                "Volatile assistant deltas were missed; reload the canonical transcript",
+                "volatile_events_lost",
+                high_water=high_water,
+            )
         response = web.StreamResponse(status=200, headers={
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
@@ -1018,13 +1225,34 @@ class SessionTurnService:
         try:
             while True:
                 rows = await asyncio.to_thread(store.events_after, turn_id, sequence)
+                current = await asyncio.to_thread(store.get, turn_id)
+                missing_volatile = any(
+                    row["event"] == "assistant.delta"
+                    and row["seq"] not in self._volatile_events.get(turn_id, {})
+                    for row in rows
+                )
+                if missing_volatile:
+                    if current and current["status"] not in TERMINAL_STATUSES:
+                        await asyncio.sleep(0.01)
+                        continue
+                    wire = json.dumps(
+                        {
+                            "error_code": "volatile_events_lost",
+                            "resync_required": True,
+                        }
+                    )
+                    await response.write(
+                        f"event: session.resync_required\ndata: {wire}\n\n".encode("utf-8")
+                    )
+                    break
                 for row in rows:
+                    if row["event"] == "assistant.delta":
+                        row = self._volatile_events[turn_id][row["seq"]]
                     sequence = row["seq"]
                     wire = json.dumps(row["data"], ensure_ascii=False)
                     await response.write(
                         f"id: {sequence}\nevent: {row['event']}\ndata: {wire}\n\n".encode("utf-8")
                     )
-                current = await asyncio.to_thread(store.get, turn_id)
                 if current and current["status"] in TERMINAL_STATUSES and not rows:
                     break
                 try:
@@ -1071,16 +1299,18 @@ class SessionTurnService:
         slack_adapter = self.adapter._get_platform_callback_adapter(request, "slack")
         if slack_adapter is None:
             return _error("Slack adapter is not connected", "slack_unavailable", 503)
-        effective_id = str(turn.get("effective_session_id") or session_id)
         try:
-            messages = await asyncio.to_thread(store.db.get_messages, effective_id)
+            content = await asyncio.to_thread(store.anchored_assistant_content, turn_id)
         except Exception:
             return _error("Session history unavailable", "session_history_unavailable", 503)
-        assistants = [row for row in messages if row.get("role") == "assistant"]
-        if not assistants or not isinstance(assistants[-1].get("content"), str):
-            return _error("Final response unavailable", "delivery_content_unavailable", 409)
+        if not isinstance(content, str):
+            return _error(
+                "Completed assistant anchor is missing or mismatched",
+                "assistant_anchor_unavailable",
+                409,
+            )
         await self._deliver_slack(
-            store, turn_id, binding, slack_adapter, assistants[-1]["content"]
+            store, turn_id, binding, slack_adapter, content
         )
         delivery = await asyncio.to_thread(store.get_delivery, turn_id, "slack")
         status = 200 if delivery and delivery["state"] == "delivered" else 409
