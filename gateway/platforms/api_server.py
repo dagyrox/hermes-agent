@@ -9,6 +9,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
+- GET  /api/sessions/search        — owner-scoped full-text message search
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
@@ -43,6 +44,7 @@ import asyncio
 import errno
 import hashlib
 import hmac
+import html
 import json
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -1563,6 +1565,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
+            # Static route must precede /api/sessions/{session_id}.
+            ("GET", "/api/sessions/search", self._handle_session_search),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
@@ -2112,6 +2116,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
+                "session_search": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
@@ -2139,6 +2144,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
+                "session_search": {
+                    "method": "GET",
+                    "path": "/api/sessions/search",
+                    "owner_scope": ["user_id", "source"],
+                },
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
@@ -2337,6 +2347,150 @@ class APIServerAdapter(BasePlatformAdapter):
             "limit": limit,
             "offset": offset,
             "has_more": len(sessions) == limit,
+        })
+
+    @staticmethod
+    def _bounded_search_snippet(value: Any, maximum: int = 480) -> str:
+        """Redact and HTML-escape an FTS snippet while preserving safe marks."""
+        redacted = redact_sensitive_text(str(value or ""), force=True)
+        output: List[str] = []
+        output_len = 0
+        marked = False
+
+        def _append(piece: str, *, reserve: int = 0) -> bool:
+            nonlocal output_len
+            if output_len + len(piece) + reserve > maximum:
+                return False
+            output.append(piece)
+            output_len += len(piece)
+            return True
+
+        for part in re.split(r"(\[\[\[|\]\]\])", redacted):
+            if part == "[[[":
+                if not marked and _append("<mark>", reserve=len("</mark>")):
+                    marked = True
+                continue
+            if part == "]]]":
+                if marked:
+                    _append("</mark>")
+                    marked = False
+                continue
+            for character in part:
+                escaped = html.escape(character, quote=True)
+                reserve = len("</mark>") if marked else 0
+                if not _append(escaped, reserve=reserve):
+                    if marked:
+                        _append("</mark>")
+                    return "".join(output)
+
+        if marked:
+            _append("</mark>")
+        return "".join(output)
+
+    async def _handle_session_search(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/search — safe exact-owner FTS search."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        query = request.rel_url.query
+        allowed = {"q", "user_id", "source", "limit", "offset"}
+        if any(key not in allowed for key in query):
+            return web.json_response(
+                _openai_error("Invalid search query parameters", code="invalid_query"),
+                status=400,
+            )
+        for key in allowed:
+            if len(query.getall(key, [])) > 1:
+                return web.json_response(
+                    _openai_error("Duplicate search query parameter", code="invalid_query"),
+                    status=400,
+                )
+
+        q = (query.get("q") or "").strip()
+        user_id = (query.get("user_id") or "").strip()
+        source = (query.get("source") or "").strip()
+        if (
+            not q
+            or not user_id
+            or not source
+            or len(q) > 256
+            or len(user_id) > 256
+            or len(source) > 64
+            or any(
+                "\x00" in value or "\r" in value or "\n" in value
+                for value in (q, user_id, source)
+            )
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Invalid or missing owner-scoped search query",
+                    code="invalid_query",
+                ),
+                status=400,
+            )
+
+        def _strict_int(
+            name: str, default: int, minimum: int, maximum: int
+        ) -> Optional[int]:
+            raw = query.get(name)
+            if raw is None:
+                return default
+            if not re.fullmatch(r"[0-9]+", raw):
+                return None
+            parsed = int(raw)
+            return parsed if minimum <= parsed <= maximum else None
+
+        limit = _strict_int("limit", 20, 1, 50)
+        offset = _strict_int("offset", 0, 0, 1_000_000)
+        if limit is None or offset is None:
+            return web.json_response(
+                _openai_error("Invalid search pagination", code="invalid_query"),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+        try:
+            rows = await asyncio.to_thread(
+                db.search_messages_scoped,
+                q,
+                user_id=user_id,
+                source=source,
+                limit=limit + 1,
+                offset=offset,
+            )
+        except Exception:
+            logger.exception("Owner-scoped session search failed")
+            return web.json_response(
+                _openai_error("Session search failed", err_type="server_error"),
+                status=500,
+            )
+
+        has_more = len(rows) > limit
+        data = [
+            {
+                "session_id": row["session_id"],
+                "message_id": row["message_id"],
+                "role": row["role"],
+                "timestamp": row["timestamp"],
+                "snippet": self._bounded_search_snippet(row.get("snippet")),
+                "rank": float(row.get("rank") or 0.0),
+            }
+            for row in rows[:limit]
+        ]
+        return web.json_response({
+            "object": "list",
+            "data": data,
+            "limit": limit,
+            "offset": offset,
+            "has_more": has_more,
         })
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":

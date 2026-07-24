@@ -7229,6 +7229,65 @@ class SessionDB:
                     query[:200],
                 )
 
+    def search_messages_scoped(
+        self,
+        query: str,
+        *,
+        user_id: str,
+        source: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Return a minimal, exact-owner page from the authoritative FTS5 index.
+
+        This narrow HTTP-facing primitive intentionally omits the adjacent
+        transcript context and extra metadata returned by ``search_messages``.
+        Exact non-empty owner predicates are mandatory, so an omitted filter
+        can never become an unscoped transcript search.
+        """
+        if not self._fts_enabled or not user_id or not source:
+            return []
+        if not query or not query.strip() or limit <= 0 or offset < 0:
+            return []
+
+        fts_query = self._sanitize_fts5_query(query)
+        if not fts_query:
+            return []
+
+        sql = """
+            SELECT
+                m.id AS message_id,
+                m.session_id,
+                m.role,
+                m.timestamp,
+                snippet(messages_fts, -1, '[[[', ']]]', '...', 40) AS snippet,
+                rank AS rank
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE messages_fts MATCH ?
+              AND (m.active = 1 OR m.compacted = 1)
+              AND s.user_id = ?
+              AND s.source = ?
+              AND m.role IN ('user', 'assistant')
+            ORDER BY rank, m.timestamp DESC, m.id DESC
+            LIMIT ? OFFSET ?
+        """
+        params = (fts_query, user_id, source, limit, offset)
+        assert self._conn is not None
+        try:
+            with self._lock:
+                return [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+        except sqlite3.OperationalError:
+            # The shared sanitizer should prevent syntax errors.  Fail closed
+            # if a platform-specific tokenizer still rejects the query.
+            return []
+        except sqlite3.DatabaseError as exc:
+            if not self._try_runtime_fts_rebuild(exc):
+                raise
+            with self._lock:
+                return [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+
     def _describe_search_path(self, query: str) -> str:
         """Best-effort name of the routing path a query takes (log-only)."""
         try:
