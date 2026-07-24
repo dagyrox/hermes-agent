@@ -61,7 +61,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -2428,13 +2428,21 @@ class APIServerAdapter(BasePlatformAdapter):
             raise SessionHistoryReadError("session history unavailable") from exc
 
     async def _acquire_session_execution_lease(
-        self, session_id: str, *, owner_prefix: str
+        self,
+        session_id: str,
+        *,
+        owner_prefix: str,
+        on_lost: Optional[Callable[[], None]] = None,
     ) -> SessionExecutionLease:
         db = await self._ensure_session_db_async()
         if db is None:
             raise SessionHistoryReadError("session database unavailable")
         return await SessionExecutionLease.acquire(
-            db, session_id, owner_prefix=owner_prefix, wait_timeout=0.0
+            db,
+            session_id,
+            owner_prefix=owner_prefix,
+            wait_timeout=0.0,
+            on_lost=on_lost,
         )
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
@@ -3277,9 +3285,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 lease = await self._acquire_session_execution_lease(
                     session_id, owner_prefix="api:session-chat-stream"
                 )
+                history = await self._conversation_history_for_session(session_id)
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = await self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -3488,9 +3496,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 db = await self._ensure_session_db_async()
                 if db is not None:
                     history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
+            except Exception:
+                logger.warning("Failed to load canonical session history for %s", session_id)
+                return web.json_response(
+                    _openai_error(
+                        "Session history unavailable",
+                        code="session_history_unavailable",
+                    ),
+                    status=503,
+                )
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)

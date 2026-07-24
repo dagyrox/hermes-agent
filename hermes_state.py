@@ -1189,7 +1189,7 @@ CREATE TABLE IF NOT EXISTS session_fork_requests (
 );
 
 CREATE TABLE IF NOT EXISTS session_execution_leases (
-    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    session_id TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL,
     owner_pid INTEGER NOT NULL,
     owner_host TEXT NOT NULL,
@@ -2995,6 +2995,34 @@ class SessionDB:
                 """
             )
 
+        # Early H1 builds tied execution leases to sessions with a foreign key.
+        # Gateway admission and synthetic recovery can legitimately acquire the
+        # exclusivity fence before a session row is materialized, so rebuild
+        # that metadata-only table once without weakening its PRIMARY KEY.
+        if cursor.execute(
+            "PRAGMA foreign_key_list(session_execution_leases)"
+        ).fetchall():
+            cursor.executescript(
+                """
+                ALTER TABLE session_execution_leases RENAME TO session_execution_leases_with_fk;
+                CREATE TABLE session_execution_leases (
+                    session_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    owner_pid INTEGER NOT NULL,
+                    owner_host TEXT NOT NULL,
+                    owner_boot_id TEXT NOT NULL,
+                    acquired_at REAL NOT NULL,
+                    heartbeat_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                INSERT INTO session_execution_leases
+                    SELECT * FROM session_execution_leases_with_fk;
+                DROP TABLE session_execution_leases_with_fk;
+                CREATE INDEX IF NOT EXISTS idx_session_execution_leases_expires
+                    ON session_execution_leases(expires_at);
+                """
+            )
+
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
         # This is idempotent and self-healing: even if a version-gated
@@ -3914,10 +3942,10 @@ class SessionDB:
 
     @classmethod
     def _execution_lease_owner_is_alive(cls, row: Any) -> bool:
-        """Fail closed unless a local expired owner is provably dead."""
+        """Return whether a same-host/same-boot owner PID is still alive."""
         pid, host, boot_id = cls._execution_lease_process_identity()
         if str(row["owner_host"]) != host or str(row["owner_boot_id"]) != boot_id:
-            return True
+            return False
         owner_pid = int(row["owner_pid"])
         if owner_pid == pid:
             return True
@@ -3929,14 +3957,44 @@ class SessionDB:
             return True
         return True
 
+    @classmethod
+    def session_execution_lease_owner_state(cls, row: Any, *, now: Optional[float] = None) -> str:
+        """Classify durable ownership as ``live``, ``dead``, or ``stale``.
+
+        A local PID is directly verifiable. Remote-host or prior-boot owners are
+        preserved only through their unexpired heartbeat window; once expired,
+        they are deterministically stale and may be fenced.
+        """
+        current_pid, host, boot_id = cls._execution_lease_process_identity()
+        same_host_boot = (
+            str(row["owner_host"]) == host
+            and str(row["owner_boot_id"]) == boot_id
+        )
+        if same_host_boot:
+            if int(row["owner_pid"]) == current_pid:
+                return "live"
+            return "live" if cls._execution_lease_owner_is_alive(row) else "dead"
+        current_time = time.time() if now is None else float(now)
+        return "live" if float(row["expires_at"]) > current_time else "stale"
+
+    def get_session_execution_lease(self, session_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            assert self._conn is not None
+            row = self._conn.execute(
+                "SELECT * FROM session_execution_leases WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def acquire_session_execution_lease(
         self, session_id: str, owner_id: str, *, ttl_seconds: float = 60.0
     ) -> bool:
         """Atomically acquire/renew the canonical cross-process session lease.
 
-        Expiry alone never steals from a live or unverifiable owner. An expired
-        lease is reconciled only when its same-host/same-boot PID is provably
-        dead, preventing a paused live worker from being overlapped.
+        A same-host/same-boot lease is never stolen from a live PID and may be
+        reconciled as soon as that PID is provably dead. A remote-host or
+        prior-boot owner is preserved through its heartbeat expiry, then
+        classified stale so a crashed process cannot wedge the session.
         """
         if not session_id or not owner_id:
             return False
@@ -3949,7 +4007,7 @@ class SessionDB:
                 "SELECT * FROM session_execution_leases WHERE session_id = ?", (session_id,)
             ).fetchone()
             if row is not None and row["owner_id"] != owner_id:
-                if float(row["expires_at"]) > now or self._execution_lease_owner_is_alive(row):
+                if self.session_execution_lease_owner_state(row, now=now) == "live":
                     return False
             conn.execute(
                 """INSERT INTO session_execution_leases

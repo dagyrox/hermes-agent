@@ -2097,6 +2097,7 @@ from gateway.config import (
 )
 from gateway.session import (
     AsyncSessionStore,
+    CanonicalSessionHistoryError,
     SessionEntry,
     SessionStore,
     SessionSource,
@@ -12103,6 +12104,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
+        except CanonicalSessionHistoryError:
+            logger.error(
+                "Canonical session history unavailable for gateway session %s",
+                _quick_key,
+            )
+            return (
+                "I couldn't safely load this conversation's history, so the turn "
+                "was not run. Please retry after the session database is available."
+            )
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -12969,13 +12979,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Cross-process canonical lease closes API/OCC versus gateway/Slack
         # overlap. It is acquired before history read and released by the
         # dispatch finally on every success/error/interrupt path.
+        _durable_lease = None
         _canonical_db = getattr(getattr(self, "_session_db", None), "_db", getattr(self, "_session_db", None))
-        if callable(getattr(_canonical_db, "acquire_session_execution_lease", None)):
+        # Require the concrete SessionDB lease interface.  Generic mocks and
+        # legacy transcript shims synthesize arbitrary attributes and must not
+        # be mistaken for a durable ownership backend.
+        _lease_backend = all(
+            callable(getattr(type(_canonical_db), method, None))
+            for method in (
+                "acquire_session_execution_lease",
+                "get_session_execution_lease",
+                "heartbeat_session_execution_lease",
+                "release_session_execution_lease",
+            )
+        )
+        if _lease_backend:
+            def _interrupt_on_durable_lease_loss() -> None:
+                active = self._running_agents.get(_quick_key)
+                if callable(getattr(active, "interrupt", None)):
+                    active.interrupt("Persistent session execution lease lost")
+
             _durable_lease = await SessionExecutionLease.acquire(
                 _canonical_db,
                 session_entry.session_id,
                 owner_prefix=f"gateway:{_quick_key}:{run_generation}",
                 wait_timeout=_float_env("HERMES_AGENT_TIMEOUT", 1800),
+                on_lost=_interrupt_on_durable_lease_loss,
             )
             if not hasattr(self, "_durable_turn_lease_tokens"):
                 self._durable_turn_lease_tokens = {}
@@ -13740,6 +13769,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
             )
+            if _durable_lease is not None and not await _durable_lease.still_owned():
+                logger.error(
+                    "Discarding gateway result for %s after persistent lease loss",
+                    _quick_key,
+                )
+                return None
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
