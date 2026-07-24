@@ -1,5 +1,6 @@
 """Behavior contract and real SQLite E2E for owner-scoped session search."""
 
+import html
 import json
 
 import pytest
@@ -67,6 +68,11 @@ def search_runtime(tmp_path, monkeypatch):
     )
     db.append_message("owned-slack-b", "user", "or7needle second owned match")
     db.append_message("owned-slack-b", "assistant", "unrelated body")
+    db.append_message(
+        "owned-slack-b",
+        "user",
+        "or7marker [[[user-authored-marker]]] useful surrounding context",
+    )
     db.append_message("other-owner", "user", "or7needle foreign owner body")
     db.append_message("other-source", "user", "or7needle foreign source body")
 
@@ -114,9 +120,8 @@ async def test_search_rejects_malformed_duplicate_unknown_and_unbounded_params(
         f"{base}&q=or7needle&limit=0",
         f"{base}&q=or7needle&limit=51",
         f"{base}&q=or7needle&limit=abc",
-        f"{base}&q=or7needle&offset=-1",
-        f"{base}&q=or7needle&offset=abc",
-        f"{base}&q=or7needle&offset=1000001",
+        f"{base}&q=or7needle&offset=0",
+        f"{base}&q=or7needle&cursor=not-base64",
         f"{base}&q=or7needle&extra=true",
         f"{base}&q={'x' * 257}",
         f"/api/sessions/search?q=or7needle&user_id={'x' * 257}&source=slack",
@@ -144,8 +149,8 @@ async def test_search_is_owner_source_and_role_scoped_with_safe_bounded_fields(
 
     assert payload["object"] == "list"
     assert payload["limit"] == 20
-    assert payload["offset"] == 0
     assert payload["has_more"] is False
+    assert payload["next_cursor"] is None
     assert {row["session_id"] for row in payload["data"]} == {
         "owned-slack-a",
         "owned-slack-b",
@@ -176,6 +181,63 @@ async def test_search_is_owner_source_and_role_scoped_with_safe_bounded_fields(
 
 
 @pytest.mark.asyncio
+async def test_search_redacts_credential_prefix_before_safe_highlighting(search_runtime):
+    adapter, _, secret = search_runtime
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get(
+            "/api/sessions/search?q=sk&user_id=owner-1&source=slack",
+            headers=AUTH,
+        )
+        assert response.status == 200
+        payload = await response.json()
+
+    serialized = html.unescape(json.dumps(payload))
+    assert payload["data"]
+    assert secret not in serialized
+    assert "testcredential1234567890" not in serialized
+    assert "credential1234567890" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_search_never_trusts_user_authored_highlight_markers(search_runtime):
+    adapter, _, _ = search_runtime
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get(
+            "/api/sessions/search?q=or7marker&user_id=owner-1&source=slack",
+            headers=AUTH,
+        )
+        assert response.status == 200
+        payload = await response.json()
+
+    snippet = payload["data"][0]["snippet"]
+    assert "<mark>or7marker</mark>" in snippet
+    assert "<mark>user-authored-marker</mark>" not in snippet
+    assert "[[[user-authored-marker]]]" in html.unescape(snippet)
+
+
+@pytest.mark.asyncio
+async def test_search_short_match_is_useful_but_never_returns_complete_body(
+    search_runtime,
+):
+    adapter, _, _ = search_runtime
+    original = "or7needle assistant safe match"
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        response = await client.get(
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack&limit=20",
+            headers=AUTH,
+        )
+        assert response.status == 200
+        payload = await response.json()
+
+    snippets = [html.unescape(row["snippet"]) for row in payload["data"]]
+    assert any("assistant safe" in snippet for snippet in snippets)
+    assert all(
+        original not in snippet.replace("<mark>", "").replace("</mark>", "")
+        for snippet in snippets
+    )
+
+
+@pytest.mark.asyncio
 async def test_search_sanitizes_natural_language_fts_and_returns_nonmatches(
     search_runtime,
 ):
@@ -197,27 +259,40 @@ async def test_search_sanitizes_natural_language_fts_and_returns_nonmatches(
 
 
 @pytest.mark.asyncio
-async def test_search_pagination_is_stable_and_nonoverlapping(search_runtime):
-    adapter, _, _ = search_runtime
+async def test_search_cursor_does_not_overlap_when_match_is_inserted_between_pages(
+    search_runtime,
+):
+    adapter, db, _ = search_runtime
     async with TestClient(TestServer(_make_app(adapter))) as client:
 
-        async def page(offset: int):
+        async def page(cursor: str | None = None):
+            cursor_query = f"&cursor={cursor}" if cursor else ""
             response = await client.get(
-                f"/api/sessions/search?q=or7needle&user_id=owner-1&source=slack&limit=2&offset={offset}",
+                "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack"
+                f"&limit=2{cursor_query}",
                 headers=AUTH,
             )
             assert response.status == 200
             return await response.json()
 
-        first = await page(0)
-        first_repeat = await page(0)
-        second = await page(2)
+        first = await page()
+        inserted_id = db.append_message(
+            "owned-slack-a", "user", "or7needle inserted between cursor pages"
+        )
+        second = await page(first["next_cursor"])
+        wrong_scope = await client.get(
+            "/api/sessions/search?q=or7needle&user_id=owner-2&source=slack"
+            f"&limit=2&cursor={first['next_cursor']}",
+            headers=AUTH,
+        )
 
     first_ids = [row["message_id"] for row in first["data"]]
     second_ids = [row["message_id"] for row in second["data"]]
-    assert first_ids == [row["message_id"] for row in first_repeat["data"]]
     assert first["has_more"] is True
+    assert first["next_cursor"]
+    assert wrong_scope.status == 400
     assert not set(first_ids) & set(second_ids)
+    assert inserted_id not in second_ids
     assert len(first_ids + second_ids) == 3
 
 
@@ -234,4 +309,50 @@ async def test_capabilities_advertise_owner_scoped_search(search_runtime):
         "method": "GET",
         "path": "/api/sessions/search",
         "owner_scope": ["user_id", "source"],
+        "pagination": {
+            "type": "cursor",
+            "parameter": "cursor",
+            "ordering": ["rank_asc", "timestamp_desc", "message_id_desc"],
+            "snapshot": "message_id_high_water",
+        },
     }
+
+
+@pytest.mark.asyncio
+async def test_search_disabled_is_not_advertised_and_returns_safe_503(search_runtime):
+    adapter, db, _ = search_runtime
+    db._fts_enabled = False
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        capabilities = await client.get("/v1/capabilities", headers=AUTH)
+        assert capabilities.status == 200
+        advertised = await capabilities.json()
+        assert advertised["features"]["session_search"] is False
+        assert "session_search" not in advertised["endpoints"]
+
+        response = await client.get(
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack",
+            headers=AUTH,
+        )
+        assert response.status == 503
+        payload = await response.json()
+        assert payload["error"]["code"] == "session_search_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_search_operational_fts_failure_is_503_not_empty_success(search_runtime):
+    adapter, db, _ = search_runtime
+    db._conn.execute("DROP TABLE messages_fts")
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        capabilities = await client.get("/v1/capabilities", headers=AUTH)
+        assert capabilities.status == 200
+        advertised = await capabilities.json()
+        assert advertised["features"]["session_search"] is False
+        assert "session_search" not in advertised["endpoints"]
+
+        response = await client.get(
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack",
+            headers=AUTH,
+        )
+        assert response.status == 503
+        payload = await response.json()
+        assert payload["error"]["code"] == "session_search_unavailable"

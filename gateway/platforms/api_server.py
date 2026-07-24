@@ -41,11 +41,14 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import errno
 import hashlib
 import hmac
 import html
 import json
+import math
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
@@ -93,6 +96,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from hermes_state import SessionSearchUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -2085,6 +2089,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        session_db = await self._ensure_session_db_async()
+        session_search_available = bool(
+            session_db
+            and await asyncio.to_thread(session_db.session_search_available)
+        )
+        session_search_endpoint = {
+            "method": "GET",
+            "path": "/api/sessions/search",
+            "owner_scope": ["user_id", "source"],
+            "pagination": {
+                "type": "cursor",
+                "parameter": "cursor",
+                "ordering": ["rank_asc", "timestamp_desc", "message_id_desc"],
+                "snapshot": "message_id_high_water",
+            },
+        }
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -2116,7 +2137,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
-                "session_search": True,
+                "session_search": session_search_available,
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
@@ -2144,11 +2165,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
-                "session_search": {
-                    "method": "GET",
-                    "path": "/api/sessions/search",
-                    "owner_scope": ["user_id", "source"],
-                },
+                **(
+                    {"session_search": session_search_endpoint}
+                    if session_search_available
+                    else {}
+                ),
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
@@ -2350,42 +2371,175 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     @staticmethod
-    def _bounded_search_snippet(value: Any, maximum: int = 480) -> str:
-        """Redact and HTML-escape an FTS snippet while preserving safe marks."""
+    def _search_highlight_terms(query: str) -> List[str]:
+        """Extract literal terms for presentation-only post-redaction highlighting."""
+        terms: List[str] = []
+        for token in re.findall(r"[\w.-]+\*?", query, flags=re.UNICODE):
+            token = token.rstrip("*.-")
+            if token and token.upper() not in {"AND", "OR", "NOT"}:
+                terms.append(token)
+        return sorted(set(terms), key=len, reverse=True)
+
+    @classmethod
+    def _bounded_search_snippet(
+        cls,
+        value: Any,
+        query: str,
+        maximum: int = 480,
+    ) -> str:
+        """Redact raw content, then build a bounded, never-complete excerpt.
+
+        Highlight markup is generated only after redaction. No marker-like text
+        originating in a message is ever interpreted as trusted presentation data.
+        """
         redacted = redact_sensitive_text(str(value or ""), force=True)
-        output: List[str] = []
-        output_len = 0
-        marked = False
+        if not redacted:
+            return "…"
 
-        def _append(piece: str, *, reserve: int = 0) -> bool:
-            nonlocal output_len
-            if output_len + len(piece) + reserve > maximum:
-                return False
-            output.append(piece)
-            output_len += len(piece)
-            return True
+        terms = cls._search_highlight_terms(query)
+        match = None
+        for term in terms:
+            candidate = re.search(re.escape(term), redacted, flags=re.IGNORECASE)
+            if candidate and (match is None or candidate.start() < match.start()):
+                match = candidate
 
-        for part in re.split(r"(\[\[\[|\]\]\])", redacted):
-            if part == "[[[":
-                if not marked and _append("<mark>", reserve=len("</mark>")):
-                    marked = True
-                continue
-            if part == "]]]":
-                if marked:
-                    _append("</mark>")
-                    marked = False
-                continue
-            for character in part:
-                escaped = html.escape(character, quote=True)
-                reserve = len("</mark>") if marked else 0
-                if not _append(escaped, reserve=reserve):
-                    if marked:
-                        _append("</mark>")
-                    return "".join(output)
+        # Six output characters cover the longest HTML escape for one input
+        # character. Keeping the plain excerpt to this budget guarantees room
+        # for generated <mark> tags and omission ellipses within ``maximum``.
+        excerpt_budget = max(1, min(72, (maximum - 28) // 6))
+        if len(redacted) <= excerpt_budget:
+            if len(redacted) == 1:
+                excerpt = ""
+                prefix_omitted = False
+                suffix_omitted = True
+            elif match is not None and match.end() == len(redacted) and match.start() > 0:
+                excerpt = redacted[1:]
+                prefix_omitted = True
+                suffix_omitted = False
+            else:
+                excerpt = redacted[:-1]
+                prefix_omitted = False
+                suffix_omitted = True
+        else:
+            anchor = match.start() if match is not None else 0
+            start = max(0, min(anchor - excerpt_budget // 3, len(redacted) - excerpt_budget))
+            end = start + excerpt_budget
+            excerpt = redacted[start:end]
+            prefix_omitted = start > 0
+            suffix_omitted = end < len(redacted)
 
-        if marked:
-            _append("</mark>")
+        if not excerpt:
+            return "…"
+
+        pattern = None
+        if terms:
+            pattern = re.compile(
+                "|".join(re.escape(term) for term in terms),
+                flags=re.IGNORECASE,
+            )
+        output: List[str] = ["…"] if prefix_omitted else []
+        position = 0
+        if pattern is not None:
+            for highlighted in pattern.finditer(excerpt):
+                output.append(html.escape(excerpt[position:highlighted.start()], quote=True))
+                output.append("<mark>")
+                output.append(html.escape(highlighted.group(0), quote=True))
+                output.append("</mark>")
+                position = highlighted.end()
+        output.append(html.escape(excerpt[position:], quote=True))
+        if suffix_omitted:
+            output.append("…")
         return "".join(output)
+
+    @staticmethod
+    def _search_cursor_scope_hash(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _encode_search_cursor(
+        cls,
+        *,
+        query: str,
+        user_id: str,
+        source: str,
+        snapshot_message_id: int,
+        boundary: Dict[str, Any],
+        seen_message_ids: List[int],
+    ) -> str:
+        payload = {
+            "v": 1,
+            "q": cls._search_cursor_scope_hash(query),
+            "u": cls._search_cursor_scope_hash(user_id),
+            "s": cls._search_cursor_scope_hash(source),
+            "h": snapshot_message_id,
+            "r": float(boundary["rank"]),
+            "t": boundary["timestamp"],
+            "i": int(boundary["message_id"]),
+            "x": seen_message_ids,
+        }
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
+        return encoded.rstrip(b"=").decode("ascii")
+
+    @classmethod
+    def _decode_search_cursor(
+        cls,
+        value: str,
+        *,
+        query: str,
+        user_id: str,
+        source: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not value or len(value) > 16_384 or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+            return None
+        try:
+            padding = "=" * (-len(value) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(value + padding))
+            if not isinstance(payload, dict) or payload.get("v") != 1:
+                return None
+            expected = (
+                cls._search_cursor_scope_hash(query),
+                cls._search_cursor_scope_hash(user_id),
+                cls._search_cursor_scope_hash(source),
+            )
+            actual = (payload.get("q"), payload.get("u"), payload.get("s"))
+            if any(
+                not isinstance(left, str)
+                or not isinstance(right, str)
+                or not hmac.compare_digest(left, right)
+                for left, right in zip(actual, expected)
+            ):
+                return None
+            high_water = int(payload["h"])
+            rank = float(payload["r"])
+            message_id = int(payload["i"])
+            timestamp = payload["t"]
+            seen = payload.get("x", [])
+            if (
+                high_water < 0
+                or message_id <= 0
+                or not math.isfinite(rank)
+                or not isinstance(timestamp, (int, float))
+                or not isinstance(seen, list)
+                or len(seen) > 5_000
+                or any(not isinstance(item, int) or item <= 0 for item in seen)
+            ):
+                return None
+            return {
+                "snapshot_message_id": high_water,
+                "after": (rank, timestamp, message_id),
+                "seen_message_ids": seen,
+            }
+        except (
+            binascii.Error,
+            KeyError,
+            TypeError,
+            UnicodeDecodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return None
 
     async def _handle_session_search(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/search — safe exact-owner FTS search."""
@@ -2394,7 +2548,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         query = request.rel_url.query
-        allowed = {"q", "user_id", "source", "limit", "offset"}
+        allowed = {"q", "user_id", "source", "limit", "cursor"}
         if any(key not in allowed for key in query):
             return web.json_response(
                 _openai_error("Invalid search query parameters", code="invalid_query"),
@@ -2430,41 +2584,66 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        def _strict_int(
-            name: str, default: int, minimum: int, maximum: int
-        ) -> Optional[int]:
-            raw = query.get(name)
-            if raw is None:
-                return default
-            if not re.fullmatch(r"[0-9]+", raw):
-                return None
-            parsed = int(raw)
-            return parsed if minimum <= parsed <= maximum else None
-
-        limit = _strict_int("limit", 20, 1, 50)
-        offset = _strict_int("offset", 0, 0, 1_000_000)
-        if limit is None or offset is None:
+        raw_limit = query.get("limit")
+        if raw_limit is None:
+            limit = 20
+        elif re.fullmatch(r"[0-9]+", raw_limit):
+            limit = int(raw_limit)
+        else:
+            limit = 0
+        if not 1 <= limit <= 50:
             return web.json_response(
                 _openai_error("Invalid search pagination", code="invalid_query"),
                 status=400,
             )
 
+        cursor_value = query.get("cursor")
+        cursor = None
+        if cursor_value is not None:
+            cursor = self._decode_search_cursor(
+                cursor_value,
+                query=q,
+                user_id=user_id,
+                source=source,
+            )
+            if cursor is None:
+                return web.json_response(
+                    _openai_error("Invalid search cursor", code="invalid_query"),
+                    status=400,
+                )
+
         db = await self._ensure_session_db_async()
         if db is None:
             return web.json_response(
                 _openai_error(
-                    "Session database unavailable", code="session_db_unavailable"
+                    "Session search unavailable", code="session_search_unavailable"
                 ),
                 status=503,
             )
         try:
-            rows = await asyncio.to_thread(
+            if not await asyncio.to_thread(db.session_search_available):
+                raise SessionSearchUnavailable("Session full-text search is unavailable")
+            rows, snapshot_message_id = await asyncio.to_thread(
                 db.search_messages_scoped,
                 q,
                 user_id=user_id,
                 source=source,
                 limit=limit + 1,
-                offset=offset,
+                snapshot_message_id=(
+                    cursor["snapshot_message_id"] if cursor is not None else None
+                ),
+                after=cursor["after"] if cursor is not None else None,
+                exclude_message_ids=(
+                    cursor["seen_message_ids"] if cursor is not None else None
+                ),
+            )
+        except SessionSearchUnavailable:
+            logger.warning("Owner-scoped session search unavailable", exc_info=True)
+            return web.json_response(
+                _openai_error(
+                    "Session search unavailable", code="session_search_unavailable"
+                ),
+                status=503,
             )
         except Exception:
             logger.exception("Owner-scoped session search failed")
@@ -2474,23 +2653,36 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         has_more = len(rows) > limit
+        page_rows = rows[:limit]
         data = [
             {
                 "session_id": row["session_id"],
                 "message_id": row["message_id"],
                 "role": row["role"],
                 "timestamp": row["timestamp"],
-                "snippet": self._bounded_search_snippet(row.get("snippet")),
+                "snippet": self._bounded_search_snippet(row.get("content"), q),
                 "rank": float(row.get("rank") or 0.0),
             }
-            for row in rows[:limit]
+            for row in page_rows
         ]
+        next_cursor = None
+        if has_more and page_rows:
+            previous_seen = cursor["seen_message_ids"] if cursor is not None else []
+            next_cursor = self._encode_search_cursor(
+                query=q,
+                user_id=user_id,
+                source=source,
+                snapshot_message_id=snapshot_message_id,
+                boundary=page_rows[-1],
+                seen_message_ids=previous_seen
+                + [int(row["message_id"]) for row in page_rows],
+            )
         return web.json_response({
             "object": "list",
             "data": data,
             "limit": limit,
-            "offset": offset,
             "has_more": has_more,
+            "next_cursor": next_cursor,
         })
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":

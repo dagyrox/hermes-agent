@@ -38,6 +38,11 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
 
 logger = logging.getLogger(__name__)
 
+
+class SessionSearchUnavailable(RuntimeError):
+    """The authoritative FTS index cannot safely serve session search."""
+
+
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
 
@@ -7229,6 +7234,10 @@ class SessionDB:
                     query[:200],
                 )
 
+    def session_search_available(self) -> bool:
+        """Return whether the authoritative FTS table is enabled and queryable."""
+        return bool(self._fts_enabled and self._conn and self._fts_table_exists("messages_fts"))
+
     def search_messages_scoped(
         self,
         query: str,
@@ -7236,57 +7245,131 @@ class SessionDB:
         user_id: str,
         source: str,
         limit: int = 20,
-        offset: int = 0,
-    ) -> List[Dict[str, Any]]:
-        """Return a minimal, exact-owner page from the authoritative FTS5 index.
+        snapshot_message_id: Optional[int] = None,
+        after: Optional[Tuple[float, Any, int]] = None,
+        exclude_message_ids: Optional[List[int]] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Return a minimal exact-owner FTS page using a stable snapshot cursor.
 
-        This narrow HTTP-facing primitive intentionally omits the adjacent
-        transcript context and extra metadata returned by ``search_messages``.
-        Exact non-empty owner predicates are mandatory, so an omitted filter
-        can never become an unscoped transcript search.
+        Results are ordered by FTS rank, timestamp descending, then message id
+        descending. ``snapshot_message_id`` freezes the candidate row set at the
+        first page's high-water mark; ``after`` is the keyset boundary. Previously
+        returned ids may also be excluded defensively because FTS corpus statistics
+        can shift ranks when later rows are indexed.
         """
-        if not self._fts_enabled or not user_id or not source:
-            return []
-        if not query or not query.strip() or limit <= 0 or offset < 0:
-            return []
+        if not self.session_search_available():
+            raise SessionSearchUnavailable("Session full-text search is unavailable")
+        if not user_id or not source:
+            return [], 0
+        if not query or not query.strip() or limit <= 0:
+            return [], 0
 
         fts_query = self._sanitize_fts5_query(query)
         if not fts_query:
-            return []
+            return [], 0
 
-        sql = """
-            SELECT
-                m.id AS message_id,
-                m.session_id,
-                m.role,
-                m.timestamp,
-                snippet(messages_fts, -1, '[[[', ']]]', '...', 40) AS snippet,
-                rank AS rank
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
-            JOIN sessions s ON s.id = m.session_id
-            WHERE messages_fts MATCH ?
-              AND (m.active = 1 OR m.compacted = 1)
-              AND s.user_id = ?
-              AND s.source = ?
-              AND m.role IN ('user', 'assistant')
-            ORDER BY rank, m.timestamp DESC, m.id DESC
-            LIMIT ? OFFSET ?
-        """
-        params = (fts_query, user_id, source, limit, offset)
         assert self._conn is not None
         try:
             with self._lock:
-                return [dict(row) for row in self._conn.execute(sql, params).fetchall()]
-        except sqlite3.OperationalError:
-            # The shared sanitizer should prevent syntax errors.  Fail closed
-            # if a platform-specific tokenizer still rejects the query.
-            return []
+                if snapshot_message_id is None:
+                    snapshot_row = self._conn.execute(
+                        """
+                        SELECT COALESCE(MAX(m.id), 0)
+                        FROM messages m
+                        JOIN sessions s ON s.id = m.session_id
+                        WHERE (m.active = 1 OR m.compacted = 1)
+                          AND s.user_id = ?
+                          AND s.source = ?
+                          AND m.role IN ('user', 'assistant')
+                        """,
+                        (user_id, source),
+                    ).fetchone()
+                    snapshot_message_id = int(snapshot_row[0] or 0)
+
+                params: List[Any] = [
+                    fts_query,
+                    user_id,
+                    source,
+                    snapshot_message_id,
+                ]
+                keyset_clause = ""
+                if after is not None:
+                    after_rank, after_timestamp, after_message_id = after
+                    keyset_clause = """
+                      AND (
+                            search_rank > ?
+                         OR (search_rank = ? AND timestamp < ?)
+                         OR (search_rank = ? AND timestamp = ? AND message_id < ?)
+                      )
+                    """
+                    params.extend(
+                        [
+                            after_rank,
+                            after_rank,
+                            after_timestamp,
+                            after_rank,
+                            after_timestamp,
+                            after_message_id,
+                        ]
+                    )
+
+                excluded = [int(value) for value in (exclude_message_ids or [])]
+                exclusion_clause = ""
+                if excluded:
+                    placeholders = ",".join("?" for _ in excluded)
+                    exclusion_clause = f" AND message_id NOT IN ({placeholders})"
+                    params.extend(excluded)
+
+                params.append(limit)
+                sql = f"""
+                    WITH ranked AS (
+                        SELECT
+                            m.id AS message_id,
+                            m.session_id,
+                            m.role,
+                            m.timestamp,
+                            m.content,
+                            rank AS search_rank
+                        FROM messages_fts
+                        JOIN messages m ON m.id = messages_fts.rowid
+                        JOIN sessions s ON s.id = m.session_id
+                        WHERE messages_fts MATCH ?
+                          AND (m.active = 1 OR m.compacted = 1)
+                          AND s.user_id = ?
+                          AND s.source = ?
+                          AND m.role IN ('user', 'assistant')
+                          AND m.id <= ?
+                    )
+                    SELECT
+                        message_id,
+                        session_id,
+                        role,
+                        timestamp,
+                        content,
+                        search_rank AS rank
+                    FROM ranked
+                    WHERE 1 = 1
+                    {keyset_clause}
+                    {exclusion_clause}
+                    ORDER BY search_rank, timestamp DESC, message_id DESC
+                    LIMIT ?
+                """
+                rows = [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+                return rows, snapshot_message_id
         except sqlite3.DatabaseError as exc:
-            if not self._try_runtime_fts_rebuild(exc):
-                raise
-            with self._lock:
-                return [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+            if self._try_runtime_fts_rebuild(exc):
+                return self.search_messages_scoped(
+                    query,
+                    user_id=user_id,
+                    source=source,
+                    limit=limit,
+                    snapshot_message_id=snapshot_message_id,
+                    after=after,
+                    exclude_message_ids=exclude_message_ids,
+                )
+            raise SessionSearchUnavailable(
+                "Session full-text search is operationally unavailable"
+            ) from exc
 
     def _describe_search_path(self, query: str) -> str:
         """Best-effort name of the routing path a query takes (log-only)."""
