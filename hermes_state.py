@@ -1172,6 +1172,19 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_execution_leases (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    owner_id TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    owner_host TEXT NOT NULL,
+    owner_boot_id TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    heartbeat_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_execution_leases_expires
+    ON session_execution_leases(expires_at);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -3501,6 +3514,104 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    @staticmethod
+    def _execution_lease_process_identity() -> tuple[int, str, str]:
+        """Return PID, host and Linux boot id used for safe stale-owner checks."""
+        pid = os.getpid()
+        try:
+            host = os.uname().nodename
+        except AttributeError:  # pragma: no cover - Windows
+            import socket
+            host = socket.gethostname()
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        except OSError:
+            boot_id = "unavailable"
+        return pid, host, boot_id
+
+    @classmethod
+    def _execution_lease_owner_is_alive(cls, row: Any) -> bool:
+        """Fail closed unless a local expired owner is provably dead."""
+        pid, host, boot_id = cls._execution_lease_process_identity()
+        if str(row["owner_host"]) != host or str(row["owner_boot_id"]) != boot_id:
+            return True
+        owner_pid = int(row["owner_pid"])
+        if owner_pid == pid:
+            return True
+        try:
+            os.kill(owner_pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return True
+        return True
+
+    def acquire_session_execution_lease(
+        self, session_id: str, owner_id: str, *, ttl_seconds: float = 60.0
+    ) -> bool:
+        """Atomically acquire/renew the canonical cross-process session lease.
+
+        Expiry alone never steals from a live or unverifiable owner. An expired
+        lease is reconciled only when its same-host/same-boot PID is provably
+        dead, preventing a paused live worker from being overlapped.
+        """
+        if not session_id or not owner_id:
+            return False
+        now = time.time()
+        ttl = max(5.0, float(ttl_seconds))
+        pid, host, boot_id = self._execution_lease_process_identity()
+
+        def _acquire(conn):
+            row = conn.execute(
+                "SELECT * FROM session_execution_leases WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if row is not None and row["owner_id"] != owner_id:
+                if float(row["expires_at"]) > now or self._execution_lease_owner_is_alive(row):
+                    return False
+            conn.execute(
+                """INSERT INTO session_execution_leases
+                   (session_id, owner_id, owner_pid, owner_host, owner_boot_id,
+                    acquired_at, heartbeat_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                     owner_id=excluded.owner_id, owner_pid=excluded.owner_pid,
+                     owner_host=excluded.owner_host, owner_boot_id=excluded.owner_boot_id,
+                     acquired_at=CASE WHEN session_execution_leases.owner_id=excluded.owner_id
+                                      THEN session_execution_leases.acquired_at
+                                      ELSE excluded.acquired_at END,
+                     heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at""",
+                (session_id, owner_id, pid, host, boot_id, now, now, now + ttl),
+            )
+            return True
+
+        return bool(self._execute_write(_acquire))
+
+    def heartbeat_session_execution_lease(
+        self, session_id: str, owner_id: str, *, ttl_seconds: float = 60.0
+    ) -> bool:
+        now = time.time()
+
+        def _heartbeat(conn):
+            cursor = conn.execute(
+                "UPDATE session_execution_leases SET heartbeat_at=?, expires_at=? "
+                "WHERE session_id=? AND owner_id=?",
+                (now, now + max(5.0, float(ttl_seconds)), session_id, owner_id),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_heartbeat))
+
+    def release_session_execution_lease(self, session_id: str, owner_id: str) -> bool:
+        """Release only the caller's exact owner token; idempotent and fenced."""
+        def _release(conn):
+            cursor = conn.execute(
+                "DELETE FROM session_execution_leases WHERE session_id=? AND owner_id=?",
+                (session_id, owner_id),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_release))
 
     def record_gateway_session_peer(
         self,

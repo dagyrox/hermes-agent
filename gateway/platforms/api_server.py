@@ -91,8 +91,20 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from gateway.session_execution_lease import (
+    SessionExecutionConflict,
+    SessionExecutionLease,
+)
+from gateway.platforms.session_turns import (
+    SESSION_TURN_CAPABILITIES,
+    SessionTurnService,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class SessionHistoryReadError(RuntimeError):
+    """Canonical persisted history could not be read safely."""
 
 
 def _hermes_version() -> str:
@@ -1078,6 +1090,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # Durable OCC/browser turns live in a focused edge service. Keeping
+        # orchestration out of this already-large adapter also ensures no new
+        # model tool/schema is introduced.
+        self._session_turn_service = SessionTurnService(self)
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1570,6 +1586,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+            ("POST", "/api/sessions/{session_id}/turns", self._handle_session_turn_submit),
+            ("GET", "/api/sessions/{session_id}/turns/{turn_id}", self._handle_session_turn_status),
+            ("GET", "/api/sessions/{session_id}/turns/{turn_id}/events", self._handle_session_turn_events),
+            ("POST", "/api/sessions/{session_id}/turns/{turn_id}/stop", self._handle_session_turn_stop),
+            ("POST", "/api/sessions/{session_id}/turns/{turn_id}/deliver", self._handle_session_turn_deliver),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -2115,6 +2136,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "durable_session_turns": True,
+                "conversation_turn_contract": "h1",
+                "durable_turn_idempotency": True,
+                "durable_turn_status": True,
+                "durable_turn_resumable_events": True,
+                "durable_turn_stop": True,
+                "durable_turn_manual_delivery": True,
+                "conversation_turn_slack_delivery": True,
+                "conversation_turn_image_input": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -2147,7 +2177,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "session_turn_submit": {"method": "POST", "path": "/api/sessions/{session_id}/turns"},
+                "session_turn_status": {"method": "GET", "path": "/api/sessions/{session_id}/turns/{turn_id}"},
+                "session_turn_events": {"method": "GET", "path": "/api/sessions/{session_id}/turns/{turn_id}/events"},
+                "session_turn_stop": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/stop"},
+                "session_turn_deliver": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/deliver"},
+                "conversation_turn_create": {"method": "POST", "path": "/api/sessions/{session_id}/turns"},
+                "conversation_turn_status": {"method": "GET", "path": "/api/sessions/{session_id}/turns/{turn_id}"},
+                "conversation_turn_events": {"method": "GET", "path": "/api/sessions/{session_id}/turns/{turn_id}/events"},
+                "conversation_turn_stop": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/stop"},
+                "conversation_turn_deliver": {"method": "POST", "path": "/api/sessions/{session_id}/turns/{turn_id}/deliver"},
             },
+            "session_turns": SESSION_TURN_CAPABILITIES,
         })
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
@@ -2303,12 +2344,22 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
         db = await self._ensure_session_db_async()
         if db is None:
-            return []
+            raise SessionHistoryReadError("session database unavailable")
         try:
             return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
         except Exception as exc:
-            logger.warning("Failed to load session history for %s: %s", session_id, exc)
-            return []
+            logger.warning("Failed to load session history for %s", session_id)
+            raise SessionHistoryReadError("session history unavailable") from exc
+
+    async def _acquire_session_execution_lease(
+        self, session_id: str, *, owner_prefix: str
+    ) -> SessionExecutionLease:
+        db = await self._ensure_session_db_async()
+        if db is None:
+            raise SessionHistoryReadError("session database unavailable")
+        return await SessionExecutionLease.acquire(
+            db, session_id, owner_prefix=owner_prefix, wait_timeout=0.0
+        )
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
@@ -2565,14 +2616,35 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        history = await self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-        )
+        try:
+            lease = await self._acquire_session_execution_lease(
+                session_id, owner_prefix="api:session-chat"
+            )
+        except SessionExecutionConflict:
+            return web.json_response(
+                _openai_error("Session already has an active execution", code="active_session_execution"),
+                status=409,
+            )
+        except SessionHistoryReadError:
+            return web.json_response(
+                _openai_error("Session history unavailable", code="session_history_unavailable"),
+                status=503,
+            )
+        async with lease:
+            try:
+                history = await self._conversation_history_for_session(session_id)
+            except SessionHistoryReadError:
+                return web.json_response(
+                    _openai_error("Session history unavailable", code="session_history_unavailable"),
+                    status=503,
+                )
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -2649,7 +2721,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
         async def _run_and_signal() -> None:
+            lease = None
             try:
+                lease = await self._acquire_session_execution_lease(
+                    session_id, owner_prefix="api:session-chat-stream"
+                )
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = await self._conversation_history_for_session(session_id)
@@ -2680,10 +2756,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     "messages": turn_messages,
                     "usage": usage,
                 }))
+            except SessionExecutionConflict:
+                await queue.put(_event_payload("error", {"message": "Session already has an active execution", "code": "active_session_execution"}))
+            except SessionHistoryReadError:
+                await queue.put(_event_payload("error", {"message": "Session history unavailable", "code": "session_history_unavailable"}))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                if lease is not None:
+                    await lease.release()
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
@@ -2726,6 +2808,24 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
+
+    # Durable/replayable session-turn API. All behavior and persistence live
+    # in session_turns.py; these methods intentionally stay as thin route seams.
+    @_admit_api_agent_request
+    async def _handle_session_turn_submit(self, request: "web.Request") -> "web.Response":
+        return await self._session_turn_service.submit(request)
+
+    async def _handle_session_turn_status(self, request: "web.Request") -> "web.Response":
+        return await self._session_turn_service.status(request)
+
+    async def _handle_session_turn_events(self, request: "web.Request") -> "web.StreamResponse":
+        return await self._session_turn_service.events(request)
+
+    async def _handle_session_turn_stop(self, request: "web.Request") -> "web.Response":
+        return await self._session_turn_service.stop(request)
+
+    async def _handle_session_turn_deliver(self, request: "web.Request") -> "web.Response":
+        return await self._session_turn_service.deliver(request)
 
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
@@ -5559,6 +5659,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
+            # Reconcile crash-uncertain durable turns before accepting traffic.
+            # This never resumes work; it terminalizes it as interrupted.
+            await self._session_turn_service.reconcile_startup()
             mws = [
                 mw
                 for mw in (

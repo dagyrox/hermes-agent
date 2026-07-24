@@ -2110,6 +2110,7 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.turn_lease import SessionTurnLeaseRegistry
+from gateway.session_execution_lease import SessionExecutionLease
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -3420,6 +3421,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so release is granted per-turn and a stale unwind can never free a
         # newer turn's lease (#28686 ownership lesson).
         self._turn_lease_tokens: Dict[tuple, Any] = {}
+        # Canonical SessionDB-backed lease shared with API/OCC execution paths.
+        self._durable_turn_lease_tokens: Dict[tuple, SessionExecutionLease] = {}
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         # Last successfully-resolved (non-empty) model, keyed by session. Used
         # as a fallback when a fresh config read transiently returns an empty
@@ -12122,6 +12125,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
+            # Canonical SessionDB lease must be released before the local
+            # registry token so another process cannot enter during unwind.
+            await self._release_durable_turn_lease(_quick_key, _run_generation)
             self._release_turn_lease(_quick_key, _run_generation)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
@@ -12959,6 +12965,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not hasattr(self, "_turn_lease_tokens"):
                     self._turn_lease_tokens = {}
                 self._turn_lease_tokens[(_quick_key, run_generation)] = _lease_token
+
+        # Cross-process canonical lease closes API/OCC versus gateway/Slack
+        # overlap. It is acquired before history read and released by the
+        # dispatch finally on every success/error/interrupt path.
+        _canonical_db = getattr(getattr(self, "_session_db", None), "_db", getattr(self, "_session_db", None))
+        if callable(getattr(_canonical_db, "acquire_session_execution_lease", None)):
+            _durable_lease = await SessionExecutionLease.acquire(
+                _canonical_db,
+                session_entry.session_id,
+                owner_prefix=f"gateway:{_quick_key}:{run_generation}",
+                wait_timeout=_float_env("HERMES_AGENT_TIMEOUT", 1800),
+            )
+            if not hasattr(self, "_durable_turn_lease_tokens"):
+                self._durable_turn_lease_tokens = {}
+            self._durable_turn_lease_tokens[(_quick_key, run_generation)] = _durable_lease
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -18588,6 +18609,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # _persist_active_agents).
         self._persist_active_agents()
         return True
+
+    async def _release_durable_turn_lease(self, session_key: str, run_generation: int) -> bool:
+        tokens = getattr(self, "_durable_turn_lease_tokens", None)
+        if not tokens:
+            return False
+        token = tokens.pop((session_key, run_generation), None)
+        if token is None:
+            return False
+        try:
+            return await token.release()
+        except Exception:
+            logger.debug("Failed to release durable session execution lease", exc_info=True)
+            return False
 
     def _release_turn_lease(self, session_key: str, run_generation: int) -> bool:
         """Release the turn lease acquired by (``session_key``, ``run_generation``).
