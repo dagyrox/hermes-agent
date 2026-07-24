@@ -2115,6 +2115,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_fork_anchored_preserve_source": True,
+                "session_fork_anchor_field": "anchor_message_id",
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -2260,9 +2262,23 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id",
+            "_lineage_root_id", "branch_point_message_id",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
+        if "branch_point_message_id" not in payload:
+            raw_config = session.get("model_config")
+            try:
+                model_config = (
+                    json.loads(raw_config)
+                    if isinstance(raw_config, str)
+                    else raw_config
+                )
+            except (json.JSONDecodeError, TypeError):
+                model_config = None
+            if isinstance(model_config, dict):
+                branch_point = model_config.get("_branch_point_message_id")
+                if isinstance(branch_point, int) and not isinstance(branch_point, bool):
+                    payload["branch_point_message_id"] = branch_point
         # Avoid exposing full system prompts/model_config through the client API;
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
@@ -2500,51 +2516,192 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
-        """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
+        """POST /api/sessions/{session_id}/fork — exact, non-mutating branch."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
         source_id = request.match_info["session_id"]
-        source, err = await self._get_existing_session_or_404(source_id)
+        _, err = await self._get_existing_session_or_404(source_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
         if err:
             return err
-        db = await self._ensure_session_db_async()
-        fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
-        if not fork_id or re.search(r'[\r\n\x00]', fork_id):
-            return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
-        if await asyncio.to_thread(db.get_session, fork_id):
-            return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
 
-        # Match the CLI /branch semantics: mark the original as branched, then
-        # create a child session that carries the transcript forward. This uses
-        # SessionDB's native parent_session_id/end_reason visibility model rather
-        # than inventing a parallel fork store.
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        await asyncio.to_thread(db.create_session,
-            fork_id,
-            "api_server",
-            model=source.get("model"),
-            system_prompt=source.get("system_prompt"),
-            parent_session_id=source_id,
-        )
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
+        if body.get("preserve_source") is not True:
+            return web.json_response(
+                _openai_error(
+                    "preserve_source must be true for an anchored fork",
+                    code="preserve_source_required",
+                ),
+                status=400,
+            )
+
+        has_canonical_anchor = "anchor_message_id" in body
+        has_legacy_anchor = "from_message_id" in body
+        canonical_anchor = body.get("anchor_message_id")
+        legacy_anchor = body.get("from_message_id")
+        if (
+            not has_canonical_anchor
+            and not has_legacy_anchor
+            or has_canonical_anchor
+            and has_legacy_anchor
+            and canonical_anchor != legacy_anchor
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Supply anchor_message_id, or compatible from_message_id, but not conflicting values",
+                    code="invalid_anchor",
+                ),
+                status=400,
+            )
+        anchor_message_id = canonical_anchor if has_canonical_anchor else legacy_anchor
+        if (
+            not isinstance(anchor_message_id, int)
+            or isinstance(anchor_message_id, bool)
+            or anchor_message_id <= 0
+        ):
+            return web.json_response(
+                _openai_error(
+                    "anchor_message_id must be a positive integer",
+                    code="invalid_anchor",
+                ),
+                status=400,
+            )
+
+        idempotency_key = body.get("idempotency_key")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            return web.json_response(
+                _openai_error(
+                    "idempotency_key must be a non-empty string",
+                    code="invalid_idempotency_key",
+                ),
+                status=400,
+            )
+        idempotency_key = idempotency_key.strip()
+        if len(idempotency_key) > 255:
+            return web.json_response(
+                _openai_error(
+                    "idempotency_key is too long (max 255 characters)",
+                    code="invalid_idempotency_key",
+                ),
+                status=400,
+            )
+
         title = body.get("title")
-        if title is None:
-            base = source.get("title") or "fork"
-            try:
-                title = await asyncio.to_thread(db.get_next_title_in_lineage, base)
-            except Exception:
-                title = f"{base} fork"
+        if title is not None and not isinstance(title, str):
+            return web.json_response(
+                _openai_error("title must be a string", code="invalid_title"),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
         try:
-            await asyncio.to_thread(db.set_session_title, fork_id, str(title))
+            clean_title = db.sanitize_title(title)
         except ValueError as exc:
-            return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
-        fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
-        return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_title"), status=400
+            )
+
+        raw_fork_id = body.get("id") or body.get("session_id")
+        requested_fork_id = str(raw_fork_id).strip() if raw_fork_id else None
+        fork_id = requested_fork_id or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        from gateway.session import _is_path_unsafe
+        if (
+            not fork_id
+            or re.search(r'[\r\n\x00]', fork_id)
+            or _is_path_unsafe(fork_id)
+            or len(fork_id) > self._MAX_SESSION_HEADER_LEN
+        ):
+            return web.json_response(
+                _openai_error("Invalid session ID", code="invalid_session_id"),
+                status=400,
+            )
+
+        try:
+            result, fork = await asyncio.to_thread(
+                db.fork_session_at_message,
+                source_id,
+                fork_id,
+                anchor_message_id,
+                idempotency_key,
+                title=clean_title,
+                requested_child_session_id=requested_fork_id,
+            )
+        except Exception:
+            logger.exception("Atomic anchored fork failed for source %s", source_id)
+            return web.json_response(
+                _openai_error("Failed to fork session", code="session_fork_failed"),
+                status=500,
+            )
+
+        if result == "source_missing":
+            return web.json_response(
+                _openai_error(
+                    f"Session not found: {source_id}", code="session_not_found"
+                ),
+                status=404,
+            )
+        if result == "invalid_anchor":
+            return web.json_response(
+                _openai_error(
+                    "anchor_message_id does not belong to the source session",
+                    code="invalid_anchor",
+                ),
+                status=400,
+            )
+        if result == "unsafe_anchor":
+            return web.json_response(
+                _openai_error(
+                    "anchor_message_id is not a completed assistant response safe for continuation",
+                    code="unsafe_anchor",
+                ),
+                status=400,
+            )
+        if result == "session_exists":
+            return web.json_response(
+                _openai_error(
+                    f"Session already exists: {fork_id}", code="session_exists"
+                ),
+                status=409,
+            )
+        if result == "invalid_title":
+            return web.json_response(
+                _openai_error("Title already in use", code="invalid_title"),
+                status=400,
+            )
+        if result == "idempotency_stale":
+            return web.json_response(
+                _openai_error(
+                    "idempotency_key refers to a fork whose child no longer exists",
+                    code="idempotency_stale",
+                ),
+                status=409,
+            )
+        if result == "idempotency_conflict":
+            return web.json_response(
+                _openai_error(
+                    "idempotency_key was already used for a different fork request",
+                    code="idempotency_conflict",
+                ),
+                status=409,
+            )
+
+        return web.json_response(
+            {
+                "object": "hermes.session",
+                "session": self._session_response(fork),
+                "idempotent_replay": result == "replayed",
+            },
+            status=200 if result == "replayed" else 201,
+        )
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
