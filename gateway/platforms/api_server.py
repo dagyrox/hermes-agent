@@ -48,7 +48,7 @@ import hashlib
 import hmac
 import html
 import json
-import math
+import unicodedata
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
@@ -2091,7 +2091,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         session_db = await self._ensure_session_db_async()
         session_search_available = bool(
-            session_db
+            self._search_cursor_signing_key()
+            and session_db
             and await asyncio.to_thread(session_db.session_search_available)
         )
         session_search_endpoint = {
@@ -2101,8 +2102,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "pagination": {
                 "type": "cursor",
                 "parameter": "cursor",
-                "ordering": ["rank_asc", "timestamp_desc", "message_id_desc"],
+                "ordering": ["timestamp_desc", "message_id_desc"],
                 "snapshot": "message_id_high_water",
+                "cursor": "hmac_authenticated_v2",
             },
         }
 
@@ -2370,138 +2372,164 @@ class APIServerAdapter(BasePlatformAdapter):
             "has_more": len(sessions) == limit,
         })
 
-    @staticmethod
-    def _search_highlight_terms(query: str) -> List[str]:
-        """Extract literal terms for presentation-only post-redaction highlighting."""
-        terms: List[str] = []
-        for token in re.findall(r"[\w.-]+\*?", query, flags=re.UNICODE):
-            token = token.rstrip("*.-")
-            if token and token.upper() not in {"AND", "OR", "NOT"}:
-                terms.append(token)
-        return sorted(set(terms), key=len, reverse=True)
+    _SEARCH_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+        r"(?i)(?<![A-Za-z0-9_.-])"
+        r"(?P<key>[A-Za-z0-9_.-]{0,64}"
+        r"(?:api[_. -]?key|access[_. -]?token|refresh[_. -]?token|token|secret|"
+        r"password|passwd|credential|authorization|auth)"
+        r"[A-Za-z0-9_.-]{0,64})"
+        r"(?P<sep>\s*(?:=|:)\s*)"
+        r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;&]+)"
+    )
+    _SEARCH_AUTHORIZATION_RE = re.compile(
+        r"(?i)((?:proxy-)?authorization\s*:\s*)"
+        r"(?:(?:bearer|basic|token|digest)\s+)?[^\s,;]+"
+    )
+    _SEARCH_BEARER_RE = re.compile(
+        r"(?i)(?<![A-Za-z0-9_-])(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"
+    )
+    _SEARCH_JWT_RE = re.compile(
+        r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}"
+    )
+    _SEARCH_REDACTED_SENTINEL_RE = re.compile(r"«redacted(?::[^»]*)?»")
+    _SEARCH_CURSOR_VERSION = 2
+    _SEARCH_CURSOR_TTL_SECONDS = 900
 
     @classmethod
-    def _bounded_search_snippet(
-        cls,
-        value: Any,
-        query: str,
-        maximum: int = 480,
-    ) -> str:
-        """Redact raw content, then build a bounded, never-complete excerpt.
+    def _redact_search_content(cls, value: Any) -> str:
+        """Completely remove credential values before any snippet slicing."""
+        text = str(value or "")
+        text = cls._SEARCH_AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
+        text = cls._SEARCH_BEARER_RE.sub(r"\1[REDACTED]", text)
+        text = cls._SEARCH_JWT_RE.sub("[REDACTED]", text)
+        text = cls._SEARCH_CREDENTIAL_ASSIGNMENT_RE.sub(
+            lambda match: f"{match.group('key')}{match.group('sep')}[REDACTED]",
+            text,
+        )
+        redacted = redact_sensitive_text(
+            text,
+            force=True,
+            file_read=True,
+            redact_url_credentials=True,
+        )
+        return cls._SEARCH_REDACTED_SENTINEL_RE.sub("[REDACTED]", redacted)
 
-        Highlight markup is generated only after redaction. No marker-like text
-        originating in a message is ever interpreted as trusted presentation data.
-        """
-        redacted = redact_sensitive_text(str(value or ""), force=True)
-        if not redacted:
+    @classmethod
+    def _bounded_search_snippet(cls, value: Any, maximum: int = 480) -> str:
+        """Return one globally redacted, query-independent prefix per message."""
+        redacted = " ".join(cls._redact_search_content(value).split())
+        if not redacted or maximum < 2:
             return "…"
 
-        terms = cls._search_highlight_terms(query)
-        match = None
-        for term in terms:
-            candidate = re.search(re.escape(term), redacted, flags=re.IGNORECASE)
-            if candidate and (match is None or candidate.start() < match.start()):
-                match = candidate
-
-        # Six output characters cover the longest HTML escape for one input
-        # character. Keeping the plain excerpt to this budget guarantees room
-        # for generated <mark> tags and omission ellipses within ``maximum``.
-        excerpt_budget = max(1, min(72, (maximum - 28) // 6))
-        if len(redacted) <= excerpt_budget:
-            if len(redacted) == 1:
-                excerpt = ""
-                prefix_omitted = False
-                suffix_omitted = True
-            elif match is not None and match.end() == len(redacted) and match.start() > 0:
-                excerpt = redacted[1:]
-                prefix_omitted = True
-                suffix_omitted = False
-            else:
-                excerpt = redacted[:-1]
-                prefix_omitted = False
-                suffix_omitted = True
-        else:
-            anchor = match.start() if match is not None else 0
-            start = max(0, min(anchor - excerpt_budget // 3, len(redacted) - excerpt_budget))
-            end = start + excerpt_budget
-            excerpt = redacted[start:end]
-            prefix_omitted = start > 0
-            suffix_omitted = end < len(redacted)
-
+        # Never return a complete body, even when it is shorter than the bound.
+        excerpt = redacted[:192]
+        if len(excerpt) == len(redacted):
+            excerpt = excerpt[:-1]
         if not excerpt:
             return "…"
 
-        pattern = None
-        if terms:
-            pattern = re.compile(
-                "|".join(re.escape(term) for term in terms),
-                flags=re.IGNORECASE,
-            )
-        output: List[str] = ["…"] if prefix_omitted else []
-        position = 0
-        if pattern is not None:
-            for highlighted in pattern.finditer(excerpt):
-                output.append(html.escape(excerpt[position:highlighted.start()], quote=True))
-                output.append("<mark>")
-                output.append(html.escape(highlighted.group(0), quote=True))
-                output.append("</mark>")
-                position = highlighted.end()
-        output.append(html.escape(excerpt[position:], quote=True))
-        if suffix_omitted:
-            output.append("…")
-        return "".join(output)
+        output: List[str] = []
+        used = 0
+        for character in excerpt:
+            escaped = html.escape(character, quote=True)
+            if used + len(escaped) > maximum - 1:
+                break
+            output.append(escaped)
+            used += len(escaped)
+        return "".join(output) + "…"
 
     @staticmethod
     def _search_cursor_scope_hash(value: str) -> str:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-    @classmethod
+    @staticmethod
+    def _normalize_search_query(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).split())
+
+    def _search_cursor_signing_key(self) -> Optional[bytes]:
+        if not self._api_key:
+            return None
+        return hmac.new(
+            self._api_key.encode("utf-8"),
+            b"hermes-session-search-cursor:v2",
+            hashlib.sha256,
+        ).digest()
+
     def _encode_search_cursor(
-        cls,
+        self,
         *,
         query: str,
         user_id: str,
         source: str,
         snapshot_message_id: int,
         boundary: Dict[str, Any],
-        seen_message_ids: List[int],
     ) -> str:
+        signing_key = self._search_cursor_signing_key()
+        if signing_key is None:
+            raise SessionSearchUnavailable("Session search cursor signing unavailable")
+        now = int(time.time())
         payload = {
-            "v": 1,
-            "q": cls._search_cursor_scope_hash(query),
-            "u": cls._search_cursor_scope_hash(user_id),
-            "s": cls._search_cursor_scope_hash(source),
+            "v": self._SEARCH_CURSOR_VERSION,
+            "q": self._search_cursor_scope_hash(self._normalize_search_query(query)),
+            "u": self._search_cursor_scope_hash(user_id),
+            "s": self._search_cursor_scope_hash(source),
             "h": snapshot_message_id,
-            "r": float(boundary["rank"]),
             "t": boundary["timestamp"],
             "i": int(boundary["message_id"]),
-            "x": seen_message_ids,
+            "e": now + self._SEARCH_CURSOR_TTL_SECONDS,
         }
-        encoded = base64.urlsafe_b64encode(
+        encoded_payload = base64.urlsafe_b64encode(
             json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        )
-        return encoded.rstrip(b"=").decode("ascii")
+        ).rstrip(b"=")
+        signature = base64.urlsafe_b64encode(
+            hmac.new(signing_key, encoded_payload, hashlib.sha256).digest()
+        ).rstrip(b"=")
+        return f"{encoded_payload.decode('ascii')}.{signature.decode('ascii')}"
 
-    @classmethod
     def _decode_search_cursor(
-        cls,
+        self,
         value: str,
         *,
         query: str,
         user_id: str,
         source: str,
     ) -> Optional[Dict[str, Any]]:
-        if not value or len(value) > 16_384 or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        signing_key = self._search_cursor_signing_key()
+        if (
+            signing_key is None
+            or not value
+            or len(value) > 2_048
+            or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value)
+        ):
             return None
         try:
-            padding = "=" * (-len(value) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(value + padding))
-            if not isinstance(payload, dict) or payload.get("v") != 1:
+            encoded_payload, encoded_signature = value.split(".", 1)
+            signature = base64.b64decode(
+                encoded_signature + "=" * (-len(encoded_signature) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            expected_signature = hmac.new(
+                signing_key, encoded_payload.encode("ascii"), hashlib.sha256
+            ).digest()
+            if not hmac.compare_digest(signature, expected_signature):
+                return None
+            payload_bytes = base64.b64decode(
+                encoded_payload + "=" * (-len(encoded_payload) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            payload = json.loads(payload_bytes)
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"v", "q", "u", "s", "h", "t", "i", "e"}
+                or payload.get("v") != self._SEARCH_CURSOR_VERSION
+            ):
                 return None
             expected = (
-                cls._search_cursor_scope_hash(query),
-                cls._search_cursor_scope_hash(user_id),
-                cls._search_cursor_scope_hash(source),
+                self._search_cursor_scope_hash(self._normalize_search_query(query)),
+                self._search_cursor_scope_hash(user_id),
+                self._search_cursor_scope_hash(source),
             )
             actual = (payload.get("q"), payload.get("u"), payload.get("s"))
             if any(
@@ -2512,24 +2540,20 @@ class APIServerAdapter(BasePlatformAdapter):
             ):
                 return None
             high_water = int(payload["h"])
-            rank = float(payload["r"])
             message_id = int(payload["i"])
             timestamp = payload["t"]
-            seen = payload.get("x", [])
+            expires_at = int(payload["e"])
             if (
                 high_water < 0
                 or message_id <= 0
-                or not math.isfinite(rank)
                 or not isinstance(timestamp, (int, float))
-                or not isinstance(seen, list)
-                or len(seen) > 5_000
-                or any(not isinstance(item, int) or item <= 0 for item in seen)
+                or timestamp < 0
+                or expires_at < int(time.time())
             ):
                 return None
             return {
                 "snapshot_message_id": high_water,
-                "after": (rank, timestamp, message_id),
-                "seen_message_ids": seen,
+                "after": (timestamp, message_id),
             }
         except (
             binascii.Error,
@@ -2621,6 +2645,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=503,
             )
         try:
+            if self._search_cursor_signing_key() is None:
+                raise SessionSearchUnavailable(
+                    "Session search cursor signing unavailable"
+                )
             if not await asyncio.to_thread(db.session_search_available):
                 raise SessionSearchUnavailable("Session full-text search is unavailable")
             rows, snapshot_message_id = await asyncio.to_thread(
@@ -2633,9 +2661,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     cursor["snapshot_message_id"] if cursor is not None else None
                 ),
                 after=cursor["after"] if cursor is not None else None,
-                exclude_message_ids=(
-                    cursor["seen_message_ids"] if cursor is not None else None
-                ),
             )
         except SessionSearchUnavailable:
             logger.warning("Owner-scoped session search unavailable", exc_info=True)
@@ -2660,22 +2685,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 "message_id": row["message_id"],
                 "role": row["role"],
                 "timestamp": row["timestamp"],
-                "snippet": self._bounded_search_snippet(row.get("content"), q),
-                "rank": float(row.get("rank") or 0.0),
+                "snippet": self._bounded_search_snippet(row.get("content")),
             }
             for row in page_rows
         ]
         next_cursor = None
         if has_more and page_rows:
-            previous_seen = cursor["seen_message_ids"] if cursor is not None else []
             next_cursor = self._encode_search_cursor(
                 query=q,
                 user_id=user_id,
                 source=source,
                 snapshot_message_id=snapshot_message_id,
                 boundary=page_rows[-1],
-                seen_message_ids=previous_seen
-                + [int(row["message_id"]) for row in page_rows],
             )
         return web.json_response({
             "object": "list",

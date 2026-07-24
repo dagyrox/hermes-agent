@@ -1,7 +1,11 @@
 """Behavior contract and real SQLite E2E for owner-scoped session search."""
 
+import base64
+import hashlib
 import html
+import hmac
 import json
+import time
 
 import pytest
 from aiohttp import web
@@ -157,11 +161,10 @@ async def test_search_is_owner_source_and_role_scoped_with_safe_bounded_fields(
     }
     assert {row["role"] for row in payload["data"]} <= {"user", "assistant"}
 
-    allowed = {"session_id", "message_id", "role", "timestamp", "snippet", "rank"}
+    allowed = {"session_id", "message_id", "role", "timestamp", "snippet"}
     assert payload["data"]
     for row in payload["data"]:
         assert set(row) == allowed
-        assert isinstance(row["rank"], (int, float))
         assert len(row["snippet"]) <= 512
         assert "<script>" not in row["snippet"]
 
@@ -176,12 +179,12 @@ async def test_search_is_owner_source_and_role_scoped_with_safe_bounded_fields(
     assert "DO_NOT_LEAK_FULL_BODY" not in serialized
     assert "content" not in serialized
     assert "context" not in serialized
-    assert any("<mark>or7needle</mark>" in row["snippet"] for row in payload["data"])
+    assert any("or7needle" in row["snippet"] for row in payload["data"])
     assert any("&lt;script&gt;" in row["snippet"] for row in payload["data"])
 
 
 @pytest.mark.asyncio
-async def test_search_redacts_credential_prefix_before_safe_highlighting(search_runtime):
+async def test_search_redacts_complete_credential_without_head_or_tail_fragments(search_runtime):
     adapter, _, secret = search_runtime
     async with TestClient(TestServer(_make_app(adapter))) as client:
         response = await client.get(
@@ -196,6 +199,9 @@ async def test_search_redacts_credential_prefix_before_safe_highlighting(search_
     assert secret not in serialized
     assert "testcredential1234567890" not in serialized
     assert "credential1234567890" not in serialized
+    assert "sk-" not in serialized
+    assert "sk-test" not in serialized
+    assert "7890" not in serialized
 
 
 @pytest.mark.asyncio
@@ -210,7 +216,7 @@ async def test_search_never_trusts_user_authored_highlight_markers(search_runtim
         payload = await response.json()
 
     snippet = payload["data"][0]["snippet"]
-    assert "<mark>or7marker</mark>" in snippet
+    assert "or7marker" in snippet
     assert "<mark>user-authored-marker</mark>" not in snippet
     assert "[[[user-authored-marker]]]" in html.unescape(snippet)
 
@@ -238,6 +244,62 @@ async def test_search_short_match_is_useful_but_never_returns_complete_body(
 
 
 @pytest.mark.asyncio
+async def test_search_snippet_is_query_independent_and_blocks_reconstruction(search_runtime):
+    adapter, db, _ = search_runtime
+    message_id = db.append_message(
+        "owned-slack-a",
+        "user",
+        "firstprobe " + "alpha-private " * 30 + "secondprobe " + "omega-private " * 30,
+    )
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        first = await client.get(
+            "/api/sessions/search?q=firstprobe&user_id=owner-1&source=slack",
+            headers=AUTH,
+        )
+        second = await client.get(
+            "/api/sessions/search?q=secondprobe&user_id=owner-1&source=slack",
+            headers=AUTH,
+        )
+        first_payload = await first.json()
+        second_payload = await second.json()
+
+    assert first.status == second.status == 200
+    first_row = next(row for row in first_payload["data"] if row["message_id"] == message_id)
+    second_row = next(row for row in second_payload["data"] if row["message_id"] == message_id)
+    assert first_row["snippet"] == second_row["snippet"]
+    assert "secondprobe" not in html.unescape(first_row["snippet"])
+
+
+@pytest.mark.parametrize(
+    "content, forbidden",
+    (
+        (
+            'credprobe MiXeD_ApI_KeY = "AbCdEfGhIjKlMnOpQrStUvWxYz012345" boundary',
+            ("AbCdEf", "012345", "QrStUv"),
+        ),
+        (
+            "credprobe Authorization: Bearer abcDEF0123456789xyzXYZ9876543210 boundary",
+            ("abcDEF", "6543210", "xyzXYZ"),
+        ),
+        (
+            "credprobe " + "x" * 150 + " api-token=tok_HEAD_middle_SECRET_tail999 boundary",
+            ("tok_HEAD", "tail999", "SECRET"),
+        ),
+        (
+            "credprobe eyJabcdefghijklmno.abcdefghijklmnop.signaturetail boundary",
+            ("eyJabc", "signaturetail", "hijklmno"),
+        ),
+    ),
+)
+def test_search_snippet_redacts_assignments_before_boundary_truncation(content, forbidden):
+    snippet = html.unescape(APIServerAdapter._bounded_search_snippet(content))
+    assert "[REDACTED]" in snippet or all(value not in snippet for value in forbidden)
+    for value in forbidden:
+        assert value not in snippet
+
+
+@pytest.mark.asyncio
 async def test_search_sanitizes_natural_language_fts_and_returns_nonmatches(
     search_runtime,
 ):
@@ -259,17 +321,96 @@ async def test_search_sanitizes_natural_language_fts_and_returns_nonmatches(
 
 
 @pytest.mark.asyncio
-async def test_search_cursor_does_not_overlap_when_match_is_inserted_between_pages(
+async def test_search_cursor_is_authenticated_scope_bound_and_expires(
     search_runtime,
+    monkeypatch,
 ):
     adapter, db, _ = search_runtime
     async with TestClient(TestServer(_make_app(adapter))) as client:
+        for index in range(4):
+            db.append_message(
+                "owned-slack-a", "user", f"or7needle cursor fixture {index}"
+            )
+        first_response = await client.get(
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack&limit=2",
+            headers=AUTH,
+        )
+        first = await first_response.json()
+        cursor = first["next_cursor"]
+        assert cursor
 
+        replacement = "A" if cursor[-1] != "A" else "B"
+        tampered = cursor[:-1] + replacement
+        encoded_payload, _signature = cursor.split(".", 1)
+        decoded_payload = json.loads(
+            base64.urlsafe_b64decode(
+                encoded_payload + "=" * (-len(encoded_payload) % 4)
+            )
+        )
+        decoded_payload["v"] = 999
+        unsupported_payload = base64.urlsafe_b64encode(
+            json.dumps(decoded_payload, separators=(",", ":")).encode()
+        ).rstrip(b"=")
+        unsupported_signature = base64.urlsafe_b64encode(
+            hmac.new(
+                adapter._search_cursor_signing_key(),
+                unsupported_payload,
+                hashlib.sha256,
+            ).digest()
+        ).rstrip(b"=")
+        unsupported = (
+            unsupported_payload.decode() + "." + unsupported_signature.decode()
+        )
+        cases = (
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack"
+            f"&limit=2&cursor={tampered}",
+            "/api/sessions/search?q=different&user_id=owner-1&source=slack"
+            f"&limit=2&cursor={cursor}",
+            "/api/sessions/search?q=or7needle&user_id=owner-2&source=slack"
+            f"&limit=2&cursor={cursor}",
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=cli"
+            f"&limit=2&cursor={cursor}",
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack"
+            "&limit=2&cursor=malformed.cursor",
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack"
+            f"&limit=2&cursor={unsupported}",
+        )
+        for url in cases:
+            response = await client.get(url, headers=AUTH)
+            assert response.status == 400
+            assert (await response.json())["error"]["code"] == "invalid_query"
+
+        monkeypatch.setattr(time, "time", lambda: 4_000_000_000)
+        expired = await client.get(
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack"
+            f"&limit=2&cursor={cursor}",
+            headers=AUTH,
+        )
+        expired_payload = await expired.json()
+
+    assert expired.status == 400
+    assert expired_payload["error"]["code"] == "invalid_query"
+
+
+@pytest.mark.asyncio
+async def test_search_stable_multi_page_snapshot_has_no_overlap_or_omission_on_insert_and_rank_update(
+    search_runtime,
+):
+    adapter, db, _ = search_runtime
+    initial_ids = []
+    for index in range(9):
+        initial_ids.append(
+            db.append_message(
+                "owned-slack-a", "user", f"pageprobe stable fixture {index}"
+            )
+        )
+
+    async with TestClient(TestServer(_make_app(adapter))) as client:
         async def page(cursor: str | None = None):
             cursor_query = f"&cursor={cursor}" if cursor else ""
             response = await client.get(
-                "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack"
-                f"&limit=2{cursor_query}",
+                "/api/sessions/search?q=pageprobe&user_id=owner-1&source=slack"
+                f"&limit=3{cursor_query}",
                 headers=AUTH,
             )
             assert response.status == 200
@@ -277,24 +418,25 @@ async def test_search_cursor_does_not_overlap_when_match_is_inserted_between_pag
 
         first = await page()
         inserted_id = db.append_message(
-            "owned-slack-a", "user", "or7needle inserted between cursor pages"
+            "owned-slack-a", "user", "pageprobe inserted after snapshot"
         )
-        second = await page(first["next_cursor"])
-        wrong_scope = await client.get(
-            "/api/sessions/search?q=or7needle&user_id=owner-2&source=slack"
-            f"&limit=2&cursor={first['next_cursor']}",
-            headers=AUTH,
+        # Change BM25 term frequency for a row already returned. Immutable
+        # timestamp/id keyset ordering must make this irrelevant to pagination.
+        updated_id = first["data"][0]["message_id"]
+        db._conn.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            ("pageprobe " * 100, updated_id),
         )
+        db._conn.commit()
 
-    first_ids = [row["message_id"] for row in first["data"]]
-    second_ids = [row["message_id"] for row in second["data"]]
-    assert first["has_more"] is True
-    assert first["next_cursor"]
-    assert wrong_scope.status == 400
-    assert not set(first_ids) & set(second_ids)
-    assert inserted_id not in second_ids
-    assert len(first_ids + second_ids) == 3
+        pages = [first]
+        while pages[-1]["has_more"]:
+            pages.append(await page(pages[-1]["next_cursor"]))
 
+    returned = [row["message_id"] for payload in pages for row in payload["data"]]
+    assert len(returned) == len(set(returned))
+    assert set(returned) == set(initial_ids)
+    assert inserted_id not in returned
 
 @pytest.mark.asyncio
 async def test_capabilities_advertise_owner_scoped_search(search_runtime):
@@ -312,10 +454,29 @@ async def test_capabilities_advertise_owner_scoped_search(search_runtime):
         "pagination": {
             "type": "cursor",
             "parameter": "cursor",
-            "ordering": ["rank_asc", "timestamp_desc", "message_id_desc"],
+            "ordering": ["timestamp_desc", "message_id_desc"],
             "snapshot": "message_id_high_water",
+            "cursor": "hmac_authenticated_v2",
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_search_without_cursor_signing_credential_fails_closed(search_runtime):
+    adapter, _, _ = search_runtime
+    adapter._api_key = ""
+    async with TestClient(TestServer(_make_app(adapter))) as client:
+        capabilities = await client.get("/v1/capabilities")
+        response = await client.get(
+            "/api/sessions/search?q=or7needle&user_id=owner-1&source=slack"
+        )
+        advertised = await capabilities.json()
+        failure = await response.json()
+
+    assert advertised["features"]["session_search"] is False
+    assert "session_search" not in advertised["endpoints"]
+    assert response.status == 503
+    assert failure["error"]["code"] == "session_search_unavailable"
 
 
 @pytest.mark.asyncio
@@ -336,12 +497,20 @@ async def test_search_disabled_is_not_advertised_and_returns_safe_503(search_run
         assert response.status == 503
         payload = await response.json()
         assert payload["error"]["code"] == "session_search_unavailable"
+        serialized = json.dumps(payload).lower()
+        assert "messages_fts" not in serialized
+        assert "sqlite" not in serialized
 
 
 @pytest.mark.asyncio
-async def test_search_operational_fts_failure_is_503_not_empty_success(search_runtime):
+async def test_search_operational_fts_failure_is_503_not_empty_success(
+    search_runtime, monkeypatch
+):
     adapter, db, _ = search_runtime
     db._conn.execute("DROP TABLE messages_fts")
+    # A metadata-only readiness check would still claim success here. The
+    # capability probe must execute a harmless scoped MATCH and fail closed.
+    monkeypatch.setattr(db, "_fts_table_exists", lambda _name: True)
     async with TestClient(TestServer(_make_app(adapter))) as client:
         capabilities = await client.get("/v1/capabilities", headers=AUTH)
         assert capabilities.status == 200
@@ -356,3 +525,6 @@ async def test_search_operational_fts_failure_is_503_not_empty_success(search_ru
         assert response.status == 503
         payload = await response.json()
         assert payload["error"]["code"] == "session_search_unavailable"
+        serialized = json.dumps(payload).lower()
+        assert "messages_fts" not in serialized
+        assert "sqlite" not in serialized
