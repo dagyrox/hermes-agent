@@ -387,6 +387,34 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
 
 
 @pytest.mark.asyncio
+async def test_session_messages_do_not_cross_noncompression_owner_boundary(
+    adapter, session_db
+):
+    source_id = session_db.create_session(
+        "owner-session", "slack", user_id="owner-42"
+    )
+    session_db.append_message(source_id, "user", "owned transcript")
+    session_db.end_session(source_id, "session_reset")
+    session_db.create_session(
+        "foreign-child",
+        "api_server",
+        parent_session_id=source_id,
+    )
+    session_db.append_message("foreign-child", "user", "foreign transcript")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        messages_resp = await cli.get(f"/api/sessions/{source_id}/messages")
+        assert messages_resp.status == 200
+        messages = await messages_resp.json()
+
+    assert messages["object"] == "list"
+    assert messages["session_id"] == source_id
+    assert [m["content"] for m in messages["data"]] == ["owned transcript"]
+    assert all(message["session_id"] == source_id for message in messages["data"])
+
+
+@pytest.mark.asyncio
 async def test_session_fork_is_authenticated_anchored_and_source_exactly_immutable(
     auth_adapter, session_db
 ):
