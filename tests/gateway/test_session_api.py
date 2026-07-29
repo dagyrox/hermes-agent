@@ -388,7 +388,7 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
 
 @pytest.mark.asyncio
 async def test_session_messages_do_not_cross_noncompression_owner_boundary(
-    adapter, session_db
+    auth_adapter, session_db
 ):
     source_id = session_db.create_session(
         "owner-session", "slack", user_id="owner-42"
@@ -402,9 +402,12 @@ async def test_session_messages_do_not_cross_noncompression_owner_boundary(
     )
     session_db.append_message("foreign-child", "user", "foreign transcript")
 
-    app = _create_session_app(adapter)
+    app = _create_session_app(auth_adapter)
     async with TestClient(TestServer(app)) as cli:
-        messages_resp = await cli.get(f"/api/sessions/{source_id}/messages")
+        messages_resp = await cli.get(
+            f"/api/sessions/{source_id}/messages",
+            headers={"Authorization": "Bearer sk-test"},
+        )
         assert messages_resp.status == 200
         messages = await messages_resp.json()
 
