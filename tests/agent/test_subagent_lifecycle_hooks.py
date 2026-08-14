@@ -269,3 +269,50 @@ def test_terminal_failure_is_emitted_once_under_exception(monkeypatch):
     assert len(terminal) == 1
     assert terminal[0]["terminal_status"] == "failed"
     assert "RuntimeError: raw exception" not in repr(emitted)
+
+
+def test_nonempty_failed_and_incomplete_results_never_emit_success(monkeypatch):
+    result_shapes = [
+        {
+            "final_response": "Invalid API response after retries",
+            "completed": False,
+            "failed": True,
+            "error": "provider failure",
+        },
+        {
+            "final_response": "Content policy blocked this request",
+            "completed": False,
+            "failed": True,
+            "error": "content_policy_violation",
+        },
+        {
+            "final_response": "Partial answer at the iteration limit",
+            "completed": False,
+            "failed": False,
+            "exit_reason": "max_iterations",
+        },
+    ]
+
+    monkeypatch.setattr(dt, "_get_child_timeout", lambda: None)
+    for index, run_result in enumerate(result_shapes):
+        child = MagicMock()
+        child.session_id = f"child-session-failed-{index}"
+        child._subagent_id = f"subagent-result-failed-{index}"
+        child._delegate_role = "leaf"
+        child._delegate_depth = 1
+        child._credential_pool = None
+        child.get_activity_summary.return_value = {}
+        child.run_conversation.return_value = run_result
+        parent = _parent()
+        parent._active_children.append(child)
+        emitted = []
+        monkeypatch.setattr(
+            lh, "_emit", lambda _hook, payload: emitted.append(dict(payload))
+        )
+
+        dt._run_single_child(index, "SECRET-CANARY", child, parent)
+
+        terminal = [event for event in emitted if event["event"] == "terminal"]
+        assert len(terminal) == 1
+        assert terminal[0]["terminal_status"] == "failed"
+        assert run_result["final_response"] not in repr(emitted)

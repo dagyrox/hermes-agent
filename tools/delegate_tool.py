@@ -2084,13 +2084,18 @@ def _run_single_child(
         _queue_announced = threading.Event()
 
         def _terminal_status(run_result: Any) -> str:
+            """Classify only explicit conversation outcomes; ambiguity fails closed."""
             if not isinstance(run_result, dict):
                 return "failed"
-            if run_result.get("interrupted"):
+            if run_result.get("interrupted") is True:
                 return "cancelled"
-            summary = run_result.get("final_response") or ""
-            if isinstance(summary, str) and summary.strip() and summary.strip() != "(empty)":
+            if run_result.get("failed") is True:
+                return "failed"
+            if run_result.get("completed") is True:
                 return "succeeded"
+            # Partial, max-iteration, provider-exhaustion, and legacy/unknown
+            # result shapes are not authoritative success signals even when they
+            # carry non-empty user-facing text.
             return "failed"
 
         def _run_with_thread_capture():
