@@ -22,6 +22,12 @@ SUBAGENT_LIFECYCLE_VERSION = 2
 DELEGATION_WRAPPER_LIFECYCLE_VERSION = 1
 MANAGED_PROCESS_LIFECYCLE_VERSION = 2
 
+_LIFECYCLE_VERSIONS = {
+    "subagent": SUBAGENT_LIFECYCLE_VERSION,
+    "delegation_wrapper": DELEGATION_WRAPPER_LIFECYCLE_VERSION,
+    "managed_process": MANAGED_PROCESS_LIFECYCLE_VERSION,
+}
+
 SUBAGENT_EVENTS = frozenset(
     {"registered", "queued", "started", "heartbeat", "cancel_requested", "terminal"}
 )
@@ -55,7 +61,7 @@ def _integer(value: Any) -> Optional[int]:
 
 
 def _envelope(kind: str, source_id: Optional[str], event: str) -> dict[str, Any]:
-    """Build the common v1 ordering envelope for one opaque source identity."""
+    """Build the versioned ordering envelope for one opaque source identity."""
     if source_id is None:
         raise ValueError(f"{kind} lifecycle event requires a stable source identity")
     key = (kind, source_id)
@@ -66,7 +72,7 @@ def _envelope(kind: str, source_id: Optional[str], event: str) -> dict[str, Any]
         "+00:00", "Z"
     )
     return {
-        "contract_version": 1,
+        "contract_version": _LIFECYCLE_VERSIONS[kind],
         "event": event,
         "occurred_at": occurred_at,
         "sequence": sequence,
@@ -97,7 +103,7 @@ def emit_subagent_lifecycle(
     terminal_status: Any = None,
     cancel_reason: Any = None,
 ) -> None:
-    """Emit one v1 delegated-child lifecycle observation."""
+    """Emit one versioned delegated-child lifecycle observation."""
     if event not in SUBAGENT_EVENTS:
         raise ValueError(f"invalid subagent lifecycle event: {event}")
     role = child_role if child_role in SUBAGENT_ROLES else None
@@ -196,7 +202,7 @@ def emit_managed_process_lifecycle(
     termination_source: Any = None,
     exit_code: Any = None,
 ) -> None:
-    """Emit one v1 managed-process lifecycle observation."""
+    """Emit one versioned managed-process lifecycle observation."""
     if event not in MANAGED_PROCESS_EVENTS:
         raise ValueError(f"invalid managed process lifecycle event: {event}")
     scope = pid_scope if pid_scope in PROCESS_PID_SCOPES else None

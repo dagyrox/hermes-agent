@@ -114,6 +114,41 @@ def test_identity_enum_dtos_drop_runtime_text(monkeypatch):
     assert emitted[2][1]["exit_code"] is None
 
 
+def test_emitted_dto_versions_match_advertised_hook_contracts(monkeypatch):
+    from hermes_cli.plugins import HOOK_CONTRACT_VERSIONS
+
+    emitted = {}
+    monkeypatch.setattr(
+        lh, "_emit", lambda hook, payload: emitted.setdefault(hook, dict(payload))
+    )
+
+    lh.emit_subagent_lifecycle(
+        "started",
+        child_session_id="child-session-version",
+        child_subagent_id="subagent-version",
+        child_role="leaf",
+    )
+    lh.emit_delegation_wrapper_lifecycle(
+        "started",
+        wrapper_id="wrapper-version",
+        child_subagent_id="subagent-version",
+    )
+    lh.emit_managed_process_lifecycle(
+        "started",
+        process_id="process-version",
+        pid=123,
+        host_start_time=456,
+        host_boot_id="boot-version",
+        pid_scope="host",
+        backend="local",
+    )
+
+    assert set(emitted) == set(HOOK_CONTRACT_VERSIONS)
+    assert {
+        hook: dto["contract_version"] for hook, dto in emitted.items()
+    } == HOOK_CONTRACT_VERSIONS
+
+
 def test_registered_after_stable_ids_and_legacy_start_is_preserved(monkeypatch):
     parent = _parent()
     parent._delegate_depth = 0
