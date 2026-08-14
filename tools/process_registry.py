@@ -254,9 +254,15 @@ class ProcessRegistry:
             process_id=session.id,
             task_id=session.task_id,
             session_key=session.session_key,
-            pid=session.pid,
-            host_start_time=session.host_start_time,
-            host_boot_id=session.host_boot_id,
+            # Sandbox PIDs are namespace-local observations, not canonical
+            # host identities. Keep them private to the process registry.
+            pid=session.pid if session.pid_scope == "host" else None,
+            host_start_time=(
+                session.host_start_time if session.pid_scope == "host" else None
+            ),
+            host_boot_id=(
+                session.host_boot_id if session.pid_scope == "host" else None
+            ),
             pid_scope=session.pid_scope,
             backend=backend,
             backend_id=backend_id,
@@ -945,17 +951,9 @@ class ProcessRegistry:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
-            try:
-                if not _IS_WINDOWS:
-                    try:
-                        kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                        os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
-                    proc.kill()
-            except Exception:
-                pass
+            self._terminate_host_pid(
+                proc.pid, session.host_start_time, session.host_boot_id
+            )
             try:
                 proc.wait(timeout=5)
             except Exception:
@@ -1752,8 +1750,14 @@ class ProcessRegistry:
                     session.process.pid, session.host_start_time, session.host_boot_id
                 )
             elif session.env_ref and session.pid:
-                # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                # A namespace-local PID alone is not an authoritative process
+                # identity and may have been recycled. Refuse bare-PID signalling
+                # until the backend provides an identity-aware kill primitive.
+                self._emit_process_lifecycle(session, "probe_unavailable")
+                return {
+                    "status": "error",
+                    "error": "Sandbox process identity cannot be verified; refusing to signal PID",
+                }
             elif session.detached and session.pid_scope == "host" and session.pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as

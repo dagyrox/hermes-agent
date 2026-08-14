@@ -846,6 +846,7 @@ class TestPopenLeakOnSetupFailure:
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", side_effect=boom), \
              patch("os.getpgid", side_effect=ProcessLookupError), \
+             patch.object(registry, "_terminate_host_pid", side_effect=lambda *_args: killed.append(True)), \
              patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
                 registry.spawn_local("echo hello", cwd="/tmp")
@@ -878,6 +879,7 @@ class TestPopenLeakOnSetupFailure:
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", return_value=fake_thread), \
              patch("os.getpgid", side_effect=ProcessLookupError), \
+             patch.object(registry, "_terminate_host_pid", side_effect=lambda *_args: killed.append(True)), \
              patch.object(registry, "_write_checkpoint", side_effect=OSError("disk full")):
             with pytest.raises(OSError, match="disk full"):
                 registry.spawn_local("echo hello", cwd="/tmp")
@@ -2329,8 +2331,36 @@ class TestManagedProcessLifecycleHooks:
         assert session.id in registry._running
         assert payload["backend"] == "docker"
         assert payload["backend_id"] == "container-identity-1"
-        assert payload["pid"] == 31337
+        assert session.pid == 31337
+        assert payload["pid"] is None
+        assert payload["host_start_time"] is None
+        assert payload["host_boot_id"] is None
         assert "raw command canary" not in repr(payload)
+
+    def test_remote_kill_refuses_unverified_namespace_pid(self, registry):
+        class DockerEnv:
+            __module__ = "tools.environments.docker"
+            _container_id = "container-kill-refusal"
+
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                raise AssertionError("bare sandbox PID must never be signalled")
+
+        env = DockerEnv()
+        session = _make_session(sid="proc_remote_kill")
+        session.pid = 31337
+        session.pid_scope = "sandbox"
+        session.env_ref = env
+        registry._running[session.id] = session
+
+        result = registry.kill_process(session.id)
+
+        assert result["status"] == "error"
+        assert "identity cannot be verified" in result["error"]
+        assert env.calls == []
 
     def test_remote_failed_start_emits_exactly_one_terminal_dto(self, registry, monkeypatch):
         from agent import lifecycle_hooks as lh
