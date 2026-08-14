@@ -311,9 +311,12 @@ def test_nonempty_failed_and_incomplete_results_never_emit_success(monkeypatch):
             lh, "_emit", lambda _hook, payload: emitted.append(dict(payload))
         )
 
-        dt._run_single_child(index, "SECRET-CANARY", child, parent)
+        parent_result = dt._run_single_child(
+            index, "SECRET-CANARY", child, parent
+        )
 
         terminal = [event for event in emitted if event["event"] == "terminal"]
+        assert parent_result["status"] == "failed"
         assert len(terminal) == 1
         assert terminal[0]["terminal_status"] == "failed"
         assert run_result["final_response"] not in repr(emitted)

@@ -2266,6 +2266,7 @@ def _run_single_child(
 
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
+        failed = result.get("failed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
@@ -2278,10 +2279,9 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+        elif completed is True and not failed and summary and not _empty_sentinel:
+            # Parent-facing status must agree with authoritative lifecycle truth:
+            # usable text alone cannot turn an explicit/partial failure into success.
             status = "completed"
         else:
             status = "failed"

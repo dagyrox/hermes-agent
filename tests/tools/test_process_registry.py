@@ -2332,6 +2332,30 @@ class TestManagedProcessLifecycleHooks:
         assert payload["pid"] == 31337
         assert "raw command canary" not in repr(payload)
 
+    def test_remote_failed_start_emits_exactly_one_terminal_dto(self, registry, monkeypatch):
+        from agent import lifecycle_hooks as lh
+        emitted = []
+
+        class DockerEnv:
+            __module__ = "tools.environments.docker"
+            _container_id = "container-failed-start"
+
+            def execute(self, *_args, **_kwargs):
+                return {"output": "launch failed", "returncode": 2}
+
+        monkeypatch.setattr(
+            lh, "_emit", lambda _hook, payload: emitted.append(dict(payload))
+        )
+        with patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(DockerEnv(), "raw command canary")
+
+        terminal = [event for event in emitted if event["event"] == "terminal"]
+        assert session.exited is True
+        assert len(terminal) == 1
+        assert terminal[0]["terminal_status"] == "failed_start"
+        assert terminal[0]["termination_source"] == "failed_start"
+        assert "raw command canary" not in repr(terminal)
+
     def test_remote_without_stable_backend_identity_emits_no_lifecycle(self, registry, monkeypatch):
         from agent import lifecycle_hooks as lh
         emitted = []
@@ -2386,6 +2410,39 @@ class TestManagedProcessLifecycleHooks:
         session.exited = True
         thread.join(timeout=1)
         assert "raw backend exception canary" not in caplog.text
+
+    def test_empty_remote_probe_is_probe_unavailable_not_silent(self, registry, monkeypatch):
+        from agent import lifecycle_hooks as lh
+        session = _make_session(sid="proc_remote_empty")
+        session.pid, session.pid_scope = 99, "sandbox"
+        registry._running[session.id] = session
+        seen, emitted = threading.Event(), []
+
+        class EmptyEnv:
+            __module__ = "tools.environments.docker"
+            _container_id = "container-empty-probe"
+
+            def execute(self, *_args, **_kwargs):
+                return {"output": "", "returncode": 0}
+
+        def capture(_hook, payload):
+            emitted.append(dict(payload))
+            session.exited = True
+            seen.set()
+
+        env = EmptyEnv()
+        session.env_ref = env
+        monkeypatch.setattr(lh, "_emit", capture)
+        monkeypatch.setattr("tools.process_registry.time.sleep", lambda _seconds: None)
+        thread = threading.Thread(
+            target=registry._env_poller_loop,
+            args=(session, env, "/log", "/pid", "/exit"),
+            daemon=True,
+        )
+        thread.start()
+        assert seen.wait(timeout=1)
+        thread.join(timeout=1)
+        assert [event["event"] for event in emitted] == ["probe_unavailable"]
 
     def test_move_to_finished_emits_terminal_exactly_once_under_race(self, registry, monkeypatch):
         from agent import lifecycle_hooks as lh

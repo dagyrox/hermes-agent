@@ -1173,7 +1173,9 @@ class ProcessRegistry:
                 )
                 if probe_alive:
                     self._emit_process_lifecycle(session, "heartbeat")
-                if check_output and not probe_alive:
+                elif not check_output:
+                    self._emit_process_lifecycle(session, "probe_unavailable")
+                else:
                     # Process has exited -- get exit code captured by the wrapper shell.
                     exit_result = env.execute(
                         f"cat {quoted_exit_path} 2>/dev/null",
