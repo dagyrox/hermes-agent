@@ -292,6 +292,13 @@ def test_nonempty_failed_and_incomplete_results_never_emit_success(monkeypatch):
             "failed": False,
             "exit_reason": "max_iterations",
         },
+        {"final_response": "", "completed": True, "failed": False},
+        {"final_response": "(empty)", "completed": True, "failed": False},
+        {
+            "final_response": "Contradictory provider result",
+            "completed": True,
+            "failed": True,
+        },
     ]
 
     monkeypatch.setattr(dt, "_get_child_timeout", lambda: None)
@@ -317,6 +324,8 @@ def test_nonempty_failed_and_incomplete_results_never_emit_success(monkeypatch):
 
         terminal = [event for event in emitted if event["event"] == "terminal"]
         assert parent_result["status"] == "failed"
+        assert parent_result["exit_reason"] != "completed"
         assert len(terminal) == 1
         assert terminal[0]["terminal_status"] == "failed"
-        assert run_result["final_response"] not in repr(emitted)
+        if run_result["final_response"]:
+            assert run_result["final_response"] not in repr(emitted)

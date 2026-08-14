@@ -2097,7 +2097,13 @@ def _run_single_child(
                 return "cancelled"
             if run_result.get("failed") is True:
                 return "failed"
-            if run_result.get("completed") is True:
+            summary_value = run_result.get("final_response")
+            if (
+                run_result.get("completed") is True
+                and isinstance(summary_value, str)
+                and summary_value.strip()
+                and summary_value.strip() != "(empty)"
+            ):
                 return "succeeded"
             # Partial, max-iteration, provider-exhaustion, and legacy/unknown
             # result shapes are not authoritative success signals even when they
@@ -2270,16 +2276,13 @@ def _run_single_child(
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
-        # The child emits the literal "(empty)" sentinel (see run_agent.py) when
-        # it gives up after repeated empty-LLM-response retries — typically a
-        # transport bug (misrouted provider, adapter returning empty
-        # ChatCompletion, etc.). Treat it as a failure so the parent surfaces
-        # it instead of silently accepting zero-content "success".
-        _empty_sentinel = summary.strip() == "(empty)"
-
+        # Parent-visible status is derived from the same authoritative classifier
+        # used by the lifecycle terminal event, including the literal ``(empty)``
+        # transport-failure sentinel.
+        authoritative_terminal = _terminal_status(result)
         if interrupted:
             status = "interrupted"
-        elif completed is True and not failed and summary and not _empty_sentinel:
+        elif authoritative_terminal == "succeeded":
             # Parent-facing status must agree with authoritative lifecycle truth:
             # usable text alone cannot turn an explicit/partial failure into success.
             status = "completed"
@@ -2325,8 +2328,10 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
-        elif completed:
+        elif authoritative_terminal == "succeeded":
             exit_reason = "completed"
+        elif failed or completed:
+            exit_reason = "error"
         else:
             exit_reason = "max_iterations"
 
