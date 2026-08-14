@@ -970,6 +970,8 @@ class TestCheckpoint:
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),  # current process — guaranteed alive
+            "host_start_time": ProcessRegistry._safe_host_start_time(os.getpid()),
+            "host_boot_id": ProcessRegistry._safe_host_boot_id(),
             "task_id": "t1",
             "session_key": "sk1",
             "watcher_platform": "telegram",
@@ -998,6 +1000,8 @@ class TestCheckpoint:
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
+            "host_start_time": ProcessRegistry._safe_host_start_time(os.getpid()),
+            "host_boot_id": ProcessRegistry._safe_host_boot_id(),
             "task_id": "t1",
             "watcher_interval": 0,
         }]))
@@ -1012,6 +1016,8 @@ class TestCheckpoint:
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
+            "host_start_time": ProcessRegistry._safe_host_start_time(os.getpid()),
+            "host_boot_id": ProcessRegistry._safe_host_boot_id(),
             "task_id": "t1",
             "session_key": "sk1",
         }]))
@@ -1053,6 +1059,8 @@ class TestCheckpoint:
             "session_id": "proc_live",
             "command": "python -c 'import time; time.sleep(0.4)'",
             "pid": proc.pid,
+            "host_start_time": ProcessRegistry._safe_host_start_time(proc.pid),
+            "host_boot_id": ProcessRegistry._safe_host_boot_id(),
             "task_id": "t1",
             "session_key": "sk1",
         }]))
@@ -1109,22 +1117,26 @@ class TestKillProcess:
         s.process = MagicMock()
         s.process.pid = 12345
         s.host_start_time = 67890
+        s.host_boot_id = "boot"
         registry._running[s.id] = s
         terminate_calls = []
 
         monkeypatch.setattr(
             registry,
             "_terminate_host_pid",
-            lambda pid, expected_start=None: terminate_calls.append((pid, expected_start)),
+            lambda pid, expected_start=None, expected_boot=None: terminate_calls.append(
+                (pid, expected_start, expected_boot)
+            ),
         )
+        monkeypatch.setattr(registry, "_host_pid_identity_status", lambda *_args: "ours")
         monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
 
         result = registry.kill_process(s.id)
 
         assert result["status"] == "killed"
-        assert terminate_calls == [(12345, 67890)]
+        assert terminate_calls == [(12345, 67890, "boot")]
 
-    def test_kill_detached_session_uses_host_pid(self, registry):
+    def test_kill_detached_session_without_full_tuple_refuses_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
@@ -1156,8 +1168,9 @@ class TestKillProcess:
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
                 result = registry.kill_process(s.id)
 
-            assert result["status"] == "killed"
-            assert ("terminate", 424242) in terminate_calls
+            assert result["status"] == "error"
+            assert terminate_calls == []
+            assert s.exited is False
         finally:
             registry._running.pop(s.id, None)
 
@@ -1733,6 +1746,10 @@ def test_drain_notifications_owns_event_callback_fails_closed():
 
 
 class TestTerminateHostPidWindows:
+    @pytest.fixture(autouse=True)
+    def _verified_identity(self, monkeypatch):
+        monkeypatch.setattr(ProcessRegistry, "_host_pid_is_ours", lambda *_args: True)
+
     """Windows branch uses ``taskkill /T /F`` — the documented MS tree-kill
     primitive. We can't use psutil's ``children(recursive=True)`` /
     ``.terminate()`` path on Windows because (1) Windows doesn't maintain
@@ -1818,6 +1835,10 @@ class TestTerminateHostPidWindows:
 
 
 class TestTerminateHostPidPosix:
+    @pytest.fixture(autouse=True)
+    def _verified_identity(self, monkeypatch):
+        monkeypatch.setattr(ProcessRegistry, "_host_pid_is_ours", lambda *_args: True)
+
     """POSIX branch walks the tree via psutil and SIGTERMs children first."""
 
     def test_posix_walks_tree_and_terminates_children_then_parent(self, monkeypatch):
@@ -1910,7 +1931,11 @@ class TestPidReuseGuard:
             real_start = ProcessRegistry._safe_host_start_time(proc.pid)
             assert real_start is not None, "no /proc start time on this platform?"
             # Simulate recycling: the recorded baseline no longer matches.
-            registry._terminate_host_pid(proc.pid, expected_start=real_start + 1)
+            registry._terminate_host_pid(
+                proc.pid,
+                expected_start=real_start + 1,
+                expected_boot=ProcessRegistry._safe_host_boot_id(),
+            )
             # The process must still be alive — the guard refused to signal it.
             assert not _wait_until(lambda: proc.poll() is not None, timeout=1.0)
             assert proc.poll() is None
@@ -1923,19 +1948,23 @@ class TestPidReuseGuard:
         proc = _spawn_python_sleep(30)
         try:
             real_start = ProcessRegistry._safe_host_start_time(proc.pid)
-            registry._terminate_host_pid(proc.pid, expected_start=real_start)
+            registry._terminate_host_pid(
+                proc.pid,
+                expected_start=real_start,
+                expected_boot=ProcessRegistry._safe_host_boot_id(),
+            )
             assert _wait_until(lambda: proc.poll() is not None, timeout=5.0)
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
 
-    def test_terminate_without_baseline_is_best_effort(self, registry):
-        """No baseline (legacy) → degrade to prior unconditional behaviour."""
+    def test_terminate_without_full_tuple_refuses_bare_pid(self, registry):
+        """No baseline means no signal: a bare PID is not identity."""
         proc = _spawn_python_sleep(30)
         try:
-            registry._terminate_host_pid(proc.pid)  # expected_start=None
-            assert _wait_until(lambda: proc.poll() is not None, timeout=5.0)
+            registry._terminate_host_pid(proc.pid)
+            assert not _wait_until(lambda: proc.poll() is not None, timeout=1.0)
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -1951,6 +1980,7 @@ class TestPidReuseGuard:
             "pid": os.getpid(),            # alive...
             "pid_scope": "host",
             "host_start_time": wrong_start,  # ...but a different process now
+            "host_boot_id": ProcessRegistry._safe_host_boot_id(),
             "task_id": "t1",
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
@@ -1967,13 +1997,14 @@ class TestPidReuseGuard:
             "pid": os.getpid(),
             "pid_scope": "host",
             "host_start_time": real_start,
+            "host_boot_id": ProcessRegistry._safe_host_boot_id(),
             "task_id": "t1",
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             assert registry.recover_from_checkpoint() == 1
 
-    def test_legacy_checkpoint_without_start_time_still_recovers(self, registry, tmp_path):
-        """Entries written before host_start_time existed degrade to liveness."""
+    def test_legacy_checkpoint_without_tuple_is_not_recovered(self, registry, tmp_path):
+        """Legacy bare-PID entries fail closed rather than being adopted."""
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_legacy",
@@ -1983,7 +2014,7 @@ class TestPidReuseGuard:
             "task_id": "t1",
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
-            assert registry.recover_from_checkpoint() == 1
+            assert registry.recover_from_checkpoint() == 0
 
     def test_write_checkpoint_backfills_host_start_time(self, registry, tmp_path):
         """A host session is checkpointed with a kernel start time recorded."""
@@ -1995,24 +2026,31 @@ class TestPidReuseGuard:
             registry._write_checkpoint()
             data = json.loads((tmp_path / "procs.json").read_text())
             assert data[0]["host_start_time"] is not None
+            assert data[0]["host_boot_id"] is not None
 
-    def test_refresh_detached_marks_recycled_pid_exited(self, registry):
-        """A detached session whose PID got recycled is moved to finished."""
+    def test_refresh_detached_mismatch_stays_unknown_for_sentinel(self, registry):
+        """A detached mismatch is probe uncertainty, never terminal evidence."""
         wrong_start = (ProcessRegistry._safe_host_start_time(os.getpid()) or 0) + 999
         s = _make_session(sid="proc_detached")
-        s.pid = os.getpid()          # alive, but...
+        s.pid = os.getpid()
         s.pid_scope = "host"
         s.detached = True
-        s.host_start_time = wrong_start  # ...identity no longer matches
+        s.host_start_time = wrong_start
+        s.host_boot_id = ProcessRegistry._safe_host_boot_id()
         registry._running[s.id] = s
         refreshed = registry._refresh_detached_session(s)
-        assert refreshed.exited is True
-        assert s.id in registry._finished
+        assert refreshed.exited is False
+        assert s.id in registry._running
+        assert s.id not in registry._finished
 
 
 @pytest.mark.skipif(sys.platform == "win32",
                     reason="POSIX SIGTERM→SIGKILL escalation; Windows uses taskkill /F")
 class TestSigkillEscalation:
+    @pytest.fixture(autouse=True)
+    def _verified_identity(self, monkeypatch):
+        monkeypatch.setattr(ProcessRegistry, "_host_pid_is_ours", lambda *_args: True)
+
     """Bounded SIGTERM→SIGKILL escalation in _terminate_host_pid.
 
     A daemon that ignores/stalls on SIGTERM must be force-killed after the
@@ -2083,11 +2121,23 @@ class TestSigkillEscalation:
         """A start-time mismatch must still spare the PID — no SIGTERM, no SIGKILL."""
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
                             staticmethod(lambda: 1.0))
+        # This test exercises the real tuple guard rather than the class fixture's
+        # signalling-path bypass used by the escalation-only tests above.
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_host_pid_is_ours",
+            lambda pid, start, boot: ProcessRegistry._host_pid_identity_status(
+                pid, start, boot
+            ) == "ours",
+        )
         proc = self._spawn_trap()
         try:
             real_start = ProcessRegistry._safe_host_start_time(proc.pid)
             ProcessRegistry._terminate_host_pid(
-                proc.pid, expected_start=(real_start or 0) + 1)
+                proc.pid,
+                expected_start=(real_start or 0) + 1,
+                expected_boot=ProcessRegistry._safe_host_boot_id(),
+            )
             assert not _wait_until(lambda: proc.poll() is not None, timeout=1.5)
             assert proc.poll() is None
         finally:
@@ -2255,6 +2305,7 @@ class TestManagedProcessLifecycleHooks:
         payload = emitted[0][1]
         assert session.pid == payload["pid"] == 4242
         assert payload["host_start_time"] == 98765
+        assert payload["host_boot_id"] == session.host_boot_id
         assert payload["event"] == "started"
         assert "SECRET-CANARY" not in repr(payload)
         assert "/private/cwd" not in repr(payload)
@@ -2339,6 +2390,9 @@ class TestManagedProcessLifecycleHooks:
     def test_move_to_finished_emits_terminal_exactly_once_under_race(self, registry, monkeypatch):
         from agent import lifecycle_hooks as lh
         session = _make_session(sid="proc_race", exited=True, exit_code=0)
+        session.pid = 123
+        session.host_start_time = 456
+        session.host_boot_id = "boot"
         registry._running[session.id] = session
         emitted, lock = [], threading.Lock()
 
@@ -2363,6 +2417,7 @@ class TestManagedProcessLifecycleHooks:
         from agent import lifecycle_hooks as lh
         session = _make_session(sid="proc_reused")
         session.pid, session.host_start_time, session.process = 123, 456, MagicMock()
+        session.host_boot_id = "boot"
         session.process.poll.return_value = None
         emitted = []
         waits = iter([False])
@@ -2371,7 +2426,7 @@ class TestManagedProcessLifecycleHooks:
         monkeypatch.setattr(lh, "_emit", lambda _hook, payload: emitted.append(dict(payload)))
 
         registry._local_lifecycle_monitor(session)
-        assert emitted == []
+        assert [event["event"] for event in emitted] == ["probe_unavailable"]
 
     def test_verified_checkpoint_recovery_emits_adopted(self, registry, monkeypatch, tmp_path):
         from agent import lifecycle_hooks as lh
@@ -2383,6 +2438,7 @@ class TestManagedProcessLifecycleHooks:
             "pid": os.getpid(),
             "pid_scope": "host",
             "host_start_time": start_time,
+            "host_boot_id": ProcessRegistry._safe_host_boot_id(),
             "task_id": "task-adopted",
         }]))
         emitted = []

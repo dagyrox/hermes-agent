@@ -1855,6 +1855,7 @@ def _run_single_child(
     _last_seen_iter = [0]
     _last_seen_tool = [None]  # type: list
     _stale_count = [0]
+    _legacy_touch_suppressed = [False]
 
     def _emit_child_lifecycle(event: str, **extra: Any) -> None:
         try:
@@ -1887,6 +1888,8 @@ def _run_single_child(
                     "subagent_lifecycle_failed event=heartbeat reason=callback_error"
                 )
             if parent_agent is None:
+                continue
+            if _legacy_touch_suppressed[0]:
                 continue
             touch = getattr(parent_agent, "_touch_activity", None)
             if not touch:
@@ -1932,7 +1935,10 @@ def _run_single_child(
                         _stale_count[0],
                         child_tool or "<none>",
                     )
-                    break  # stop touching parent, let gateway timeout fire
+                    # Suppress only the legacy parent-activity touch. The v1
+                    # lifecycle heartbeat remains owned by the live child.
+                    _legacy_touch_suppressed[0] = True
+                    continue
 
                 if child_tool:
                     desc = (

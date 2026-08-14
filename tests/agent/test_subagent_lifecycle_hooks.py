@@ -73,6 +73,7 @@ def test_identity_enum_dtos_drop_runtime_text(monkeypatch):
         task_id="task-1",
         pid=123,
         host_start_time=456,
+        host_boot_id="boot-identity",
         pid_scope="host",
         backend="local",
         terminal_status="exited",
