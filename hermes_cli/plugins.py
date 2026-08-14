@@ -221,8 +221,9 @@ VALID_HOOKS: Set[str] = {
 # Explicit per-hook payload contract versions. Hooks omitted here retain their
 # historical unversioned callback kwargs; adding the two entries is additive.
 HOOK_CONTRACT_VERSIONS: Dict[str, int] = {
-    "subagent_lifecycle": 1,
-    "managed_process_lifecycle": 1,
+    "subagent_lifecycle": 2,
+    "delegation_wrapper_lifecycle": 1,
+    "managed_process_lifecycle": 2,
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

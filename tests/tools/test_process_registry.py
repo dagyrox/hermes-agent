@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -704,13 +705,17 @@ class TestSpawnEnvSanitization:
         class FakeEnv:
             def __init__(self):
                 self.commands = []
+                self.process_token = None
 
             def get_temp_dir(self):
                 return "/data/data/com.termux/files/usr/tmp"
 
             def execute(self, command, **kwargs):
                 self.commands.append((command, kwargs))
-                return {"output": "4321\n"}
+                if len(self.commands) == 1:
+                    self.process_token = re.findall(r"\b[0-9a-f]{32}\b", command)[-1]
+                    return {"output": "4321\n"}
+                return {"output": f"4321 98765 {self.process_token}\n"}
 
         env = FakeEnv()
         fake_thread = MagicMock()
@@ -721,6 +726,7 @@ class TestSpawnEnvSanitization:
 
         bg_command = env.commands[0][0]
         assert session.pid == 4321
+        assert session.backend_process_id.endswith(":98765")
         assert "/data/data/com.termux/files/usr/tmp/hermes_bg_" in bg_command
         assert ".exit" in bg_command
         assert "rc=$?;" in bg_command
@@ -777,13 +783,15 @@ class TestSpawnEnvSanitization:
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False
+        session.pid = 4321
+        session.backend_process_id = "token:98765"
 
         class FakeEnv:
             def __init__(self):
                 self.commands = []
                 self._responses = iter([
                     {"output": "hello\n"},
-                    {"output": "1\n"},
+                    {"output": "exited\n"},
                     {"output": "0\n"},
                 ])
 
@@ -801,10 +809,11 @@ class TestSpawnEnvSanitization:
                 "/path with spaces/hermes_bg.log",
                 "/path with spaces/hermes_bg.pid",
                 "/path with spaces/hermes_bg.exit",
+                "/path with spaces/hermes_bg.identity",
             )
 
         assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
-        assert env.commands[1][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
+        assert "cat '/path with spaces/hermes_bg.identity'" in env.commands[1][0]
         assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
 
 
@@ -2319,7 +2328,16 @@ class TestManagedProcessLifecycleHooks:
         class DockerEnv:
             __module__ = "tools.environments.docker"
             _container_id = "container-identity-1"
-            def execute(self, *_args, **_kwargs):
+            process_token = ""
+
+            def execute(self, command, **_kwargs):
+                if ".identity" in command and command.lstrip().startswith("cat "):
+                    return {
+                        "output": f"31337 424242 {self.process_token}\n",
+                        "returncode": 0,
+                    }
+                tokens = re.findall(r"[0-9a-f]{32}", command)
+                self.process_token = tokens[-1]
                 return {"output": "31337\n", "returncode": 0}
 
         monkeypatch.setattr(lh, "_emit", lambda hook, payload: emitted.append((hook, dict(payload))))
@@ -2392,8 +2410,16 @@ class TestManagedProcessLifecycleHooks:
 
         class UnknownEnv:
             __module__ = "tools.environments.ssh"
+            process_token = ""
 
-            def execute(self, *_args, **_kwargs):
+            def execute(self, command, **_kwargs):
+                if ".identity" in command and command.lstrip().startswith("cat "):
+                    return {
+                        "output": f"31337 424242 {self.process_token}\n",
+                        "returncode": 0,
+                    }
+                tokens = re.findall(r"[0-9a-f]{32}", command)
+                self.process_token = tokens[-1]
                 return {"output": "31337\n", "returncode": 0}
 
         monkeypatch.setattr(

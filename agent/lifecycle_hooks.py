@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 _sequence_lock = threading.Lock()
 _sequences: dict[tuple[str, str], int] = {}
 
-SUBAGENT_LIFECYCLE_VERSION = 1
-MANAGED_PROCESS_LIFECYCLE_VERSION = 1
+SUBAGENT_LIFECYCLE_VERSION = 2
+DELEGATION_WRAPPER_LIFECYCLE_VERSION = 1
+MANAGED_PROCESS_LIFECYCLE_VERSION = 2
 
 SUBAGENT_EVENTS = frozenset(
     {"registered", "queued", "started", "heartbeat", "cancel_requested", "terminal"}
@@ -27,6 +28,8 @@ SUBAGENT_EVENTS = frozenset(
 SUBAGENT_ROLES = frozenset({"leaf", "orchestrator"})
 SUBAGENT_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 SUBAGENT_CANCEL_REASONS = frozenset({"waiter_timeout", "parent_interrupt", "explicit_cancel"})
+DELEGATION_WRAPPER_EVENTS = frozenset({"registered", "started", "timed_out", "terminal"})
+DELEGATION_WRAPPER_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 
 MANAGED_PROCESS_EVENTS = frozenset(
     {"started", "heartbeat", "probe_unavailable", "terminal", "adopted"}
@@ -89,6 +92,7 @@ def emit_subagent_lifecycle(
     parent_session_id: Any = None,
     parent_turn_id: Any = None,
     parent_subagent_id: Any = None,
+    delegation_wrapper_id: Any = None,
     child_role: Any = None,
     terminal_status: Any = None,
     cancel_reason: Any = None,
@@ -110,6 +114,7 @@ def emit_subagent_lifecycle(
         "parent_session_id": _identity(parent_session_id),
         "parent_turn_id": _identity(parent_turn_id),
         "parent_subagent_id": _identity(parent_subagent_id),
+        "delegation_wrapper_id": _identity(delegation_wrapper_id),
         "child_role": role,
     }
     if event == "terminal":
@@ -121,6 +126,39 @@ def emit_subagent_lifecycle(
             raise ValueError("cancel_requested requires an allowlisted cancel_reason")
         payload["cancel_reason"] = reason
     _emit("subagent_lifecycle", payload)
+
+
+def emit_delegation_wrapper_lifecycle(
+    event: str,
+    *,
+    wrapper_id: Any,
+    child_subagent_id: Any,
+    parent_session_id: Any = None,
+    parent_turn_id: Any = None,
+    parent_subagent_id: Any = None,
+    terminal_status: Any = None,
+) -> None:
+    """Emit one privacy-bounded lifecycle fact for a delegation waiter."""
+    if event not in DELEGATION_WRAPPER_EVENTS:
+        raise ValueError(f"invalid delegation-wrapper lifecycle event: {event}")
+    wrapper = _identity(wrapper_id)
+    child = _identity(child_subagent_id)
+    if wrapper is None or child is None:
+        raise ValueError("delegation-wrapper lifecycle requires stable wrapper and child identities")
+    payload = {
+        **_envelope("delegation_wrapper", wrapper, event),
+        "wrapper_id": wrapper,
+        "child_subagent_id": child,
+        "parent_session_id": _identity(parent_session_id),
+        "parent_turn_id": _identity(parent_turn_id),
+        "parent_subagent_id": _identity(parent_subagent_id),
+    }
+    if event == "terminal":
+        status = terminal_status if terminal_status in DELEGATION_WRAPPER_TERMINAL_STATUSES else None
+        if status is None:
+            raise ValueError("terminal delegation-wrapper event requires terminal_status")
+        payload["terminal_status"] = status
+    _emit("delegation_wrapper_lifecycle", payload)
 
 
 def managed_process_backend(env: Any) -> str:
@@ -153,6 +191,7 @@ def emit_managed_process_lifecycle(
     pid_scope: Any = None,
     backend: Any = None,
     backend_id: Any = None,
+    backend_process_id: Any = None,
     terminal_status: Any = None,
     termination_source: Any = None,
     exit_code: Any = None,
@@ -176,6 +215,7 @@ def emit_managed_process_lifecycle(
         "pid_scope": scope,
         "backend": backend_name,
         "backend_id": _identity(backend_id),
+        "backend_process_id": _identity(backend_process_id),
     }
     if event == "terminal":
         status = terminal_status if terminal_status in PROCESS_TERMINAL_STATUSES else None

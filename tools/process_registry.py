@@ -109,6 +109,7 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    backend_process_id: Optional[str] = None      # backend-scoped token + process start identity
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -266,6 +267,7 @@ class ProcessRegistry:
             pid_scope=session.pid_scope,
             backend=backend,
             backend_id=backend_id,
+            backend_process_id=session.backend_process_id,
             exit_code=session.exit_code,
             **extra,
         )
@@ -1004,16 +1006,22 @@ class ProcessRegistry:
         log_path = f"{temp_dir}/hermes_bg_{session.id}.log"
         pid_path = f"{temp_dir}/hermes_bg_{session.id}.pid"
         exit_path = f"{temp_dir}/hermes_bg_{session.id}.exit"
+        identity_path = f"{temp_dir}/hermes_bg_{session.id}.identity"
+        process_token = uuid.uuid4().hex
         quoted_command = shlex.quote(command)
         quoted_temp_dir = shlex.quote(temp_dir)
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
+        quoted_identity_path = shlex.quote(identity_path)
         bg_command = (
             f"mkdir -p {quoted_temp_dir} && "
             f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
             f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
-            f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+            f"pid=$!; echo $pid > {quoted_pid_path}; "
+            f"start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null) || exit 1; "
+            f"printf '%s %s %s\\n' \"$pid\" \"$start\" {shlex.quote(process_token)} > {quoted_identity_path}; "
+            f"cat {quoted_pid_path}"
         )
 
         try:
@@ -1029,6 +1037,18 @@ class ProcessRegistry:
                 if line.isdigit():
                     session.pid = int(line)
                     break
+            if session.pid is not None:
+                identity_result = env.execute(f"cat {quoted_identity_path}", timeout=timeout)
+                identity_parts = identity_result.get("output", "").strip().split()
+                if (
+                    len(identity_parts) == 3
+                    and identity_parts[0] == str(session.pid)
+                    and identity_parts[1].isdigit()
+                    and identity_parts[2] == process_token
+                ):
+                    session.backend_process_id = f"{process_token}:{identity_parts[1]}"
+                else:
+                    session.pid = None
             # If the wrapper couldn't produce a PID (for example, syntax
             # error or broken redirect), treat it as a failed launch instead
             # of exposing a fake running session.
@@ -1053,7 +1073,7 @@ class ProcessRegistry:
             # not start it until the stable remote PID and registry row exist.
             reader = threading.Thread(
                 target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
+                args=(session, env, log_path, pid_path, exit_path, identity_path),
                 daemon=True,
                 name=f"proc-poller-{session.id}",
             )
@@ -1135,12 +1155,14 @@ class ProcessRegistry:
             self._move_to_finished(session)
 
     def _env_poller_loop(
-        self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
+        self, session: ProcessSession, env: Any, log_path: str, pid_path: str,
+        exit_path: str, identity_path: Optional[str] = None,
     ):
         """Background thread: poll a sandbox log file for non-local backends."""
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
+        quoted_identity_path = shlex.quote(identity_path or "")
         prev_output_len = 0  # track delta for watch pattern scanning
         while not session.exited:
             time.sleep(2)  # Poll every 2 seconds
@@ -1160,35 +1182,50 @@ class ProcessRegistry:
                         self._check_watch_patterns(session, delta)
                         self._emit_output(session, delta)
 
-                # Check if process is still running
+                # Check the exact backend process identity, not a namespace-local PID.
+                if not session.backend_process_id or not identity_path:
+                    self._emit_process_lifecycle(session, "probe_unavailable")
+                    continue
+                expected_token, expected_start = session.backend_process_id.split(":", 1)
                 check = env.execute(
-                    f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
+                    f"set -- $(cat {quoted_identity_path} 2>/dev/null); "
+                    f"if [ \"$1\" != {shlex.quote(str(session.pid))} ] || "
+                    f"[ \"$2\" != {shlex.quote(expected_start)} ] || "
+                    f"[ \"$3\" != {shlex.quote(expected_token)} ]; then echo mismatch; "
+                    f"else current=$(awk '{{print $22}}' /proc/$1/stat 2>/dev/null); "
+                    f"if [ -z \"$current\" ]; then echo exited; "
+                    f"elif [ \"$current\" = \"$2\" ]; then echo alive; "
+                    f"else echo mismatch; fi; fi",
                     timeout=5,
                 )
                 check_output = check.get("output", "").strip()
-                probe_alive = bool(
-                    check_output and check_output.splitlines()[-1].strip() == "0"
-                )
-                if probe_alive:
+
+                if check_output.endswith("alive"):
                     self._emit_process_lifecycle(session, "heartbeat")
-                elif not check_output:
+                    continue
+                if not check_output.endswith("exited"):
+                    # A changed token/start identity is PID reuse or an
+                    # unverifiable probe, never evidence about our process.
                     self._emit_process_lifecycle(session, "probe_unavailable")
-                else:
-                    # Process has exited -- get exit code captured by the wrapper shell.
-                    exit_result = env.execute(
-                        f"cat {quoted_exit_path} 2>/dev/null",
-                        timeout=5,
-                    )
-                    exit_str = exit_result.get("output", "").strip()
-                    try:
-                        session.exit_code = int(exit_str.splitlines()[-1].strip())
-                    except (ValueError, IndexError):
-                        session.exit_code = -1
-                    session.exited = True
-                    if session.completion_reason != "killed":
-                        session.completion_reason = "exited"
-                    self._move_to_finished(session)
-                    return
+                    continue
+
+                # The exact identity disappeared. Only the wrapper's exit marker
+                # can now provide terminal evidence.
+                exit_result = env.execute(
+                    f"cat {quoted_exit_path} 2>/dev/null",
+                    timeout=5,
+                )
+                exit_str = exit_result.get("output", "").strip()
+                try:
+                    session.exit_code = int(exit_str.splitlines()[-1].strip())
+                except (ValueError, IndexError):
+                    self._emit_process_lifecycle(session, "probe_unavailable")
+                    continue
+                session.exited = True
+                if session.completion_reason != "killed":
+                    session.completion_reason = "exited"
+                self._move_to_finished(session)
+                return
 
             except Exception:
                 # A backend outage says only that the probe is unavailable. It

@@ -33,6 +33,7 @@ def _child(release: threading.Event, started: threading.Event):
     child = MagicMock()
     child.session_id = "child-session"
     child._subagent_id = "subagent-1"
+    child._delegation_wrapper_id = "wrapper-1"
     child._parent_subagent_id = None
     child._parent_turn_id = "turn-1"
     child._delegate_role = "leaf"
@@ -67,6 +68,12 @@ def test_identity_enum_dtos_drop_runtime_text(monkeypatch):
         child_role="leaf",
         terminal_status="succeeded",
     )
+    lh.emit_delegation_wrapper_lifecycle(
+        "terminal",
+        wrapper_id="wrapper-1",
+        child_subagent_id="subagent-1",
+        terminal_status="cancelled",
+    )
     lh.emit_managed_process_lifecycle(
         "terminal",
         process_id="proc-1",
@@ -82,6 +89,7 @@ def test_identity_enum_dtos_drop_runtime_text(monkeypatch):
 
     assert {hook for hook, _ in emitted} == {
         "subagent_lifecycle",
+        "delegation_wrapper_lifecycle",
         "managed_process_lifecycle",
     }
     serialized = repr(emitted)
@@ -96,12 +104,13 @@ def test_identity_enum_dtos_drop_runtime_text(monkeypatch):
         "parent_session_id",
         "parent_turn_id",
         "parent_subagent_id",
+        "delegation_wrapper_id",
         "child_role",
         "terminal_status",
     }
     assert emitted[0][1]["occurred_at"].endswith("Z")
     assert type(emitted[0][1]["sequence"]) is int
-    assert emitted[1][1]["exit_code"] is None
+    assert emitted[2][1]["exit_code"] is None
 
 
 def test_registered_after_stable_ids_and_legacy_start_is_preserved(monkeypatch):
@@ -185,11 +194,13 @@ def test_child_owned_start_timeout_heartbeat_terminal_and_cleanup(monkeypatch):
     child = _child(release, started)
     parent._active_children.append(child)
     events = []
+    wrapper_events = []
     events_lock = threading.Lock()
 
-    def capture(_hook, payload):
+    def capture(hook, payload):
         with events_lock:
-            events.append(dict(payload))
+            target = wrapper_events if hook == "delegation_wrapper_lifecycle" else events
+            target.append(dict(payload))
 
     monkeypatch.setattr(lh, "_emit", capture)
     monkeypatch.setattr(dt, "_HEARTBEAT_INTERVAL", 0.01)
@@ -213,6 +224,10 @@ def test_child_owned_start_timeout_heartbeat_terminal_and_cleanup(monkeypatch):
     assert "heartbeat" in names
     assert names[-1] == "cancel_requested"
     assert "terminal" not in names
+    assert [event["event"] for event in wrapper_events] == [
+        "started", "timed_out", "terminal"
+    ]
+    assert wrapper_events[-1]["terminal_status"] == "cancelled"
     # Waiter timeout owns none of the live-child cleanup.
     assert child in parent._active_children
     assert child._credential_pool.release_lease.call_count == 0
@@ -252,6 +267,7 @@ def test_terminal_failure_is_emitted_once_under_exception(monkeypatch):
     child = MagicMock()
     child.session_id = "child-session"
     child._subagent_id = "subagent-fail"
+    child._delegation_wrapper_id = "wrapper-fail"
     child._delegate_role = "leaf"
     child._delegate_depth = 1
     child._credential_pool = None
@@ -265,7 +281,10 @@ def test_terminal_failure_is_emitted_once_under_exception(monkeypatch):
 
     result = dt._run_single_child(0, "SECRET-CANARY", child, parent)
 
-    terminal = [event for event in emitted if event["event"] == "terminal"]
+    terminal = [
+        event for event in emitted
+        if event["event"] == "terminal" and "child_session_id" in event
+    ]
     assert result["status"] == "error"
     assert len(terminal) == 1
     assert terminal[0]["terminal_status"] == "failed"
@@ -306,6 +325,7 @@ def test_nonempty_failed_and_incomplete_results_never_emit_success(monkeypatch):
         child = MagicMock()
         child.session_id = f"child-session-failed-{index}"
         child._subagent_id = f"subagent-result-failed-{index}"
+        child._delegation_wrapper_id = f"wrapper-result-failed-{index}"
         child._delegate_role = "leaf"
         child._delegate_depth = 1
         child._credential_pool = None
@@ -322,7 +342,10 @@ def test_nonempty_failed_and_incomplete_results_never_emit_success(monkeypatch):
             index, "SECRET-CANARY", child, parent
         )
 
-        terminal = [event for event in emitted if event["event"] == "terminal"]
+        terminal = [
+            event for event in emitted
+            if event["event"] == "terminal" and "child_session_id" in event
+        ]
         assert parent_result["status"] == "failed"
         assert parent_result["exit_reason"] != "completed"
         assert len(terminal) == 1

@@ -1116,6 +1116,7 @@ def _build_child_agent(
     # one key.  parent_id is non-None when THIS parent is itself a subagent
     # (nested orchestrator -> worker chain).
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
+    wrapper_id = f"dw-{task_index}-{_uuid.uuid4().hex[:12]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
@@ -1417,6 +1418,7 @@ def _build_child_agent(
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
+    setattr(child, "_delegation_wrapper_id", wrapper_id)
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
@@ -1462,9 +1464,19 @@ def _build_child_agent(
             parent_session_id=getattr(parent_agent, "session_id", None),
             parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
             parent_subagent_id=parent_subagent_id,
+            delegation_wrapper_id=wrapper_id,
             child_session_id=getattr(child, "session_id", None),
             child_subagent_id=subagent_id,
             child_role=effective_role,
+        )
+        from agent.lifecycle_hooks import emit_delegation_wrapper_lifecycle
+        emit_delegation_wrapper_lifecycle(
+            "registered",
+            wrapper_id=wrapper_id,
+            child_subagent_id=subagent_id,
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+            parent_subagent_id=parent_subagent_id,
         )
     except Exception:
         logger.debug(
@@ -1866,6 +1878,7 @@ def _run_single_child(
                 parent_session_id=getattr(parent_agent, "session_id", None),
                 parent_turn_id=getattr(child, "_parent_turn_id", "") or "",
                 parent_subagent_id=getattr(child, "_parent_subagent_id", None),
+                delegation_wrapper_id=getattr(child, "_delegation_wrapper_id", None),
                 child_session_id=getattr(child, "session_id", None),
                 child_subagent_id=_subagent_id,
                 child_role=getattr(child, "_delegate_role", None),
@@ -1876,6 +1889,31 @@ def _run_single_child(
                 "subagent_lifecycle_failed event=%s reason=invalid_or_callback_error",
                 event,
             )
+
+    def _emit_wrapper_lifecycle(event: str, **extra: Any) -> None:
+        try:
+            from agent.lifecycle_hooks import emit_delegation_wrapper_lifecycle
+            emit_delegation_wrapper_lifecycle(
+                event,
+                wrapper_id=getattr(child, "_delegation_wrapper_id", None),
+                child_subagent_id=getattr(child, "_subagent_id", None),
+                parent_session_id=getattr(parent_agent, "session_id", None),
+                parent_turn_id=getattr(child, "_parent_turn_id", "") or "",
+                parent_subagent_id=getattr(child, "_parent_subagent_id", None),
+                **extra,
+            )
+        except Exception:
+            logger.debug("delegation_wrapper_lifecycle_failed event=%s", event)
+
+    _child_terminal_lock = threading.Lock()
+    _child_terminal_done = [False]
+
+    def _emit_child_terminal_once(status: str) -> None:
+        with _child_terminal_lock:
+            if _child_terminal_done[0]:
+                return
+            _child_terminal_done[0] = True
+        _emit_child_lifecycle("terminal", terminal_status=status)
 
     def _heartbeat_loop():
         while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
@@ -2030,6 +2068,7 @@ def _run_single_child(
             logger.debug("Failed to close child agent after delegation")
 
     try:
+        _emit_wrapper_lifecycle("started")
         # File-state coordination: reuse the stable subagent_id as the child's
         # task_id so file_state writes, active-subagents registry, and TUI
         # events all share one key.  Falls back to a fresh uuid only if the
@@ -2131,12 +2170,10 @@ def _run_single_child(
                         task_id=child_task_id,
                         stream_callback=_relay_child_text,
                     )
-                    _emit_child_lifecycle(
-                        "terminal", terminal_status=_terminal_status(run_result)
-                    )
+                    _emit_child_terminal_once(_terminal_status(run_result))
                     return run_result
                 except BaseException:
-                    _emit_child_lifecycle("terminal", terminal_status="failed")
+                    _emit_child_terminal_once("failed")
                     raise
                 finally:
                     _cleanup_after_actual_child()
@@ -2145,8 +2182,10 @@ def _run_single_child(
             _child_future = _timeout_executor.submit(_run_with_thread_capture)
             _emit_child_lifecycle("queued")
         except Exception:
-            # No actual child future exists, so there is no future owner that can
-            # perform cleanup. Do not emit started/terminal for failed submission.
+            # Registration already happened during child construction. Close the
+            # pre-start attempt authoritatively so observers cannot strand it.
+            _emit_child_terminal_once("failed")
+            _emit_wrapper_lifecycle("terminal", terminal_status="failed")
             _cleanup_after_actual_child()
             raise
         finally:
@@ -2156,6 +2195,10 @@ def _run_single_child(
         except Exception as _timeout_exc:
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
             if is_timeout:
+                _emit_wrapper_lifecycle("timed_out")
+                # The waiter is complete even though the child future remains
+                # authoritative for its own lifecycle and cleanup.
+                _emit_wrapper_lifecycle("terminal", terminal_status="cancelled")
                 try:
                     _emit_child_lifecycle(
                         "cancel_requested", cancel_reason="waiter_timeout"
@@ -2243,6 +2286,7 @@ def _run_single_child(
                         f"stuck on a slow API call or unresponsive network request."
                     )
             else:
+                _emit_wrapper_lifecycle("terminal", terminal_status="failed")
                 _err = str(_timeout_exc)
 
             return {
@@ -2280,6 +2324,7 @@ def _run_single_child(
         # used by the lifecycle terminal event, including the literal ``(empty)``
         # transport-failure sentinel.
         authoritative_terminal = _terminal_status(result)
+        _emit_wrapper_lifecycle("terminal", terminal_status=authoritative_terminal)
         if interrupted:
             status = "interrupted"
         elif authoritative_terminal == "succeeded":
