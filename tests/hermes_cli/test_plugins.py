@@ -11,6 +11,7 @@ import yaml
 
 from hermes_cli.plugins import (
     ENTRY_POINTS_GROUP,
+    HOOK_CONTRACT_VERSIONS,
     VALID_HOOKS,
     PluginContext,
     PluginManager,
@@ -628,6 +629,10 @@ class TestPluginHooks:
         assert "post_api_request" in VALID_HOOKS
         assert "api_request_error" in VALID_HOOKS
         assert "subagent_start" in VALID_HOOKS
+        assert "subagent_lifecycle" in VALID_HOOKS
+        assert "managed_process_lifecycle" in VALID_HOOKS
+        assert HOOK_CONTRACT_VERSIONS["subagent_lifecycle"] == 1
+        assert HOOK_CONTRACT_VERSIONS["managed_process_lifecycle"] == 1
         assert "transform_terminal_output" in VALID_HOOKS
         assert "transform_tool_result" in VALID_HOOKS
         assert "transform_llm_output" in VALID_HOOKS

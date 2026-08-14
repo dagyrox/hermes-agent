@@ -136,6 +136,9 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _lifecycle_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _lifecycle_last_heartbeat_at: float = field(default=0.0, repr=False)
+    _lifecycle_last_probe_unavailable_at: float = field(default=0.0, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
 
 
@@ -212,6 +215,72 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    @staticmethod
+    def _emit_process_lifecycle(
+        session: ProcessSession, event: str, **extra: Any
+    ) -> None:
+        from agent.lifecycle_hooks import (
+            emit_managed_process_lifecycle,
+            managed_process_backend,
+            managed_process_backend_id,
+        )
+
+        backend = managed_process_backend(session.env_ref)
+        backend_id = managed_process_backend_id(session.env_ref)
+        # Remote lifecycle is authoritative only with a stable backend identity.
+        # Missing identity degrades telemetry without affecting the process.
+        if session.pid_scope == "sandbox" and backend_id is None:
+            return
+        if event == "heartbeat":
+            now = time.monotonic()
+            if now - session._lifecycle_last_heartbeat_at < 15:
+                return
+            session._lifecycle_last_heartbeat_at = now
+        elif event == "probe_unavailable":
+            now = time.monotonic()
+            if now - session._lifecycle_last_probe_unavailable_at < 15:
+                return
+            session._lifecycle_last_probe_unavailable_at = now
+        emit_managed_process_lifecycle(
+            event,
+            process_id=session.id,
+            task_id=session.task_id,
+            session_key=session.session_key,
+            pid=session.pid,
+            host_start_time=session.host_start_time,
+            pid_scope=session.pid_scope,
+            backend=backend,
+            backend_id=backend_id,
+            exit_code=session.exit_code,
+            **extra,
+        )
+
+    def _local_lifecycle_monitor(self, session: ProcessSession) -> None:
+        """Heartbeat only while the exact local PID identity remains ours."""
+        while not session._completion_event.wait(15):
+            try:
+                if session.exited:
+                    return
+                if session.process is not None and session.process.poll() is not None:
+                    return
+                if not self._host_pid_is_ours(session.pid, session.host_start_time):
+                    return
+                self._emit_process_lifecycle(session, "heartbeat")
+            except Exception:
+                logger.debug(
+                    "managed_process_lifecycle_failed event=heartbeat reason=callback_error"
+                )
+
+    def _start_local_lifecycle_monitor(self, session: ProcessSession) -> None:
+        monitor = threading.Thread(
+            target=self._local_lifecycle_monitor,
+            args=(session,),
+            daemon=True,
+            name=f"proc-lifecycle-{session.id}",
+        )
+        session._lifecycle_thread = monitor
+        monitor.start()
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -743,18 +812,34 @@ class ProcessRegistry:
                     name=f"proc-pty-reader-{session.id}",
                 )
                 session._reader_thread = reader
-                reader.start()
 
                 with self._lock:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
+                self._emit_process_lifecycle(session, "started")
+                reader.start()
+                self._start_local_lifecycle_monitor(session)
                 self._write_checkpoint()
                 return session
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                with self._lock:
+                    was_registered = session.id in self._running
+                if was_registered:
+                    try:
+                        if session._pty is not None:
+                            session._pty.terminate(force=True)
+                    except Exception:
+                        pass
+                    session.exited = True
+                    session.exit_code = -1
+                    session.completion_reason = "failed_start"
+                    session.termination_source = "failed_start"
+                    self._move_to_finished(session)
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -795,12 +880,14 @@ class ProcessRegistry:
                 name=f"proc-reader-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
 
             with self._lock:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
+            self._emit_process_lifecycle(session, "started")
+            reader.start()
+            self._start_local_lifecycle_monitor(session)
             self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
@@ -821,6 +908,12 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            with session._lock:
+                session.exited = True
+                session.exit_code = getattr(proc, "returncode", None)
+                session.completion_reason = "failed_start"
+                session.termination_source = "failed_start"
+            self._move_to_finished(session)
             raise
 
         return session
@@ -904,8 +997,10 @@ class ProcessRegistry:
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
 
+        reader: Optional[threading.Thread] = None
         if not session.exited:
-            # Start a poller thread that periodically reads the log file
+            # Build the identity-aware poller before registry insertion, but do
+            # not start it until the stable remote PID and registry row exist.
             reader = threading.Thread(
                 target=self._env_poller_loop,
                 args=(session, env, log_path, pid_path, exit_path),
@@ -913,7 +1008,6 @@ class ProcessRegistry:
                 name=f"proc-poller-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
 
         with self._lock:
             self._prune_if_needed()
@@ -921,6 +1015,9 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
         if not session.exited:
+            assert reader is not None
+            self._emit_process_lifecycle(session, "started")
+            reader.start()
             self._write_checkpoint()
 
         return session
@@ -1010,7 +1107,12 @@ class ProcessRegistry:
                     timeout=5,
                 )
                 check_output = check.get("output", "").strip()
-                if check_output and check_output.splitlines()[-1].strip() != "0":
+                probe_alive = bool(
+                    check_output and check_output.splitlines()[-1].strip() == "0"
+                )
+                if probe_alive:
+                    self._emit_process_lifecycle(session, "heartbeat")
+                if check_output and not probe_alive:
                     # Process has exited -- get exit code captured by the wrapper shell.
                     exit_result = env.execute(
                         f"cat {quoted_exit_path} 2>/dev/null",
@@ -1028,13 +1130,14 @@ class ProcessRegistry:
                     return
 
             except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
-                session.exited = True
-                session.exit_code = -1
-                session.completion_reason = "lost"
-                session.termination_source = "backend_lost"
-                self._move_to_finished(session)
-                return
+                # A backend outage says only that the probe is unavailable. It
+                # must never be promoted to false "lost"/terminal evidence.
+                self._emit_process_lifecycle(session, "probe_unavailable")
+                logger.debug(
+                    "managed_process_probe_unavailable process=%s reason=backend_error",
+                    session.id,
+                )
+                continue
 
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
@@ -1082,6 +1185,23 @@ class ProcessRegistry:
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
+
+        # This was_running guard is the single terminal authority. Reader,
+        # waiter, kill, and reconciliation races may all call this method, but
+        # only the first removal from _running publishes terminal.
+        if was_running:
+            terminal_status = (
+                session.completion_reason
+                if session.completion_reason
+                in {"exited", "killed", "lost", "failed_start", "already_exited"}
+                else "exited"
+            )
+            self._emit_process_lifecycle(
+                session,
+                "terminal",
+                terminal_status=terminal_status,
+                termination_source=session.termination_source or "unknown",
+            )
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -1989,6 +2109,8 @@ class ProcessRegistry:
             )
             with self._lock:
                 self._running[session.id] = session
+            self._emit_process_lifecycle(session, "adopted")
+            self._start_local_lifecycle_monitor(session)
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
 

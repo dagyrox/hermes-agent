@@ -1455,6 +1455,23 @@ def _build_child_agent(
             logger.debug("spawn_requested relay failed: %s", exc)
 
     try:
+        from agent.lifecycle_hooks import emit_subagent_lifecycle
+
+        emit_subagent_lifecycle(
+            "registered",
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+            parent_subagent_id=parent_subagent_id,
+            child_session_id=getattr(child, "session_id", None),
+            child_subagent_id=subagent_id,
+            child_role=effective_role,
+        )
+    except Exception:
+        logger.debug(
+            "subagent_lifecycle_failed event=registered reason=callback_error"
+        )
+
+    try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
         _invoke_hook(
             "subagent_start",
@@ -1839,8 +1856,36 @@ def _run_single_child(
     _last_seen_tool = [None]  # type: list
     _stale_count = [0]
 
+    def _emit_child_lifecycle(event: str, **extra: Any) -> None:
+        try:
+            from agent.lifecycle_hooks import emit_subagent_lifecycle
+
+            emit_subagent_lifecycle(
+                event,
+                parent_session_id=getattr(parent_agent, "session_id", None),
+                parent_turn_id=getattr(child, "_parent_turn_id", "") or "",
+                parent_subagent_id=getattr(child, "_parent_subagent_id", None),
+                child_session_id=getattr(child, "session_id", None),
+                child_subagent_id=_subagent_id,
+                child_role=getattr(child, "_delegate_role", None),
+                **extra,
+            )
+        except Exception:
+            logger.debug(
+                "subagent_lifecycle_failed event=%s reason=invalid_or_callback_error",
+                event,
+            )
+
     def _heartbeat_loop():
         while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+            # Contract heartbeat is independent of the waiting wrapper and is
+            # owned by the live child execution context.
+            try:
+                _emit_child_lifecycle("heartbeat")
+            except Exception:
+                logger.debug(
+                    "subagent_lifecycle_failed event=heartbeat reason=callback_error"
+                )
             if parent_agent is None:
                 continue
             touch = getattr(parent_agent, "_touch_activity", None)
@@ -1938,14 +1983,47 @@ def _run_single_child(
             }
         )
 
-    try:
-        _heartbeat_thread.start()
-        if child_progress_cb:
-            try:
-                child_progress_cb("subagent.start", preview=goal)
-            except Exception as e:
-                logger.debug("Progress callback start failed: %s", e)
+    _owner_cleanup_lock = threading.Lock()
+    _owner_cleanup_done = [False]
+    _child_future = None
 
+    def _cleanup_after_actual_child() -> None:
+        """Release child-owned resources exactly once after real completion."""
+        with _owner_cleanup_lock:
+            if _owner_cleanup_done[0]:
+                return
+            _owner_cleanup_done[0] = True
+
+        _heartbeat_stop.set()
+        if (
+            _heartbeat_thread.ident is not None
+            and _heartbeat_thread is not threading.current_thread()
+        ):
+            _heartbeat_thread.join(timeout=5)
+        if _subagent_id:
+            _unregister_subagent(_subagent_id)
+        if child_pool is not None and leased_cred_id is not None:
+            try:
+                child_pool.release_lease(leased_cred_id)
+            except Exception as exc:
+                logger.debug("Failed to release credential lease: %s", exc)
+        if parent_agent is not None and hasattr(parent_agent, "_active_children"):
+            try:
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                if lock:
+                    with lock:
+                        parent_agent._active_children.remove(child)
+                else:
+                    parent_agent._active_children.remove(child)
+            except (ValueError, UnboundLocalError) as exc:
+                logger.debug("Could not remove child from active_children: %s", exc)
+        try:
+            if child is not None and hasattr(child, "close"):
+                child.close()
+        except Exception:
+            logger.debug("Failed to close child agent after delegation")
+
+    try:
         # File-state coordination: reuse the stable subagent_id as the child's
         # task_id so file_state writes, active-subagents registry, and TUI
         # events all share one key.  Falls back to a fresh uuid only if the
@@ -2003,22 +2081,74 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Child text relay failed: %s", e)
 
+        _queue_announced = threading.Event()
+
+        def _terminal_status(run_result: Any) -> str:
+            if not isinstance(run_result, dict):
+                return "failed"
+            if run_result.get("interrupted"):
+                return "cancelled"
+            summary = run_result.get("final_response") or ""
+            if isinstance(summary, str) and summary.strip() and summary.strip() != "(empty)":
+                return "succeeded"
+            return "failed"
+
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
+            # A successful submit does not itself prove execution. The gate lets
+            # the submitter publish queued before this owner publishes started.
+            _queue_announced.wait()
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context():
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+                try:
+                    _heartbeat_thread.start()
+                    if child_progress_cb:
+                        try:
+                            child_progress_cb("subagent.start", preview=goal)
+                        except Exception as exc:
+                            logger.debug("Progress callback start failed: %s", exc)
+                    _emit_child_lifecycle("started")
+                    run_result = child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
+                    _emit_child_lifecycle(
+                        "terminal", terminal_status=_terminal_status(run_result)
+                    )
+                    return run_result
+                except BaseException:
+                    _emit_child_lifecycle("terminal", terminal_status="failed")
+                    raise
+                finally:
+                    _cleanup_after_actual_child()
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        try:
+            _child_future = _timeout_executor.submit(_run_with_thread_capture)
+            _emit_child_lifecycle("queued")
+        except Exception:
+            # No actual child future exists, so there is no future owner that can
+            # perform cleanup. Do not emit started/terminal for failed submission.
+            _cleanup_after_actual_child()
+            raise
+        finally:
+            _queue_announced.set()
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
-            # Signal the child to stop so its thread can exit cleanly.
+            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            if is_timeout:
+                try:
+                    _emit_child_lifecycle(
+                        "cancel_requested", cancel_reason="waiter_timeout"
+                    )
+                except Exception:
+                    logger.debug(
+                        "subagent_lifecycle_failed event=cancel_requested reason=callback_error"
+                    )
+            # Signal the child to stop so its thread can exit cleanly. This is a
+            # request only; terminal and cleanup remain owned by the live future.
             try:
                 if hasattr(child, "interrupt"):
                     child.interrupt()
@@ -2027,7 +2157,6 @@ def _run_single_child(
             except Exception:
                 pass
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -2354,56 +2483,18 @@ def _run_single_child(
         }
 
     finally:
-        # Stop the heartbeat thread so it doesn't keep touching parent activity
-        # after the child has finished (or failed).  Guard the join: .start()
-        # now lives inside the try block, so if it raised (OS thread
-        # exhaustion) the thread was never started and Thread.join() would
-        # raise RuntimeError.  ident is None until start() succeeds.
-        _heartbeat_stop.set()
-        if _heartbeat_thread.ident is not None:
-            _heartbeat_thread.join(timeout=5)
-
-        # Drop the TUI-facing registry entry.  Safe to call even if the
-        # child was never registered (e.g. ID missing on test doubles).
-        if _subagent_id:
-            _unregister_subagent(_subagent_id)
-
-        if child_pool is not None and leased_cred_id is not None:
-            try:
-                child_pool.release_lease(leased_cred_id)
-            except Exception as exc:
-                logger.debug("Failed to release credential lease: %s", exc)
-
-        # Restore the parent's tool names so the process-global is correct
-        # for any subsequent execute_code calls or other consumers.
+        # Before a future exists (or after it is done), this wrapper owns
+        # cleanup. A timed-out live future remains the sole cleanup owner.
+        if _child_future is None or _child_future.done():
+            _cleanup_after_actual_child()
+        # Process-global tool-name restoration is wrapper-owned and safe on a
+        # waiter timeout. Child liveness resources are released only by
+        # _cleanup_after_actual_child inside the actual future.
         import model_tools
 
         saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
         if isinstance(saved_tool_names, list):
             model_tools._last_resolved_tool_names = list(saved_tool_names)
-
-        # Remove child from active tracking
-
-        # Unregister child from interrupt propagation
-        if hasattr(parent_agent, "_active_children"):
-            try:
-                lock = getattr(parent_agent, "_active_children_lock", None)
-                if lock:
-                    with lock:
-                        parent_agent._active_children.remove(child)
-                else:
-                    parent_agent._active_children.remove(child)
-            except (ValueError, UnboundLocalError) as e:
-                logger.debug("Could not remove child from active_children: %s", e)
-
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
 
 
 def _recover_tasks_from_json_string(

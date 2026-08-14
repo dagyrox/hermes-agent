@@ -163,6 +163,10 @@ VALID_HOOKS: Set[str] = {
     "on_session_reset",
     "subagent_start",
     "subagent_stop",
+    # Versioned provider lifecycle contracts. These observer-only hooks carry
+    # identity/enums-only DTOs; see agent.lifecycle_hooks.
+    "subagent_lifecycle",
+    "managed_process_lifecycle",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent
     # dispatch. Plugins may return a dict to influence flow:
@@ -212,6 +216,13 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+}
+
+# Explicit per-hook payload contract versions. Hooks omitted here retain their
+# historical unversioned callback kwargs; adding the two entries is additive.
+HOOK_CONTRACT_VERSIONS: Dict[str, int] = {
+    "subagent_lifecycle": 1,
+    "managed_process_lifecycle": 1,
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

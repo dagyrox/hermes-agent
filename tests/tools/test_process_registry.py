@@ -1,6 +1,7 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -2229,3 +2230,170 @@ class TestHandleProcessRedaction:
         monkeypatch.setattr(pr, "process_registry", reg)
         out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
         assert "zzzopaque1234567890abcdef" in out["output"]
+
+
+class TestManagedProcessLifecycleHooks:
+    def test_local_started_uses_exact_identity_after_registry_insert(self, registry, monkeypatch):
+        from agent import lifecycle_hooks as lh
+        emitted = []
+        proc = MagicMock(pid=4242, stdout=MagicMock(), returncode=None)
+        reader = MagicMock()
+
+        def capture(hook, payload):
+            assert payload["process_id"] in registry._running
+            emitted.append((hook, dict(payload)))
+
+        monkeypatch.setattr(lh, "_emit", capture)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: 98765)
+        monkeypatch.setattr(registry, "_start_local_lifecycle_monitor", lambda _s: None)
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("tools.process_registry.subprocess.Popen", return_value=proc), \
+             patch("tools.process_registry.threading.Thread", return_value=reader), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("SECRET-CANARY command", cwd="/private/cwd", task_id="task-1")
+
+        payload = emitted[0][1]
+        assert session.pid == payload["pid"] == 4242
+        assert payload["host_start_time"] == 98765
+        assert payload["event"] == "started"
+        assert "SECRET-CANARY" not in repr(payload)
+        assert "/private/cwd" not in repr(payload)
+
+    def test_remote_started_carries_stable_backend_identity(self, registry, monkeypatch):
+        from agent import lifecycle_hooks as lh
+        emitted = []
+
+        class DockerEnv:
+            __module__ = "tools.environments.docker"
+            _container_id = "container-identity-1"
+            def execute(self, *_args, **_kwargs):
+                return {"output": "31337\n", "returncode": 0}
+
+        monkeypatch.setattr(lh, "_emit", lambda hook, payload: emitted.append((hook, dict(payload))))
+        with patch("tools.process_registry.threading.Thread", return_value=MagicMock()), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(DockerEnv(), "raw command canary")
+
+        payload = emitted[0][1]
+        assert session.id in registry._running
+        assert payload["backend"] == "docker"
+        assert payload["backend_id"] == "container-identity-1"
+        assert payload["pid"] == 31337
+        assert "raw command canary" not in repr(payload)
+
+    def test_remote_without_stable_backend_identity_emits_no_lifecycle(self, registry, monkeypatch):
+        from agent import lifecycle_hooks as lh
+        emitted = []
+
+        class UnknownEnv:
+            __module__ = "tools.environments.ssh"
+
+            def execute(self, *_args, **_kwargs):
+                return {"output": "31337\n", "returncode": 0}
+
+        monkeypatch.setattr(
+            lh, "_emit", lambda hook, payload: emitted.append((hook, dict(payload)))
+        )
+        with patch("tools.process_registry.threading.Thread", return_value=MagicMock()), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(UnknownEnv(), "raw command canary")
+
+        assert session.id in registry._running
+        assert emitted == []
+
+    def test_backend_outage_is_probe_unavailable_not_terminal(self, registry, monkeypatch, caplog):
+        from agent import lifecycle_hooks as lh
+        session = _make_session(sid="proc_remote")
+        session.pid, session.pid_scope = 99, "sandbox"
+        registry._running[session.id] = session
+        probe_seen, emitted = threading.Event(), []
+
+        class BrokenEnv:
+            __module__ = "tools.environments.ssh"
+            instance_id = "remote-instance-1"
+
+            def execute(self, *_args, **_kwargs):
+                raise RuntimeError("raw backend exception canary")
+
+        def capture(_hook, payload):
+            emitted.append(dict(payload))
+            probe_seen.set()
+
+        broken_env = BrokenEnv()
+        session.env_ref = broken_env
+        caplog.set_level(logging.DEBUG, logger="tools.process_registry")
+        monkeypatch.setattr(lh, "_emit", capture)
+        monkeypatch.setattr("tools.process_registry.time.sleep", lambda _seconds: None)
+        thread = threading.Thread(target=registry._env_poller_loop,
+                                  args=(session, broken_env, "/log", "/pid", "/exit"), daemon=True)
+        thread.start()
+        assert probe_seen.wait(timeout=1)
+        assert session.exited is False
+        assert session.id in registry._running
+        assert not any(event["event"] == "terminal" for event in emitted)
+        assert "raw backend exception canary" not in repr(emitted)
+        session.exited = True
+        thread.join(timeout=1)
+        assert "raw backend exception canary" not in caplog.text
+
+    def test_move_to_finished_emits_terminal_exactly_once_under_race(self, registry, monkeypatch):
+        from agent import lifecycle_hooks as lh
+        session = _make_session(sid="proc_race", exited=True, exit_code=0)
+        registry._running[session.id] = session
+        emitted, lock = [], threading.Lock()
+
+        def capture(_hook, payload):
+            with lock:
+                emitted.append(dict(payload))
+
+        monkeypatch.setattr(lh, "_emit", capture)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        racers = [threading.Thread(target=registry._move_to_finished, args=(session,)) for _ in range(12)]
+        for racer in racers:
+            racer.start()
+        for racer in racers:
+            racer.join()
+
+        terminal = [event for event in emitted if event["event"] == "terminal"]
+        assert len(terminal) == 1
+        assert terminal[0]["terminal_status"] == "exited"
+        assert terminal[0]["exit_code"] == 0
+
+    def test_pid_reuse_mismatch_never_heartbeats_recycled_identity(self, registry, monkeypatch):
+        from agent import lifecycle_hooks as lh
+        session = _make_session(sid="proc_reused")
+        session.pid, session.host_start_time, session.process = 123, 456, MagicMock()
+        session.process.poll.return_value = None
+        emitted = []
+        waits = iter([False])
+        monkeypatch.setattr(session._completion_event, "wait", lambda _timeout: next(waits))
+        monkeypatch.setattr(registry, "_host_pid_is_ours", lambda *_args: False)
+        monkeypatch.setattr(lh, "_emit", lambda _hook, payload: emitted.append(dict(payload)))
+
+        registry._local_lifecycle_monitor(session)
+        assert emitted == []
+
+    def test_verified_checkpoint_recovery_emits_adopted(self, registry, monkeypatch, tmp_path):
+        from agent import lifecycle_hooks as lh
+        start_time = ProcessRegistry._safe_host_start_time(os.getpid())
+        checkpoint = tmp_path / "processes.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_adopted",
+            "command": "SECRET-CANARY",
+            "pid": os.getpid(),
+            "pid_scope": "host",
+            "host_start_time": start_time,
+            "task_id": "task-adopted",
+        }]))
+        emitted = []
+        monkeypatch.setattr(lh, "_emit", lambda _hook, payload: emitted.append(dict(payload)))
+        monkeypatch.setattr(registry, "_start_local_lifecycle_monitor", lambda _s: None)
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+             patch.object(registry, "_write_checkpoint"):
+            assert registry.recover_from_checkpoint() == 1
+
+        adopted = [event for event in emitted if event["event"] == "adopted"]
+        assert len(adopted) == 1
+        assert adopted[0]["process_id"] == "proc_adopted"
+        assert adopted[0]["host_start_time"] == start_time
+        assert "SECRET-CANARY" not in repr(adopted)
