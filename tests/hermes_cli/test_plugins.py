@@ -630,6 +630,7 @@ class TestPluginHooks:
         assert "api_request_error" in VALID_HOOKS
         assert "subagent_start" in VALID_HOOKS
         assert "subagent_lifecycle" in VALID_HOOKS
+        assert "delegation_wrapper_lifecycle" in VALID_HOOKS
         assert "managed_process_lifecycle" in VALID_HOOKS
         assert HOOK_CONTRACT_VERSIONS["subagent_lifecycle"] == 2
         assert HOOK_CONTRACT_VERSIONS["delegation_wrapper_lifecycle"] == 1

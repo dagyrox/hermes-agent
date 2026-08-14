@@ -1833,28 +1833,13 @@ def _run_single_child(
     """
     child_start = time.monotonic()
 
-    # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
-
-    # Restore parent tool names using the value saved before child construction
-    # mutated the global. This is the correct parent toolset, not the child's.
-    import model_tools
-
-    _saved_tool_names = getattr(
-        child, "_delegate_saved_tool_names", list(model_tools._last_resolved_tool_names)
-    )
-
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
-    if child_pool is not None:
-        leased_cred_id = child_pool.acquire_lease()
-        if leased_cred_id is not None:
-            try:
-                leased_entry = child_pool.current()
-                if leased_entry is not None and hasattr(child, "_swap_credential"):
-                    child._swap_credential(leased_entry)
-            except Exception as exc:
-                logger.debug("Failed to bind child to leased credential: %s", exc)
+    _saved_tool_names = []
+    _raw_sid = getattr(child, "_subagent_id", None)
+    _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    _live_registered = False
 
     # Heartbeat: periodically propagate child activity to the parent so the
     # gateway inactivity timeout doesn't fire while the subagent is working.
@@ -1999,33 +1984,70 @@ def _run_single_child(
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
 
-    # Register the live agent in the module-level registry so the TUI can
-    # target it by subagent_id (kill, pause, status queries).  Unregistered
-    # in the finally block, even when the child raises.  Test doubles that
-    # hand us a MagicMock don't carry stable ids; skip registration then.
-    _raw_sid = getattr(child, "_subagent_id", None)
-    _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
-    if _subagent_id:
-        _raw_depth = getattr(child, "_delegate_depth", 1)
-        _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
-        _parent_sid = getattr(child, "_parent_subagent_id", None)
-        _register_subagent(
-            {
-                "subagent_id": _subagent_id,
-                "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
-                "depth": _tui_depth,
-                "goal": goal,
-                "model": (
-                    getattr(child, "model", None)
-                    if isinstance(getattr(child, "model", None), str)
-                    else None
-                ),
-                "started_at": time.time(),
-                "status": "running",
-                "tool_count": 0,
-                "agent": child,
-            }
+    # Every operation after provider registration is under terminal authority.
+    # A setup failure happens before actual child start, so close both records
+    # from their registered state and release any partially acquired resource.
+    try:
+        import model_tools
+
+        _saved_tool_names = getattr(
+            child,
+            "_delegate_saved_tool_names",
+            list(model_tools._last_resolved_tool_names),
         )
+        if child_pool is not None:
+            leased_cred_id = child_pool.acquire_lease()
+            if leased_cred_id is not None:
+                try:
+                    leased_entry = child_pool.current()
+                    if leased_entry is not None and hasattr(child, "_swap_credential"):
+                        child._swap_credential(leased_entry)
+                except Exception as exc:
+                    logger.debug("Failed to bind child to leased credential: %s", exc)
+
+        if _subagent_id:
+            _raw_depth = getattr(child, "_delegate_depth", 1)
+            _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
+            _parent_sid = getattr(child, "_parent_subagent_id", None)
+            _register_subagent(
+                {
+                    "subagent_id": _subagent_id,
+                    "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
+                    "depth": _tui_depth,
+                    "goal": goal,
+                    "model": (
+                        getattr(child, "model", None)
+                        if isinstance(getattr(child, "model", None), str)
+                        else None
+                    ),
+                    "started_at": time.time(),
+                    "status": "running",
+                    "tool_count": 0,
+                    "agent": child,
+                }
+            )
+            _live_registered = True
+    except BaseException:
+        _emit_child_terminal_once("failed")
+        _emit_wrapper_lifecycle("terminal", terminal_status="failed")
+        if _live_registered and _subagent_id:
+            _unregister_subagent(_subagent_id)
+        if child_pool is not None and leased_cred_id is not None:
+            try:
+                child_pool.release_lease(leased_cred_id)
+            except Exception:
+                pass
+        if parent_agent is not None and hasattr(parent_agent, "_active_children"):
+            try:
+                parent_agent._active_children.remove(child)
+            except (ValueError, AttributeError):
+                pass
+        try:
+            if child is not None and hasattr(child, "close"):
+                child.close()
+        except Exception:
+            pass
+        raise
 
     _owner_cleanup_lock = threading.Lock()
     _owner_cleanup_done = [False]

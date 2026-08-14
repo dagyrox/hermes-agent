@@ -166,6 +166,7 @@ VALID_HOOKS: Set[str] = {
     # Versioned provider lifecycle contracts. These observer-only hooks carry
     # identity/enums-only DTOs; see agent.lifecycle_hooks.
     "subagent_lifecycle",
+    "delegation_wrapper_lifecycle",
     "managed_process_lifecycle",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent

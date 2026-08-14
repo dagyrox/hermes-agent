@@ -291,6 +291,49 @@ def test_terminal_failure_is_emitted_once_under_exception(monkeypatch):
     assert "RuntimeError: raw exception" not in repr(emitted)
 
 
+def test_post_registration_setup_failures_terminalize_child_and_wrapper_once(monkeypatch):
+    for failure in ("lease", "registry"):
+        child = MagicMock()
+        child.session_id = f"child-session-{failure}"
+        child._subagent_id = f"subagent-{failure}"
+        child._delegation_wrapper_id = f"wrapper-{failure}"
+        child._delegate_role = "leaf"
+        child._delegate_depth = 1
+        child.get_activity_summary.return_value = {}
+        child._credential_pool = MagicMock()
+        child._credential_pool.acquire_lease.return_value = None
+        parent = _parent()
+        parent._active_children.append(child)
+        emitted = []
+        monkeypatch.setattr(
+            lh, "_emit", lambda hook, payload: emitted.append((hook, dict(payload)))
+        )
+        if failure == "lease":
+            child._credential_pool.acquire_lease.side_effect = RuntimeError("SECRET-CANARY")
+            register = patch.object(dt, "_register_subagent")
+        else:
+            register = patch.object(dt, "_register_subagent", side_effect=RuntimeError("SECRET-CANARY"))
+
+        with register:
+            try:
+                dt._run_single_child(0, "goal prompt must not leak", child, parent)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("setup failure must propagate")
+
+        terminal = [(hook, dto) for hook, dto in emitted if dto["event"] == "terminal"]
+        assert len(terminal) == 2
+        assert {hook for hook, _ in terminal} == {
+            "subagent_lifecycle",
+            "delegation_wrapper_lifecycle",
+        }
+        assert all(dto["terminal_status"] == "failed" for _, dto in terminal)
+        assert child not in parent._active_children
+        child.close.assert_called_once()
+        assert "SECRET-CANARY" not in repr(emitted)
+
+
 def test_nonempty_failed_and_incomplete_results_never_emit_success(monkeypatch):
     result_shapes = [
         {
