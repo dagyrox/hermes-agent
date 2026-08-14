@@ -1422,6 +1422,11 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # A built child is provider-registered before it is submitted for
+    # execution.  Keep an object-local guard so batch construction/dispatch
+    # failures can close that pre-start lifecycle exactly once.
+    child._delegation_prestart_cleanup_lock = threading.Lock()
+    child._delegation_prestart_cleanup_done = False
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -1499,6 +1504,75 @@ def _build_child_agent(
         logger.debug("subagent_start hook invocation failed", exc_info=True)
 
     return child
+
+
+def _fail_registered_unstarted_child(child: Any, parent_agent: Any) -> None:
+    """Terminalize and release a provider-registered child that never started.
+
+    Batch construction and executor submission are both fallible after
+    ``_build_child_agent`` has emitted the child and wrapper ``registered``
+    events.  Such children never enter ``_run_single_child``, so its normal
+    terminal and cleanup authority cannot run.  This function is the narrow
+    pre-start owner for those failure paths.
+    """
+    lock = getattr(child, "_delegation_prestart_cleanup_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(child, "_delegation_prestart_cleanup_lock", lock)
+    with lock:
+        if getattr(child, "_delegation_prestart_cleanup_done", False) is True:
+            return
+        child._delegation_prestart_cleanup_done = True
+
+    lifecycle_args = {
+        "parent_session_id": getattr(parent_agent, "session_id", None),
+        "parent_turn_id": getattr(child, "_parent_turn_id", "") or "",
+        "parent_subagent_id": getattr(child, "_parent_subagent_id", None),
+    }
+    try:
+        from agent.lifecycle_hooks import emit_subagent_lifecycle
+
+        emit_subagent_lifecycle(
+            "terminal",
+            delegation_wrapper_id=getattr(child, "_delegation_wrapper_id", None),
+            child_session_id=getattr(child, "session_id", None),
+            child_subagent_id=getattr(child, "_subagent_id", None),
+            child_role=getattr(child, "_delegate_role", None),
+            terminal_status="failed",
+            **lifecycle_args,
+        )
+    except Exception:
+        logger.debug("subagent_lifecycle_failed event=terminal reason=prestart_cleanup")
+    try:
+        from agent.lifecycle_hooks import emit_delegation_wrapper_lifecycle
+
+        emit_delegation_wrapper_lifecycle(
+            "terminal",
+            wrapper_id=getattr(child, "_delegation_wrapper_id", None),
+            child_subagent_id=getattr(child, "_subagent_id", None),
+            terminal_status="failed",
+            **lifecycle_args,
+        )
+    except Exception:
+        logger.debug(
+            "delegation_wrapper_lifecycle_failed event=terminal reason=prestart_cleanup"
+        )
+
+    if parent_agent is not None and hasattr(parent_agent, "_active_children"):
+        try:
+            active_lock = getattr(parent_agent, "_active_children_lock", None)
+            if active_lock:
+                with active_lock:
+                    parent_agent._active_children.remove(child)
+            else:
+                parent_agent._active_children.remove(child)
+        except (ValueError, AttributeError):
+            pass
+    try:
+        if child is not None and hasattr(child, "close"):
+            child.close()
+    except Exception:
+        logger.debug("Failed to close unstarted delegated child", exc_info=True)
 
 
 def _dump_subagent_timeout_diagnostic(
@@ -2774,48 +2848,58 @@ def delegate_task(
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
     try:
-        for i, t in enumerate(task_list):
-            # Per-task role beats top-level; normalise again so unknown
-            # per-task values warn and degrade to leaf uniformly.
-            effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
-                role=effective_role,
-            )
-            # Override with correct parent tool names (before child construction mutated global)
-            child._delegate_saved_tool_names = _parent_tool_names
-            # Tee the child's progress events into its live transcript log.
-            # wrap_progress_callback preserves the inner callback contract
-            # (including the _flush attribute) and never lets writer failures
-            # reach the agent loop. When no parent display exists the inner
-            # callback is None and the wrapper still records events.
-            _writer = live_writers[i] if i < len(live_writers) else None
-            if _writer is not None:
-                child.tool_progress_callback = wrap_progress_callback(
-                    getattr(child, "tool_progress_callback", None), _writer
+        try:
+            for i, t in enumerate(task_list):
+                # Per-task role beats top-level; normalise again so unknown
+                # per-task values warn and degrade to leaf uniformly.
+                effective_role = _normalize_role(t.get("role") or top_role)
+                child = _build_child_agent(
+                    task_index=i,
+                    goal=t["goal"],
+                    context=t.get("context"),
+                    # Subagents always inherit the parent's toolsets; the model
+                    # cannot choose or narrow them (no model-facing toolsets arg).
+                    toolsets=None,
+                    model=creds["model"],
+                    max_iterations=effective_max_iter,
+                    task_count=n_tasks,
+                    parent_agent=parent_agent,
+                    override_provider=creds["provider"],
+                    override_base_url=creds["base_url"],
+                    override_api_key=creds["api_key"],
+                    override_api_mode=creds["api_mode"],
+                    override_request_overrides=creds.get("request_overrides"),
+                    override_max_tokens=creds.get("max_output_tokens"),
+                    override_acp_command=creds.get("command"),
+                    override_acp_args=creds.get("args"),
+                    role=effective_role,
                 )
-                child._live_transcript_path = str(_writer.path)
-            children.append((i, t, child))
-    finally:
-        # Authoritative restore: reset global to parent's tool names after all children built
-        _model_tools._last_resolved_tool_names = _parent_tool_names
+                # From this point the provider lifecycle is registered; bind
+                # it to the batch cleanup owner before any further setup.
+                children.append((i, t, child))
+                # Override with correct parent tool names (before child construction mutated global)
+                child._delegate_saved_tool_names = _parent_tool_names
+                # Tee the child's progress events into its live transcript log.
+                # wrap_progress_callback preserves the inner callback contract
+                # (including the _flush attribute) and never lets writer failures
+                # reach the agent loop. When no parent display exists the inner
+                # callback is None and the wrapper still records events.
+                _writer = live_writers[i] if i < len(live_writers) else None
+                if _writer is not None:
+                    child.tool_progress_callback = wrap_progress_callback(
+                        getattr(child, "tool_progress_callback", None), _writer
+                    )
+                    child._live_transcript_path = str(_writer.path)
+        finally:
+            # Authoritative restore: reset global to parent's tool names after all children built
+            _model_tools._last_resolved_tool_names = _parent_tool_names
+    except BaseException:
+        # A later build failed after earlier children were provider-registered.
+        # They will never reach _run_single_child, so close their lifecycle and
+        # resources here before preserving the original build failure.
+        for _i, _t, built_child in children:
+            _fail_registered_unstarted_child(built_child, parent_agent)
+        raise
 
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -2843,15 +2927,28 @@ def delegate_task(
             from tools.daemon_pool import DaemonThreadPoolExecutor
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
-                for i, t, child in children:
-                    future = executor.submit(
-                        _run_single_child,
-                        task_index=i,
-                        goal=t["goal"],
-                        child=child,
-                        parent_agent=parent_agent,
-                    )
-                    futures[future] = i
+                submitted_count = 0
+                try:
+                    for i, t, child in children:
+                        future = executor.submit(
+                            _run_single_child,
+                            task_index=i,
+                            goal=t["goal"],
+                            child=child,
+                            parent_agent=parent_agent,
+                        )
+                        futures[future] = i
+                        submitted_count += 1
+                except BaseException:
+                    # The failing submit and every later child remain in their
+                    # provider-registered state and have no execution owner.
+                    # Already-submitted children retain _run_single_child as
+                    # their sole terminal/cleanup authority.
+                    for _i, _t, unstarted_child in children[submitted_count:]:
+                        _fail_registered_unstarted_child(
+                            unstarted_child, parent_agent
+                        )
+                    raise
 
                 # Poll futures with interrupt checking.  as_completed() blocks
                 # until ALL futures finish — if a child agent gets stuck,

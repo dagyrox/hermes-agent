@@ -2,6 +2,7 @@
 
 import threading
 import time
+from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
 from agent import lifecycle_hooks as lh
@@ -332,6 +333,148 @@ def test_post_registration_setup_failures_terminalize_child_and_wrapper_once(mon
         assert child not in parent._active_children
         child.close.assert_called_once()
         assert "SECRET-CANARY" not in repr(emitted)
+
+
+def test_later_batch_build_failure_closes_every_registered_unstarted_child(monkeypatch):
+    parent = _parent()
+    parent._delegate_depth = 0
+    first = MagicMock()
+    first.session_id = "child-built-before-failure"
+    emitted = []
+
+    monkeypatch.setattr(
+        lh, "_emit", lambda hook, payload: emitted.append((hook, dict(payload)))
+    )
+    monkeypatch.setattr(dt, "_resolve_child_credential_pool", lambda *_args: None)
+
+    with patch(
+        "run_agent.AIAgent",
+        side_effect=[first, RuntimeError("SECRET-CANARY later build failure")],
+    ):
+        try:
+            dt.delegate_task(
+                tasks=[{"goal": "first private goal"}, {"goal": "second private goal"}],
+                parent_agent=parent,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("later child build failure must propagate")
+
+    child_events = [
+        dto for hook, dto in emitted
+        if hook == "subagent_lifecycle"
+        and dto.get("child_session_id") == "child-built-before-failure"
+    ]
+    wrapper_events = [
+        dto for hook, dto in emitted
+        if hook == "delegation_wrapper_lifecycle"
+        and dto.get("child_subagent_id") == child_events[0]["child_subagent_id"]
+    ]
+    assert [dto["event"] for dto in child_events] == ["registered", "terminal"]
+    assert [dto["event"] for dto in wrapper_events] == ["registered", "terminal"]
+    assert child_events[-1]["terminal_status"] == "failed"
+    assert wrapper_events[-1]["terminal_status"] == "failed"
+    assert parent._active_children == []
+    first.close.assert_called_once()
+    assert not any(canary in repr(emitted) for canary in _CANARIES)
+
+
+def test_partial_batch_submit_failure_closes_failed_and_unsubmitted_children(monkeypatch):
+    parent = _parent()
+    parent._delegate_depth = 0
+    children = []
+    for index in range(3):
+        child = MagicMock()
+        child.session_id = f"child-submit-{index}"
+        child._credential_pool = None
+        child.get_activity_summary.return_value = {}
+        child.run_conversation.return_value = {
+            "final_response": "safe summary",
+            "completed": True,
+            "api_calls": 1,
+        }
+        children.append(child)
+    emitted = []
+
+    class FailSecondSubmitExecutor:
+        def __init__(self, **_kwargs):
+            self.submit_count = 0
+            self.threads = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.shutdown(wait=True)
+            return False
+
+        def shutdown(self, wait=True, **_kwargs):
+            if wait:
+                for thread in self.threads:
+                    thread.join(timeout=2)
+
+        def submit(self, fn, **kwargs):
+            self.submit_count += 1
+            if self.submit_count == 2:
+                raise RuntimeError("SECRET-CANARY submit failure")
+            future = Future()
+
+            def run():
+                try:
+                    future.set_result(fn(**kwargs))
+                except BaseException as exc:
+                    future.set_exception(exc)
+
+            thread = threading.Thread(target=run)
+            self.threads.append(thread)
+            thread.start()
+            return future
+
+    monkeypatch.setattr(
+        lh, "_emit", lambda hook, payload: emitted.append((hook, dict(payload)))
+    )
+    monkeypatch.setattr(dt, "_resolve_child_credential_pool", lambda *_args: None)
+    monkeypatch.setattr(dt, "_get_child_timeout", lambda: None)
+    monkeypatch.setattr(
+        "tools.daemon_pool.DaemonThreadPoolExecutor", FailSecondSubmitExecutor
+    )
+
+    with patch("run_agent.AIAgent", side_effect=children):
+        try:
+            dt.delegate_task(
+                tasks=[{"goal": f"private goal {i}"} for i in range(3)],
+                parent_agent=parent,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("executor submit failure must propagate")
+
+    for index, child in enumerate(children):
+        child_events = [
+            dto for hook, dto in emitted
+            if hook == "subagent_lifecycle"
+            and dto.get("child_session_id") == f"child-submit-{index}"
+        ]
+        wrapper_events = [
+            dto for hook, dto in emitted
+            if hook == "delegation_wrapper_lifecycle"
+            and dto.get("child_subagent_id") == child_events[0]["child_subagent_id"]
+        ]
+        terminals = [dto for dto in child_events if dto["event"] == "terminal"]
+        wrapper_terminals = [dto for dto in wrapper_events if dto["event"] == "terminal"]
+        assert len(terminals) == 1
+        assert len(wrapper_terminals) == 1
+        expected = "succeeded" if index == 0 else "failed"
+        assert terminals[0]["terminal_status"] == expected
+        assert wrapper_terminals[0]["terminal_status"] == expected
+        if index > 0:
+            assert "started" not in [dto["event"] for dto in child_events]
+        child.close.assert_called_once()
+
+    assert parent._active_children == []
+    assert not any(canary in repr(emitted) for canary in _CANARIES)
 
 
 def test_nonempty_failed_and_incomplete_results_never_emit_success(monkeypatch):
