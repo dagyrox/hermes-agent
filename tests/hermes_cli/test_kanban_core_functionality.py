@@ -3464,6 +3464,24 @@ def test_check_dispatcher_presence_warns_when_no_gateway(monkeypatch):
     assert "hermes gateway start" in msg
 
 
+def test_check_dispatcher_presence_recommends_standalone_for_disabled_embedded_mode(
+    monkeypatch,
+):
+    from hermes_cli import kanban as kb_cli
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": False}},
+    )
+
+    running, msg = kb_cli._check_dispatcher_presence()
+
+    assert running is False
+    assert "hermes kanban daemon" in msg
+    assert "hermes gateway start" not in msg
+    assert "--force" not in msg
+
+
 def test_check_dispatcher_presence_warns_when_flag_off(monkeypatch):
     """Gateway is up but dispatch_in_gateway=false -> warning."""
     from hermes_cli import kanban as kb_cli
@@ -3475,6 +3493,8 @@ def test_check_dispatcher_presence_warns_when_flag_off(monkeypatch):
     running, msg = kb_cli._check_dispatcher_presence()
     assert running is False
     assert "dispatch_in_gateway" in msg
+    assert "hermes kanban daemon" in msg
+    assert "--force" not in msg
 
 
 def test_check_dispatcher_presence_silent_on_probe_error(monkeypatch):
@@ -3559,23 +3579,22 @@ def test_cli_create_no_warn_unassigned(kanban_home, monkeypatch, capsys):
     assert "hermes gateway start" not in err
 
 
-def test_cli_daemon_without_force_prints_deprecation_exits_2(kanban_home, capsys):
-    """`hermes kanban daemon` (no --force) is a deprecation stub."""
+def test_cli_daemon_refuses_duplicate_embedded_mode(kanban_home, capsys):
+    """Default embedded mode refuses a second standalone dispatcher."""
     from hermes_cli import kanban as kb_cli
     ns = argparse.Namespace(
-        force=False, interval=60.0, max=None, failure_limit=3,
+        force=False, interval=None, max=None, failure_limit=None,
         pidfile=None, verbose=False,
     )
     rc = kb_cli._cmd_daemon(ns)
     assert rc == 2
     err = capsys.readouterr().err
-    assert "DEPRECATED" in err
-    assert "hermes gateway start" in err
+    assert "duplicate dispatcher" in err
+    assert "dispatch_in_gateway=false" in err
 
 
-def test_cli_daemon_help_marks_deprecated():
-    """The argparse help string on `daemon` mentions deprecation so users
-    scanning `--help` see the migration before running the stub."""
+def test_cli_daemon_help_documents_supported_config_gate():
+    """The argparse help identifies the supported standalone config gate."""
     import argparse as _ap
     from hermes_cli import kanban as kb_cli
     root = _ap.ArgumentParser()
@@ -3594,16 +3613,16 @@ def test_cli_daemon_help_marks_deprecated():
                                     daemon_help = sub_action._choices_actions
                                     break
     # _choices_actions is a list of _ChoicesPseudoAction-like objects with .help
-    found_deprecation = False
+    found_supported_gate = False
     if daemon_help:
         for act in daemon_help:
             if getattr(act, "dest", "") == "daemon":
-                if "DEPRECATED" in (act.help or ""):
-                    found_deprecation = True
+                if "dispatch_in_gateway=false" in (act.help or ""):
+                    found_supported_gate = True
                     break
-    assert found_deprecation, (
-        "daemon subparser help should be marked DEPRECATED so users see "
-        "the migration guidance in `hermes kanban --help` output"
+    assert found_supported_gate, (
+        "daemon subparser help should name dispatch_in_gateway=false as the "
+        "supported standalone mode"
     )
 
 

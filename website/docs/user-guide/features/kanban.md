@@ -215,11 +215,11 @@ hermes kanban stats
 
 When the dispatcher picks up `t_abcd` and spawns the `researcher` profile, the very first thing that worker's model does is call `kanban_show()` to read its task. It doesn't run `hermes kanban show t_abcd`.
 
-### Gateway-embedded dispatcher (default)
+### Dispatcher supervision modes
 
-The dispatcher runs inside the gateway process. Nothing to install, no
-separate service to manage — if the gateway is up, ready tasks get picked
-up on the next tick (60s by default).
+By default the dispatcher runs inside the gateway process. Nothing separate
+needs supervision: if the gateway is up, ready tasks get picked up on the next
+tick (60s by default).
 
 ```yaml
 # config.yaml
@@ -228,19 +228,44 @@ kanban:
   dispatch_interval_seconds: 60    # default
 ```
 
-Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
-for debugging. Standard gateway supervision applies: run `hermes gateway
-start` directly, or wire the gateway up as a systemd user unit (see the
-gateway docs). Without a running gateway, `ready` tasks stay where they are
-until one comes up — `hermes kanban create` warns about this at creation
-time.
+For independent lifecycle supervision, disable embedded dispatch and run the
+standalone daemon as its own service. This keeps dispatcher-owned workers alive
+across gateway maintenance and restarts:
 
-Running `hermes kanban daemon` as a separate process is **deprecated**;
-use the gateway. If you truly cannot run the gateway (headless host
-policy forbids long-lived services, etc.) a `--force` escape hatch keeps
-the old standalone daemon alive for one release cycle, but running both
-a gateway-embedded dispatcher AND a standalone daemon against the same
-`kanban.db` causes claim races and is not supported.
+```yaml
+# config.yaml
+kanban:
+  dispatch_in_gateway: false
+  dispatch_interval_seconds: 60
+  max_in_progress: 2
+  max_in_progress_per_profile: 2
+  max_spawn: 2
+  failure_limit: 2
+```
+
+```bash
+hermes kanban daemon
+```
+
+The daemon refuses to start when effective config leaves
+`dispatch_in_gateway: true`, and a machine-global advisory lock prevents a
+second safely configured daemon from starting. The hidden `--force` flag is an
+expert escape hatch for legacy/debugging scenarios; it bypasses those safety
+checks and can create competing dispatchers, so it is not appropriate for a
+supervised deployment.
+
+Config supplies all defaults. Existing CLI flags are explicit overrides:
+`--interval` overrides `dispatch_interval_seconds`, `--max` overrides
+`max_spawn`, and `--failure-limit` overrides `failure_limit`. They do not
+override `max_in_progress` or `max_in_progress_per_profile`; the stricter live
+capacity limit still wins. Invalid or non-positive capacity values mean
+unlimited. Stop with SIGINT or SIGTERM; the daemon exits after the active tick
+without signaling dispatcher-owned workers or inventing task terminal events.
+
+Do not run gateway-embedded and standalone dispatch simultaneously. For
+rollback, stop and verify the standalone service is inactive, set
+`dispatch_in_gateway: true`, then restart the gateway. Without either mode
+running, `ready` tasks remain queued.
 
 ### Idempotent create (for automation / webhooks)
 
@@ -721,8 +746,11 @@ All commands are also available as a slash command in the interactive CLI and in
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
-| `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
+| `kanban.max_spawn` | unset (unlimited) | Historical global live-worker cap. `hermes kanban dispatch --max` and `daemon --max` explicitly override this value for that process. |
+| `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher leaves excess ready/review work deferred without a failure event. Invalid or below-1 values behave as unlimited. When combined with `max_spawn`, the stricter cap wins. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.default_assignee` | unset | Assigns otherwise-unassigned ready tasks to this profile before dispatch. |
+| `kanban.failure_limit` | `2` | Auto-blocks after this many consecutive spawn/crash/timeout failures unless a task-level `max_retries` overrides it. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 

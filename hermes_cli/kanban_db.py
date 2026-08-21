@@ -8109,40 +8109,34 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    # Count tasks already running so max_spawn enforces concurrency rather
-    # than a per-tick spawn budget. See the docstring above for the full
-    # rationale; the short version is that a 60-second tick interval with a
-    # per-tick budget of N would grow concurrency by N every tick on a busy
-    # board, since "running" tasks aren't reclaimed by completion alone —
-    # they sit in status='running' until the worker calls
-    # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
-    running_count = 0
-    if max_spawn is not None:
-        running_count = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
+    # Both global knobs are live-worker caps. Normalize unsafe direct callers
+    # here (not only at config resolution) so invalid/non-positive values retain
+    # the documented no-cap behavior. When both are set, the stricter cap wins;
+    # an explicit CLI --max must never bypass kanban.max_in_progress.
+    def _normalize_cap(value: Any) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    max_spawn = _normalize_cap(max_spawn)
+    max_in_progress = _normalize_cap(max_in_progress)
+    global_caps = [cap for cap in (max_spawn, max_in_progress) if cap is not None]
+    worker_cap = min(global_caps) if global_caps else None
+    running_count = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+        ).fetchone()[0]
+    )
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-    # Honour kanban.max_in_progress: if the board already has enough running
-    # tasks, skip spawning this tick so slow workers (local LLMs,
-    # resource-constrained hosts) can finish what they have before more tasks
-    # pile up and time out.
-    if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        if in_progress >= max_in_progress:
-            return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -8152,10 +8146,7 @@ def _dispatch_once_locked(
     # Tasks blocked this way go to skipped_per_profile_capped (not
     # skipped_unassigned — the operator-actionable signal is different:
     # "this profile is busy, try again later" not "this needs routing").
-    _per_profile_cap = max_in_progress_per_profile if (
-        isinstance(max_in_progress_per_profile, int)
-        and max_in_progress_per_profile > 0
-    ) else None
+    _per_profile_cap = _normalize_cap(max_in_progress_per_profile)
     _per_profile_running: dict[str, int] = {}
     if _per_profile_cap is not None:
         for prow in conn.execute(
@@ -8181,7 +8172,7 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if worker_cap is not None and running_count + spawned >= worker_cap:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -8286,6 +8277,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -8372,7 +8364,7 @@ def _dispatch_once_locked(
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if worker_cap is not None and running_count + spawned >= worker_cap:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
@@ -8384,8 +8376,20 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        if _per_profile_cap is not None:
+            current = _per_profile_running.get(row["assignee"], 0)
+            if current >= _per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], row["assignee"], current)
+                )
+                continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            spawned += 1
+            if _per_profile_cap is not None:
+                _per_profile_running[row["assignee"]] = (
+                    _per_profile_running.get(row["assignee"], 0) + 1
+                )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -8430,6 +8434,10 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if _per_profile_cap is not None and claimed.assignee:
+                _per_profile_running[claimed.assignee] = (
+                    _per_profile_running.get(claimed.assignee, 0) + 1
+                )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -8905,7 +8913,11 @@ def run_daemon(
     *,
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    default_assignee: Optional[str] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    stale_timeout_seconds: int = 0,
     stop_event=None,
     on_tick=None,
 ) -> None:
@@ -8938,17 +8950,34 @@ def run_daemon(
 
     while not stop_event.is_set():
         try:
-            with contextlib.closing(connect()) as conn:
-                res = dispatch_once(
-                    conn,
-                    max_spawn=max_spawn,
-                    failure_limit=failure_limit,
-                )
-            if on_tick is not None:
+            try:
+                boards = list_boards(include_archived=False)
+            except Exception:
+                boards = [{"slug": get_current_board()}]
+            for board_info in boards:
+                slug = board_info.get("slug") or DEFAULT_BOARD
                 try:
-                    on_tick(res)
+                    with contextlib.closing(connect(board=slug)) as conn:
+                        res = dispatch_once(
+                            conn,
+                            board=slug,
+                            max_spawn=max_spawn,
+                            max_in_progress=max_in_progress,
+                            max_in_progress_per_profile=max_in_progress_per_profile,
+                            default_assignee=default_assignee,
+                            failure_limit=failure_limit,
+                            stale_timeout_seconds=stale_timeout_seconds,
+                        )
+                    if on_tick is not None:
+                        try:
+                            on_tick(res)
+                        except Exception:
+                            pass
                 except Exception:
-                    pass
+                    # One corrupt/unavailable board must not starve later
+                    # boards serviced by this singleton daemon.
+                    import traceback
+                    traceback.print_exc()
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback

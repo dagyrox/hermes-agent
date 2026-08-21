@@ -2900,6 +2900,12 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Global live-worker caps. Positive integers bound concurrency; null,
+        # invalid, zero, and negative values mean unlimited. max_spawn is the
+        # historical dispatcher knob; max_in_progress is the explicit board
+        # capacity knob. When both are set, the stricter value wins.
+        "max_spawn": None,
+        "max_in_progress": None,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

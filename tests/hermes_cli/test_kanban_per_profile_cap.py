@@ -100,7 +100,7 @@ def test_pre_existing_running_counts_against_cap(isolated_kanban_home_with_profi
     assert capped_assignees.count("beta") == 1
 
 
-@pytest.mark.parametrize("cap", [0, -1, "abc", None])
+@pytest.mark.parametrize("cap", [0, -1, "abc", None, True])
 def test_invalid_cap_treated_as_no_cap(isolated_kanban_home_with_profiles, cap):
     """Cap values that don't represent a positive int should be treated as
     'no cap' — silently falling through rather than crashing the dispatcher."""
@@ -165,3 +165,81 @@ def test_dispatch_result_has_skipped_per_profile_capped_field():
     r = DispatchResult()
     assert hasattr(r, "skipped_per_profile_capped")
     assert r.skipped_per_profile_capped == []
+
+
+def test_global_cap_defers_review_task_without_terminal_event(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        running = [
+            kb.create_task(conn, title=f"running-{i}", assignee="alpha")
+            for i in range(2)
+        ]
+        for task_id in running:
+            kb.claim_task(conn, task_id)
+        review = kb.create_task(conn, title="review", assignee="beta")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            max_in_progress=2,
+        )
+        task = kb.get_task(conn, review)
+        events = kb.list_events(conn, review)
+
+    assert result.spawned == []
+    assert task.status == "review"
+    assert not any(event.kind in {"failed", "blocked", "spawn_failed"} for event in events)
+
+
+def test_per_profile_cap_applies_to_review_workers(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        running_alpha = kb.create_task(conn, title="running-alpha", assignee="alpha")
+        kb.claim_task(conn, running_alpha)
+        alpha_review = kb.create_task(conn, title="alpha-review", assignee="alpha")
+        beta_review = kb.create_task(conn, title="beta-review", assignee="beta")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id IN (?, ?)",
+                (alpha_review, beta_review),
+            )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress=3,
+            max_in_progress_per_profile=1,
+        )
+
+    assert [spawn[0] for spawn in result.spawned] == [beta_review]
+    assert result.skipped_per_profile_capped == [(alpha_review, "alpha", 1)]
+
+
+@pytest.mark.parametrize("cap", [0, -1, "bad", True])
+def test_nonpositive_or_invalid_global_caps_mean_unlimited(
+    isolated_kanban_home_with_profiles,
+    cap,
+):
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        for i in range(3):
+            kb.create_task(conn, title=f"ready-{i}", assignee="alpha")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_spawn=cap,
+            max_in_progress=cap,
+        )
+
+    assert len(result.spawned) == 3
