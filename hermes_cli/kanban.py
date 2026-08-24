@@ -761,6 +761,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_daemon.add_argument("--force", action="store_true",
                           help=argparse.SUPPRESS)
 
+    # --- dispatcher-quiesce ---
+    p_quiesce = sub.add_parser(
+        "dispatcher-quiesce",
+        help="Drain and stop one embedded dispatcher before gateway handoff",
+    )
+    p_quiesce.add_argument(
+        "--pid",
+        type=int,
+        required=True,
+        help="Expected gateway MainPID that currently owns embedded dispatch",
+    )
+    p_quiesce.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for the active tick to drain (default: 30; max: 300)",
+    )
+    p_quiesce.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit one machine-readable result object",
+    )
+
     # --- watch ---
     p_watch = sub.add_parser(
         "watch",
@@ -1006,6 +1029,12 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # Quiescence is a process-control safety boundary, not a board operation.
+    # It must still work when the SQLite board is corrupt, unavailable, or
+    # actively used by the dispatcher being drained.
+    if action == "dispatcher-quiesce":
+        return _cmd_dispatcher_quiesce(args)
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1155,6 +1184,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "archive",
     "dispatch",
     "daemon",
+    "dispatcher-quiesce",
     "repair",
     "heartbeat",
     "notify-subscribe",
@@ -2543,6 +2573,28 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dispatcher_quiesce(args: argparse.Namespace) -> int:
+    """Drain one exact embedded owner through the fixed local control protocol."""
+    from hermes_cli import kanban_dispatcher
+
+    result = kanban_dispatcher.request_dispatcher_quiescence(
+        expected_pid=args.pid,
+        timeout_seconds=args.timeout,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False))
+    elif result.get("ok"):
+        print(
+            f"Embedded dispatcher pid={result['owner_pid']} acknowledged quiescence."
+        )
+    else:
+        print(
+            f"hermes kanban dispatcher-quiesce: {result.get('state', 'indeterminate')}",
+            file=sys.stderr,
+        )
+    return 0 if result.get("ok") is True else 1
+
+
 def _cmd_daemon(args: argparse.Namespace) -> int:
     """Run the independently supervised dispatcher when embedded mode is off."""
     from hermes_cli.config import load_config
@@ -2574,7 +2626,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         )
         return 2
 
-    lock_handle, lock_state = kanban_dispatcher.acquire_dispatcher_lock()
+    lock_handle, lock_state = kanban_dispatcher.acquire_dispatcher_lock(
+        owner_mode="standalone"
+    )
     if lock_state != "held" and not force:
         detail = (
             "another dispatcher is already running"
