@@ -262,6 +262,18 @@ capacity limit still wins. Invalid or non-positive capacity values mean
 unlimited. Stop with SIGINT or SIGTERM; the daemon exits after the active tick
 without signaling dispatcher-owned workers or inventing task terminal events.
 
+The global and per-profile limits are process-wide across all active boards,
+not separate allowances per board. Board scan priority rotates on each tick so
+a busy earlier board cannot permanently monopolize newly available capacity.
+If another active board cannot be inspected, capped dispatch fails closed for
+that tick rather than guessing that the unseen board has no running workers.
+Capacity-deferred tasks remain `ready`; no failure or blocked event is added.
+
+Only worker dispatch moves to the standalone daemon. The gateway remains the
+notification owner and continues delivering deduplicated completion, blocked,
+crash, timeout, and creator-wake events from every board while
+`dispatch_in_gateway: false` is effective.
+
 Do not run gateway-embedded and standalone dispatch simultaneously. For
 rollback, stop and verify the standalone service is inactive, set
 `dispatch_in_gateway: true`, then restart the gateway. Without either mode

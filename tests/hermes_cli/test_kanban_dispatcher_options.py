@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import ANY, MagicMock
@@ -303,6 +304,9 @@ def test_run_daemon_forwards_effective_limits_to_each_tick(monkeypatch):
         default_assignee="talos",
         failure_limit=5,
         stale_timeout_seconds=600,
+        external_running_count=0,
+        external_per_profile_running={},
+        process_capacity_known=True,
     )
     stop_event.wait.assert_called_once_with(timeout=10)
 
@@ -347,6 +351,133 @@ def test_run_daemon_dispatches_every_active_board_with_explicit_scope(monkeypatc
     assert all(conn.close.called for conn in connections.values())
 
 
+def _create_multiboard_tasks(kb, boards, *, tasks_per_board=2, assignee="alpha"):
+    for slug in boards:
+        kb.create_board(slug=slug, name=slug.title())
+        with kb.connect_closing(board=slug) as conn:
+            for index in range(tasks_per_board):
+                kb.create_task(conn, title=f"{slug}-{index}", assignee=assignee)
+
+
+def _running_tasks_across_boards(kb, boards):
+    running = []
+    for slug in boards:
+        with kb.connect_closing(board=slug) as conn:
+            running.extend(
+                (slug, row["id"], row["assignee"])
+                for row in conn.execute(
+                    "SELECT id, assignee FROM tasks WHERE status = 'running'"
+                ).fetchall()
+            )
+    return running
+
+
+def test_run_daemon_enforces_global_capacity_across_active_boards(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    boards = ("default", "secondary")
+    _create_multiboard_tasks(kb, boards)
+    monkeypatch.setattr(kb, "_default_spawn", lambda *_args, **_kwargs: 12345)
+    stop_event = MagicMock()
+    stop_event.is_set.side_effect = [False, True]
+
+    kb.run_daemon(
+        interval=0,
+        max_spawn=2,
+        max_in_progress=2,
+        max_in_progress_per_profile=2,
+        stop_event=stop_event,
+    )
+
+    running = _running_tasks_across_boards(kb, boards)
+    assert len(running) == 2
+    assert {assignee for _, _, assignee in running} == {"alpha"}
+    for slug in boards:
+        with kb.connect_closing(board=slug) as conn:
+            deferred = conn.execute(
+                "SELECT id FROM tasks WHERE status = 'ready'"
+            ).fetchall()
+            for row in deferred:
+                assert not any(
+                    event.kind in {"failed", "blocked", "spawn_failed"}
+                    for event in kb.list_events(conn, row["id"])
+                )
+
+
+def test_run_daemon_rotates_board_priority_when_capacity_reopens(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    boards = ("default", "secondary")
+    _create_multiboard_tasks(kb, boards)
+    spawned_boards = []
+
+    def fake_spawn(_task, _workspace, *, board=None):
+        spawned_boards.append(board)
+        return 12345
+
+    monkeypatch.setattr(kb, "_default_spawn", fake_spawn)
+    stop_event = threading.Event()
+    callbacks = 0
+
+    def on_tick(_result):
+        nonlocal callbacks
+        callbacks += 1
+        if callbacks == len(boards):
+            for slug, task_id, _assignee in _running_tasks_across_boards(kb, boards):
+                with kb.connect_closing(board=slug) as conn:
+                    with kb.write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET status = 'done', claim_lock = NULL "
+                            "WHERE id = ?",
+                            (task_id,),
+                        )
+        if callbacks == len(boards) * 2:
+            stop_event.set()
+
+    kb.run_daemon(
+        interval=0.001,
+        max_spawn=1,
+        max_in_progress=1,
+        max_in_progress_per_profile=1,
+        stop_event=stop_event,
+        on_tick=on_tick,
+    )
+
+    assert spawned_boards == ["default", "secondary"]
+
+
+def test_run_daemon_enforces_per_profile_capacity_across_active_boards(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    boards = ("default", "secondary")
+    _create_multiboard_tasks(kb, boards)
+    monkeypatch.setattr(kb, "_default_spawn", lambda *_args, **_kwargs: 12345)
+    stop_event = MagicMock()
+    stop_event.is_set.side_effect = [False, True]
+
+    kb.run_daemon(
+        interval=0,
+        max_spawn=4,
+        max_in_progress=4,
+        max_in_progress_per_profile=2,
+        stop_event=stop_event,
+    )
+
+    assert len(_running_tasks_across_boards(kb, boards)) == 2
+
+
 def test_run_daemon_isolates_board_failure_and_dispatches_later_boards(monkeypatch):
     from hermes_cli import kanban_db
 
@@ -382,6 +513,9 @@ def test_run_daemon_isolates_board_failure_and_dispatches_later_boards(monkeypat
         default_assignee=None,
         failure_limit=2,
         stale_timeout_seconds=0,
+        external_running_count=0,
+        external_per_profile_running={},
+        process_capacity_known=False,
     )
 
 

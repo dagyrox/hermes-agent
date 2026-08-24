@@ -93,30 +93,11 @@ class GatewayKanbanWatchersMixin:
         cross boards, so delivery semantics are unchanged — this is
         purely a fan-out of the single-DB poll.
         """
-        # Gate: only the dispatch-owning gateway opens kanban DBs for notifier polling.
-        # Non-dispatch gateways have no subscriptions to deliver — all kanban state lives
-        # in the dispatch owner's per-board DBs. This prevents N-gateway -shm contention.
-        # TODO: gate per-board when per-board dispatcher_owner tracking lands.
-        try:
-            from hermes_cli.config import load_config as _load_config
-        except Exception:
-            logger.warning("kanban notifier: config loader unavailable; disabled")
-            return
-        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
-            return
-        try:
-            cfg = _load_config()
-        except Exception as exc:
-            logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
-            return
-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
-            logger.info(
-                "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
-            )
-            return
+        # Notification ownership is independent from dispatch ownership. A
+        # gateway must keep polling durable subscriptions when an externally
+        # supervised daemon owns worker spawning; otherwise completions,
+        # failures, and creator wakes silently stop in the supported standalone
+        # topology. Cursor claims remain the cross-gateway deduplication guard.
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -964,7 +945,13 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _tick_once_for_board(
+            slug: str,
+            *,
+            external_running_count: int,
+            external_per_profile_running: dict[str, int],
+            process_capacity_known: bool,
+        ) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -1014,6 +1001,9 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=options.stale_timeout_seconds,
                     default_assignee=options.default_assignee,
                     max_in_progress_per_profile=options.max_in_progress_per_profile,
+                    external_running_count=external_running_count,
+                    external_per_profile_running=external_per_profile_running,
+                    process_capacity_known=process_capacity_known,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1052,6 +1042,8 @@ class GatewayKanbanWatchersMixin:
                     except Exception:
                         pass
 
+        board_start_index = 0
+
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per board. Returns (slug, result) pairs.
 
@@ -1063,10 +1055,24 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            nonlocal board_start_index
+            board_slugs, board_start_index = _kb._fair_board_order(
+                boards, board_start_index,
+            )
             out: list[tuple[str, "Optional[object]"]] = []
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
+            for slug in board_slugs:
+                external_total, external_profiles, capacity_known = (
+                    _kb._running_capacity_outside_boards(board_slugs, slug)
+                )
+                out.append((
+                    slug,
+                    _tick_once_for_board(
+                        slug,
+                        external_running_count=external_total,
+                        external_per_profile_running=external_profiles,
+                        process_capacity_known=capacity_known,
+                    ),
+                ))
             return out
 
         def _ready_nonempty() -> bool:

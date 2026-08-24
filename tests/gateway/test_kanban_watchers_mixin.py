@@ -7,7 +7,9 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+from unittest.mock import MagicMock, patch
 
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
@@ -67,3 +69,59 @@ def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     h3, st3 = _acquire_singleton_lock(lock)
     assert st3 == "held" and h3 is not None
     _release_singleton_lock(h3)
+
+
+def test_embedded_dispatcher_enforces_global_capacity_across_boards(
+    monkeypatch, tmp_path,
+):
+    from gateway.run import GatewayRunner
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    for slug in ("default", "secondary"):
+        kb.create_board(slug=slug, name=slug.title())
+        with kb.connect_closing(board=slug) as conn:
+            for index in range(2):
+                kb.create_task(conn, title=f"{slug}-{index}", assignee="alpha")
+    monkeypatch.setattr(kb, "_default_spawn", lambda *_args, **_kwargs: 12345)
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    sleeps = 0
+
+    async def fake_sleep(_delay):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps >= 2:
+            runner._running = False
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    config = {
+        "kanban": {
+            "dispatch_in_gateway": True,
+            "dispatch_interval_seconds": 1,
+            "max_spawn": 2,
+            "max_in_progress": 2,
+            "max_in_progress_per_profile": 2,
+            "auto_decompose": False,
+        }
+    }
+    with patch("hermes_cli.config.load_config", return_value=config):
+        with patch(
+            "gateway.kanban_watchers._acquire_singleton_lock",
+            return_value=(MagicMock(), "held"),
+        ):
+            with patch("asyncio.sleep", side_effect=fake_sleep):
+                with patch("asyncio.to_thread", side_effect=fake_to_thread):
+                    asyncio.run(runner._kanban_dispatcher_watcher())
+
+    running = 0
+    for slug in ("default", "secondary"):
+        with kb.connect_closing(board=slug) as conn:
+            running += conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            ).fetchone()[0]
+    assert running == 2

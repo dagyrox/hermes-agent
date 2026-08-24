@@ -1,8 +1,7 @@
-"""Tests for the dispatch_in_gateway gate on _kanban_notifier_watcher.
+"""Tests that notifier ownership is independent from dispatcher ownership.
 
-- Non-dispatch gateways (dispatch_in_gateway=false) exit before opening any DB.
-- HERMES_KANBAN_DISPATCH_IN_GATEWAY env var disables without loading config.
-- Dispatch-owning gateways (dispatch_in_gateway=true) proceed past the gate.
+- Gateways continue polling subscriptions when standalone dispatch is selected.
+- Effective env overrides only disable embedded dispatch, not notifications.
 """
 
 import asyncio
@@ -24,36 +23,11 @@ def _fake_config(dispatch_in_gateway):
     return {"kanban": {"dispatch_in_gateway": dispatch_in_gateway}}
 
 
-def test_notifier_watcher_skips_when_dispatch_disabled():
-    """dispatch_in_gateway=false returns before opening any board DB."""
-    runner = _make_runner()
-    with patch("hermes_cli.config.load_config", return_value=_fake_config(False)):
-        with patch("hermes_cli.kanban_db.connect") as mock_connect:
-            asyncio.run(runner._kanban_notifier_watcher())
-    mock_connect.assert_not_called()
-
-
-def test_notifier_watcher_env_override_disables(monkeypatch):
-    """HERMES_KANBAN_DISPATCH_IN_GATEWAY=false skips config load entirely."""
-    runner = _make_runner()
-    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "false")
-    with patch("hermes_cli.config.load_config") as mock_load_config:
-        with patch("hermes_cli.kanban_db.connect") as mock_connect:
-            asyncio.run(runner._kanban_notifier_watcher())
-    mock_load_config.assert_not_called()
-    mock_connect.assert_not_called()
-
-
-def test_notifier_watcher_runs_when_dispatch_enabled():
-    """dispatch_in_gateway=true proceeds past the gate to the board fan-out."""
-    runner = _make_runner(with_adapter=True)
-    past_gate = []
+def _run_one_notifier_tick(runner, past_gate):
     sleep_calls = []
 
     async def fake_sleep(delay):
         sleep_calls.append(delay)
-        # Stop after the initial delay + first per-interval sleep so the loop
-        # body runs exactly once.
         if len(sleep_calls) >= 2:
             runner._running = False
 
@@ -62,13 +36,37 @@ def test_notifier_watcher_runs_when_dispatch_enabled():
 
     import hermes_cli.kanban_db as _kb
 
+    with patch.object(
+        _kb, "list_boards",
+        side_effect=lambda *a, **kw: past_gate.append(True) or [],
+    ):
+        with patch("asyncio.sleep", side_effect=fake_sleep):
+            with patch("asyncio.to_thread", side_effect=fake_to_thread):
+                asyncio.run(runner._kanban_notifier_watcher())
+
+
+def test_notifier_watcher_runs_when_standalone_dispatch_is_configured():
+    runner = _make_runner(with_adapter=True)
+    past_gate = []
+    with patch("hermes_cli.config.load_config", return_value=_fake_config(False)):
+        _run_one_notifier_tick(runner, past_gate)
+    assert past_gate
+
+
+def test_notifier_watcher_runs_when_env_selects_standalone_dispatch(monkeypatch):
+    runner = _make_runner(with_adapter=True)
+    past_gate = []
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "false")
     with patch("hermes_cli.config.load_config", return_value=_fake_config(True)):
-        with patch.object(
-            _kb, "list_boards",
-            side_effect=lambda *a, **kw: past_gate.append(True) or [],
-        ):
-            with patch("asyncio.sleep", side_effect=fake_sleep):
-                with patch("asyncio.to_thread", side_effect=fake_to_thread):
-                    asyncio.run(runner._kanban_notifier_watcher())
+        _run_one_notifier_tick(runner, past_gate)
+    assert past_gate
+
+
+def test_notifier_watcher_runs_when_dispatch_enabled():
+    """dispatch_in_gateway=true proceeds past the gate to the board fan-out."""
+    runner = _make_runner(with_adapter=True)
+    past_gate = []
+    with patch("hermes_cli.config.load_config", return_value=_fake_config(True)):
+        _run_one_notifier_tick(runner, past_gate)
 
     assert past_gate, "list_boards should be called when dispatch_in_gateway=true"

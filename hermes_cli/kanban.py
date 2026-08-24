@@ -135,20 +135,12 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
 
 
 def _check_dispatcher_presence() -> tuple[bool, str]:
-    """Return ``(running, message)``.
+    """Report effective dispatcher mode and singleton-lock presence.
 
-    - ``running=True``: a gateway is alive for this HERMES_HOME and its
-      config has ``kanban.dispatch_in_gateway`` on (default). Message
-      is a short status line.
-    - ``running=False``: either no gateway is running, or the gateway
-      is running but the config flag is off. Message is human guidance
-      explaining the next step.
-
-    Used by ``hermes kanban create`` (and callers) to warn when a task
-    will sit in ``ready`` because nothing is there to pick it up.
-    Defensive against import failures and config-read errors — if the
-    probe itself errors, we return ``(True, "")`` so we don't spam
-    false warnings (better to miss a warning than to cry wolf).
+    The gateway PID alone is insufficient once standalone dispatch is a
+    supported topology. Resolve the same config/env contract used at startup,
+    then non-destructively probe the machine-global singleton lock. A lock we
+    can acquire is released immediately and means no dispatcher owns it.
     """
     try:
         from gateway.status import get_running_pid  # type: ignore
@@ -159,29 +151,71 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     except Exception:
         return (True, "")  # probe errored — silent
 
-    # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
         from hermes_cli.config import load_config
-        cfg = load_config()
-        dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", True))
-    except Exception:
-        dispatch_on = True  # can't tell — assume default
-
-    if pid and dispatch_on:
-        return (True, f"gateway pid={pid}, dispatch enabled")
-    if pid and not dispatch_on:
-        return (
-            False,
-            "Gateway is running but kanban.dispatch_in_gateway=false in "
-            "config.yaml — the embedded dispatcher is disabled. Start the "
-            "separately supervised dispatcher with `hermes kanban daemon`."
+        from hermes_cli.kanban_dispatcher import (
+            acquire_dispatcher_lock,
+            release_dispatcher_lock,
+            resolve_dispatcher_options,
         )
-    if not dispatch_on:
+
+        options = resolve_dispatcher_options(load_config())
+    except Exception:
         return (
             False,
-            "No dispatcher is running and kanban.dispatch_in_gateway=false "
-            "in config.yaml. Start the separately supervised dispatcher with:\n"
+            "Dispatcher state is indeterminate: effective configuration "
+            "could not be resolved. Check `hermes doctor` and gateway logs.",
+        )
+
+    try:
+        lock_handle, lock_state = acquire_dispatcher_lock()
+    except Exception:
+        lock_handle, lock_state = None, "unavailable"
+    if lock_state == "held":
+        release_dispatcher_lock(lock_handle)
+
+    if lock_state == "unavailable":
+        return (
+            False,
+            "Dispatcher state is indeterminate because the singleton lock "
+            "could not be probed. Duplicate-dispatch protection cannot be "
+            "verified; check filesystem permissions and process supervision.",
+        )
+
+    dispatcher_present = lock_state == "contended"
+    if not options.dispatch_in_gateway:
+        if dispatcher_present:
+            gateway_note = f"; gateway pid={pid} is notifier-only" if pid else ""
+            return (
+                True,
+                "standalone dispatcher is healthy (singleton lock held"
+                f"{gateway_note})",
+            )
+        gateway_note = "Gateway is running, but " if pid else ""
+        return (
+            False,
+            f"{gateway_note}No dispatcher is running and effective "
+            "kanban.dispatch_in_gateway=false. Start the separately supervised "
+            "dispatcher with:\n"
             "    hermes kanban daemon"
+        )
+
+    if pid and dispatcher_present:
+        return (True, f"embedded dispatcher is healthy (gateway pid={pid})")
+    if dispatcher_present and not pid:
+        return (
+            False,
+            "Dispatcher state is indeterminate: the singleton dispatcher lock "
+            "is held but effective config selects embedded gateway dispatch and "
+            "no gateway PID is healthy. Check for an orphan or forced standalone "
+            "daemon before starting another dispatcher.",
+        )
+    if pid and not dispatcher_present:
+        return (
+            False,
+            f"Dispatcher state is indeterminate: gateway pid={pid} is running "
+            "with embedded dispatch enabled, but no process holds the dispatcher "
+            "lock. The watcher may still be starting or may have failed.",
         )
     return (
         False,

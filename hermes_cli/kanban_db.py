@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -7981,6 +7981,9 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    external_running_count: int = 0,
+    external_per_profile_running: Optional[Mapping[str, int]] = None,
+    process_capacity_known: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8015,6 +8018,9 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            external_running_count=external_running_count,
+            external_per_profile_running=external_per_profile_running,
+            process_capacity_known=process_capacity_known,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8031,6 +8037,9 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            external_running_count=external_running_count,
+            external_per_profile_running=external_per_profile_running,
+            process_capacity_known=process_capacity_known,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -8051,6 +8060,9 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    external_running_count: int = 0,
+    external_per_profile_running: Optional[Mapping[str, int]] = None,
+    process_capacity_known: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8126,11 +8138,12 @@ def _dispatch_once_locked(
     max_in_progress = _normalize_cap(max_in_progress)
     global_caps = [cap for cap in (max_spawn, max_in_progress) if cap is not None]
     worker_cap = min(global_caps) if global_caps else None
-    running_count = int(
+    local_running_count = int(
         conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
     )
+    running_count = local_running_count + max(0, int(external_running_count or 0))
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
@@ -8147,14 +8160,20 @@ def _dispatch_once_locked(
     # skipped_unassigned — the operator-actionable signal is different:
     # "this profile is busy, try again later" not "this needs routing").
     _per_profile_cap = _normalize_cap(max_in_progress_per_profile)
-    _per_profile_running: dict[str, int] = {}
+    _per_profile_running: dict[str, int] = {
+        str(profile): max(0, int(count))
+        for profile, count in (external_per_profile_running or {}).items()
+    }
     if _per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+            profile = prow["assignee"]
+            _per_profile_running[profile] = (
+                _per_profile_running.get(profile, 0) + int(prow["n"])
+            )
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -8171,6 +8190,15 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # If another active board could not be inspected, process-wide capacity is
+    # unknown. Reconciliation above is still safe and useful, but spawning under
+    # a configured cap would risk exceeding it. Defer without mutating task
+    # status or failure counters; the next healthy tick retries normally.
+    if not process_capacity_known and (
+        worker_cap is not None or _per_profile_cap is not None
+    ):
+        ready_rows = []
+
     for row in ready_rows:
         if worker_cap is not None and running_count + spawned >= worker_cap:
             break
@@ -8909,6 +8937,64 @@ def _default_spawn(
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
 
+def _fair_board_order(
+    boards: Iterable[Mapping[str, Any]], start_index: int,
+) -> tuple[list[str], int]:
+    """Return one round-robin board order and the next tick's start index."""
+
+    slugs = [str(board.get("slug") or DEFAULT_BOARD) for board in boards]
+    if not slugs:
+        return [], 0
+    offset = start_index % len(slugs)
+    ordered = slugs[offset:] + slugs[:offset]
+    return ordered, (offset + 1) % len(slugs)
+
+
+def _running_capacity_outside_boards(
+    board_slugs: Iterable[str], current_board: str,
+) -> tuple[int, dict[str, int], bool]:
+    """Count live workers on every distinct active DB except ``current_board``.
+
+    The singleton dispatcher is process-wide, while task state is split across
+    board databases. Callers add these external counts to the current board's
+    post-reconciliation counts so global and per-profile limits remain truly
+    process-wide. ``known=False`` is fail-closed input: a capped dispatcher must
+    defer spawns if any other active board cannot be inspected.
+    """
+
+    total = 0
+    per_profile: dict[str, int] = {}
+    known = True
+    seen_paths: set[str] = set()
+    try:
+        seen_paths.add(str(kanban_db_path(board=current_board).resolve()))
+    except Exception:
+        known = False
+
+    for slug in board_slugs:
+        if slug == current_board:
+            continue
+        try:
+            db_key = str(kanban_db_path(board=slug).resolve())
+            if db_key in seen_paths:
+                continue
+            seen_paths.add(db_key)
+            with connect_closing(board=slug) as conn:
+                rows = conn.execute(
+                    "SELECT assignee, COUNT(*) AS n FROM tasks "
+                    "WHERE status = 'running' GROUP BY assignee"
+                ).fetchall()
+            for row in rows:
+                count = int(row["n"])
+                total += count
+                assignee = row["assignee"]
+                if assignee:
+                    per_profile[assignee] = per_profile.get(assignee, 0) + count
+        except Exception:
+            known = False
+
+    return total, per_profile, known
+
 def run_daemon(
     *,
     interval: float = 60.0,
@@ -8948,15 +9034,21 @@ def run_daemon(
                 except (ValueError, OSError):
                     pass
 
+    board_start_index = 0
     while not stop_event.is_set():
         try:
             try:
                 boards = list_boards(include_archived=False)
             except Exception:
                 boards = [{"slug": get_current_board()}]
-            for board_info in boards:
-                slug = board_info.get("slug") or DEFAULT_BOARD
+            board_slugs, board_start_index = _fair_board_order(
+                boards, board_start_index,
+            )
+            for slug in board_slugs:
                 try:
+                    external_total, external_profiles, capacity_known = (
+                        _running_capacity_outside_boards(board_slugs, slug)
+                    )
                     with contextlib.closing(connect(board=slug)) as conn:
                         res = dispatch_once(
                             conn,
@@ -8967,6 +9059,9 @@ def run_daemon(
                             default_assignee=default_assignee,
                             failure_limit=failure_limit,
                             stale_timeout_seconds=stale_timeout_seconds,
+                            external_running_count=external_total,
+                            external_per_profile_running=external_profiles,
+                            process_capacity_known=capacity_known,
                         )
                     if on_tick is not None:
                         try:
