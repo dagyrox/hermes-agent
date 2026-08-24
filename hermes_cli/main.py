@@ -16436,10 +16436,15 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        # Most legacy handlers predate meaningful process statuses. The
+        # dispatcher quiescence control is an automation safety boundary, so
+        # its fail-closed status must reach the console-script wrapper.
+        if getattr(args, "kanban_action", None) == "dispatcher-quiesce":
+            return result
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

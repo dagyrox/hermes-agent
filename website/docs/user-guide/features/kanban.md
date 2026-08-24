@@ -279,6 +279,28 @@ rollback, stop and verify the standalone service is inactive, set
 `dispatch_in_gateway: true`, then restart the gateway. Without either mode
 running, `ready` tasks remain queued.
 
+For a one-time embedded-to-standalone handoff, quiesce the exact running
+gateway dispatcher **before freezing or stopping the gateway**:
+
+```bash
+hermes kanban dispatcher-quiesce --pid "$GATEWAY_MAIN_PID" --timeout 30 --json
+```
+
+The command uses a fixed local control protocol under the Kanban home; it does
+not execute user-composed shell or make provider/network calls. The embedded
+owner stops admitting new ticks, lets any tick that already crossed the tick
+boundary finish, writes an acknowledgment only after that work has drained,
+and then keeps the singleton lock while remaining quiesced until gateway
+shutdown. Repeating the command for the same owner is idempotent.
+
+Proceed only when the JSON result is exactly successful with
+`state="quiesced"` and the expected `owner_pid`/`owner_mode="embedded"`.
+`not_running`, `not_owner`, `timeout`, `indeterminate`, and `invalid_request`
+return non-zero and must stop the handoff. After acknowledgment, repeat the
+fail-closed running-work check before standalone activation. A timeout request
+is intentionally left armed: investigate or repeat the same command rather
+than assuming the old gateway resumed dispatch.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash

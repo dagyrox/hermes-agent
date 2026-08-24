@@ -137,7 +137,7 @@ def test_standalone_daemon_runs_without_force_when_embedded_dispatch_is_disabled
     monkeypatch.setattr(
         kanban_dispatcher,
         "acquire_dispatcher_lock",
-        lambda: (lock_handle, "held"),
+        lambda **_kwargs: (lock_handle, "held"),
     )
     release_lock = MagicMock()
     monkeypatch.setattr(kanban_dispatcher, "release_dispatcher_lock", release_lock)
@@ -198,7 +198,7 @@ def test_standalone_daemon_cli_overrides_do_not_drop_global_cap(monkeypatch):
     monkeypatch.setattr(
         kanban_dispatcher,
         "acquire_dispatcher_lock",
-        lambda: (MagicMock(), "held"),
+        lambda **_kwargs: (MagicMock(), "held"),
     )
     monkeypatch.setattr(kanban_dispatcher, "release_dispatcher_lock", MagicMock())
 
@@ -228,7 +228,7 @@ def test_standalone_daemon_refuses_second_safe_instance(monkeypatch, capsys):
     monkeypatch.setattr(
         kanban_dispatcher,
         "acquire_dispatcher_lock",
-        lambda: (None, "contended"),
+        lambda **_kwargs: (None, "contended"),
     )
 
     assert kanban_cli._cmd_daemon(_daemon_args()) == 2
@@ -253,7 +253,7 @@ def test_standalone_daemon_acquires_singleton_before_database_initialization(
     monkeypatch.setattr(
         kanban_dispatcher,
         "acquire_dispatcher_lock",
-        lambda: (order.append("lock") or lock_handle, "held"),
+        lambda **_kwargs: (order.append("lock") or lock_handle, "held"),
     )
     monkeypatch.setattr(
         kanban_db,

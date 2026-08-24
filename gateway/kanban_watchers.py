@@ -61,7 +61,9 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Backward-compatible wrapper around the shared dispatcher lock."""
     from hermes_cli.kanban_dispatcher import acquire_dispatcher_lock
 
-    return acquire_dispatcher_lock(lock_path=Path(lock_path))
+    return acquire_dispatcher_lock(
+        lock_path=Path(lock_path), owner_mode="embedded"
+    )
 
 
 def _release_singleton_lock(handle) -> None:
@@ -851,7 +853,11 @@ class GatewayKanbanWatchersMixin:
 
         try:
             from hermes_cli import kanban_db as _kb
-            from hermes_cli.kanban_dispatcher import resolve_dispatcher_options
+            from hermes_cli.kanban_dispatcher import (
+                DispatcherTickBoundary,
+                read_dispatcher_owner,
+                resolve_dispatcher_options,
+            )
         except Exception:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
@@ -866,6 +872,7 @@ class GatewayKanbanWatchersMixin:
         # index pages. The lock lives at the machine-global kanban root
         # (shared across profiles by design), so it serialises ALL gateways.
         self._kanban_dispatcher_lock_handle = None
+        dispatcher_boundary = None
         _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
         if _lock_state == "contended":
@@ -877,6 +884,14 @@ class GatewayKanbanWatchersMixin:
         if _lock_state == "held":
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
             logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
+            owner = read_dispatcher_owner()
+            if owner is not None:
+                dispatcher_boundary = DispatcherTickBoundary(owner)
+            else:
+                logger.warning(
+                    "kanban dispatcher: owner metadata unavailable; quiescence "
+                    "control will fail closed for this process"
+                )
         else:
             logger.warning(
                 "kanban dispatcher: advisory lock unavailable at %s; proceeding "
@@ -905,7 +920,12 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
-        await asyncio.sleep(5)
+        try:
+            await asyncio.sleep(5)
+        except BaseException:
+            _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+            self._kanban_dispatcher_lock_handle = None
+            raise
 
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
         # queue is non-empty but spawns are 0 for N consecutive ticks —
@@ -1206,79 +1226,143 @@ class GatewayKanbanWatchersMixin:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
             return successes
 
+        async def _to_thread_draining(fn, *args):
+            """Do not let cancellation orphan already-started thread work."""
+            task = asyncio.create_task(asyncio.to_thread(fn, *args))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError as cancellation:
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if task.done() and not task.cancelled():
+                    try:
+                        task.result()
+                    except Exception:
+                        logger.exception(
+                            "kanban dispatcher: in-flight work failed while draining"
+                        )
+                raise cancellation
+
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
-        while self._running:
-            try:
-                # Reap zombie children before per-board work so a board DB
-                # failure cannot block cleanup of unrelated workers.
-                pids = await asyncio.to_thread(_kb.reap_worker_zombies)
-                if pids:
-                    logger.info(
-                        "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
-                        len(pids),
-                        pids,
-                    )
-            except Exception:
-                logger.exception("kanban dispatcher: zombie reaper failed")
-
-            try:
-                # Re-read the auto-decompose toggle live each tick so a user
-                # flipping kanban.auto_decompose=false to STOP runaway fan-out
-                # takes effect on the next tick, not on gateway restart (#49638).
-                _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
-                if _ad_enabled:
-                    await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
-                results = await asyncio.to_thread(_tick_once)
-                any_spawned = False
-                for slug, res in (results or []):
-                    if res is not None and getattr(res, "spawned", None):
-                        any_spawned = True
-                        # Quiet by default — only log when something actually
-                        # happened, so an idle gateway stays silent.
+        try:
+            while self._running:
+                if dispatcher_boundary is not None:
+                    decision = dispatcher_boundary.begin_tick()
+                    if decision == "quiesced":
+                        if dispatcher_boundary.ack_error:
+                            logger.error(
+                                "kanban dispatcher: quiesced but acknowledgment "
+                                "could not be persisted: %s",
+                                dispatcher_boundary.ack_error,
+                            )
                         logger.info(
-                            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
-                            slug,
-                            len(res.spawned),
-                            res.reclaimed,
-                            len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                            len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                            res.promoted,
-                            len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                            "kanban dispatcher: quiesced; holding singleton until shutdown"
                         )
-                # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
-                    bad_ticks += 1
-                else:
-                    bad_ticks = 0
-                if bad_ticks >= HEALTH_WINDOW:
-                    now = int(time.time())
-                    if now - last_warn_at >= 300:
-                        logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned. Check "
-                            "profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
-                            bad_ticks,
+                        while self._running:
+                            await asyncio.sleep(0.1)
+                        break
+                    if decision == "defer":
+                        await asyncio.sleep(0.1)
+                        continue
+
+                quiesced_after_tick = False
+                try:
+                    try:
+                        # Reap zombie children before per-board work so a board DB
+                        # failure cannot block cleanup of unrelated workers.
+                        pids = await _to_thread_draining(_kb.reap_worker_zombies)
+                        if pids:
+                            logger.info(
+                                "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
+                                len(pids),
+                                pids,
+                            )
+                    except Exception:
+                        logger.exception("kanban dispatcher: zombie reaper failed")
+
+                    try:
+                        # Re-read the auto-decompose toggle live each tick so a user
+                        # flipping kanban.auto_decompose=false to STOP runaway fan-out
+                        # takes effect on the next tick, not on gateway restart (#49638).
+                        _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
+                        if _ad_enabled:
+                            await _to_thread_draining(
+                                _auto_decompose_tick, _ad_per_tick
+                            )
+                        results = await _to_thread_draining(_tick_once)
+                        any_spawned = False
+                        for slug, res in (results or []):
+                            if res is not None and getattr(res, "spawned", None):
+                                any_spawned = True
+                                logger.info(
+                                    "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+                                    "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                                    slug,
+                                    len(res.spawned),
+                                    res.reclaimed,
+                                    len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
+                                    len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
+                                    res.promoted,
+                                    len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                                )
+                        ready_pending = await _to_thread_draining(_ready_nonempty)
+                        if ready_pending and not any_spawned:
+                            bad_ticks += 1
+                        else:
+                            bad_ticks = 0
+                        if bad_ticks >= HEALTH_WINDOW:
+                            now = int(time.time())
+                            if now - last_warn_at >= 300:
+                                logger.warning(
+                                    "kanban dispatcher stuck: ready queue non-empty for "
+                                    "%d consecutive ticks but 0 workers spawned. Check "
+                                    "profile health (venv, PATH, credentials) and "
+                                    "`hermes kanban list --status ready`.",
+                                    bad_ticks,
+                                )
+                                last_warn_at = now
+                    except asyncio.CancelledError:
+                        logger.debug("kanban dispatcher: cancelled")
+                        raise
+                    except Exception:
+                        logger.exception("kanban dispatcher: unexpected watcher error")
+                finally:
+                    if dispatcher_boundary is not None:
+                        quiesced_after_tick = dispatcher_boundary.end_tick()
+
+                if quiesced_after_tick:
+                    if (
+                        dispatcher_boundary is not None
+                        and dispatcher_boundary.ack_error
+                    ):
+                        logger.error(
+                            "kanban dispatcher: drained and quiesced but "
+                            "acknowledgment could not be persisted: %s",
+                            dispatcher_boundary.ack_error,
                         )
-                        last_warn_at = now
-            except asyncio.CancelledError:
-                logger.debug("kanban dispatcher: cancelled")
-                _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-                self._kanban_dispatcher_lock_handle = None
-                raise
-            except Exception:
-                logger.exception("kanban dispatcher: unexpected watcher error")
+                    logger.info(
+                        "kanban dispatcher: quiesced after draining active tick; "
+                        "holding singleton until shutdown"
+                    )
+                    while self._running:
+                        await asyncio.sleep(0.1)
+                    break
 
-            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
-            # waits up to `interval` seconds for the current sleep to finish.
-            slept = 0.0
-            while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
-                slept += 1.0
-
-        _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-        self._kanban_dispatcher_lock_handle = None
+                # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
+                # waits up to `interval` seconds for the current sleep to finish.
+                slept = 0.0
+                while slept < interval and self._running:
+                    await asyncio.sleep(min(1.0, interval - slept))
+                    slept += 1.0
+        finally:
+            if dispatcher_boundary is not None:
+                dispatcher_boundary.end_tick()
+            _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+            self._kanban_dispatcher_lock_handle = None
