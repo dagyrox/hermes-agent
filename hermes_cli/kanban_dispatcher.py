@@ -96,13 +96,17 @@ def _valid_id(value: Any) -> bool:
 
 
 def _valid_positive_pid(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    return type(value) is int and value > 0
+
+
+def _valid_control_protocol(value: Any) -> bool:
+    return type(value) is int and value == _CONTROL_PROTOCOL
 
 
 def _valid_owner(value: Optional[Mapping[str, Any]]) -> bool:
     return bool(
         value
-        and value.get("protocol") == _CONTROL_PROTOCOL
+        and _valid_control_protocol(value.get("protocol"))
         and _valid_id(value.get("owner_id"))
         and _valid_positive_pid(value.get("pid"))
         and value.get("mode") in _OWNER_MODES
@@ -112,8 +116,7 @@ def _valid_owner(value: Optional[Mapping[str, Any]]) -> bool:
 def _valid_quiesce_request(value: Mapping[str, Any]) -> bool:
     return bool(
         value
-        and type(value.get("protocol")) is int
-        and value["protocol"] == _CONTROL_PROTOCOL
+        and _valid_control_protocol(value.get("protocol"))
         and _valid_id(value.get("request_id"))
         and _valid_id(value.get("owner_id"))
         and _valid_positive_pid(value.get("owner_pid"))
@@ -142,8 +145,7 @@ def _valid_quiesce_ack(
 ) -> bool:
     return bool(
         value
-        and type(value.get("protocol")) is int
-        and value["protocol"] == _CONTROL_PROTOCOL
+        and _valid_control_protocol(value.get("protocol"))
         and _valid_id(value.get("request_id"))
         and (request_id is None or value["request_id"] == request_id)
         and value.get("owner_id") == owner["owner_id"]
@@ -330,11 +332,7 @@ def request_dispatcher_quiescence(
     poll_interval: float = 0.1,
 ) -> dict[str, Any]:
     """Request one embedded owner to drain and acknowledge quiescence."""
-    if (
-        isinstance(expected_pid, bool)
-        or not isinstance(expected_pid, int)
-        or expected_pid < 1
-    ):
+    if not _valid_positive_pid(expected_pid):
         return {"ok": False, "state": "invalid_request"}
     if not isinstance(timeout_seconds, (int, float)) or isinstance(
         timeout_seconds, bool

@@ -326,6 +326,146 @@ def test_quiesce_never_signals_the_expected_process(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("field", "value", "remove"),
+    [
+        ("protocol", True, False),
+        ("protocol", False, False),
+        ("protocol", 1.0, False),
+        ("protocol", "1", False),
+        ("protocol", 999, False),
+        ("protocol", None, True),
+        ("pid", True, False),
+        ("pid", False, False),
+        ("pid", 1.0, False),
+    ],
+)
+def test_owner_records_require_exact_protocol_and_pid_integer_types(
+    monkeypatch, tmp_path, field, value, remove,
+):
+    import uuid
+
+    import hermes_cli.kanban_dispatcher as dispatcher
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    owner = {
+        "protocol": 1,
+        "owner_id": uuid.uuid4().hex,
+        "pid": os.getpid(),
+        "mode": "embedded",
+    }
+    if remove:
+        owner.pop(field)
+    else:
+        owner[field] = value
+    dispatcher._atomic_write_control(
+        dispatcher._dispatcher_control_path(".dispatcher.owner.json"), owner
+    )
+
+    assert dispatcher._valid_owner(owner) is False
+    assert dispatcher.read_dispatcher_owner() is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("protocol", True),
+        ("protocol", False),
+        ("protocol", 1.0),
+        ("pid", True),
+        ("pid", False),
+        ("pid", 1.0),
+    ],
+)
+def test_requester_fails_closed_without_writes_for_malformed_owner(
+    monkeypatch, tmp_path, field, value,
+):
+    import hermes_cli.kanban_dispatcher as dispatcher
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    handle, state = dispatcher.acquire_dispatcher_lock(owner_mode="embedded")
+    assert state == "held"
+    try:
+        owner_path = dispatcher._dispatcher_control_path(".dispatcher.owner.json")
+        owner = json.loads(owner_path.read_text())
+        owner[field] = value
+        dispatcher._atomic_write_control(owner_path, owner)
+
+        assert dispatcher.request_dispatcher_quiescence(
+            expected_pid=os.getpid(), timeout_seconds=0.02, poll_interval=0.01
+        ) == {"ok": False, "state": "indeterminate"}
+        assert not dispatcher._dispatcher_control_path(
+            ".dispatcher.quiesce.request.json"
+        ).exists()
+        assert not dispatcher._dispatcher_control_path(
+            ".dispatcher.quiesce.ack.json"
+        ).exists()
+    finally:
+        dispatcher.release_dispatcher_lock(handle)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("protocol", True),
+        ("protocol", False),
+        ("protocol", 1.0),
+        ("owner_pid", True),
+        ("owner_pid", False),
+        ("owner_pid", 1.0),
+    ],
+)
+def test_quiesce_request_rejects_non_exact_integer_fields(field, value):
+    import uuid
+
+    import hermes_cli.kanban_dispatcher as dispatcher
+
+    request = {
+        "protocol": 1,
+        "request_id": uuid.uuid4().hex,
+        "owner_id": uuid.uuid4().hex,
+        "owner_pid": os.getpid(),
+    }
+    request[field] = value
+
+    assert dispatcher._valid_quiesce_request(request) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("protocol", True),
+        ("protocol", False),
+        ("protocol", 1.0),
+        ("owner_pid", True),
+        ("owner_pid", False),
+        ("owner_pid", 1.0),
+    ],
+)
+def test_quiesce_ack_rejects_non_exact_integer_fields(field, value):
+    import uuid
+
+    import hermes_cli.kanban_dispatcher as dispatcher
+
+    owner = {
+        "protocol": 1,
+        "owner_id": uuid.uuid4().hex,
+        "pid": os.getpid(),
+        "mode": "embedded",
+    }
+    ack = {
+        "protocol": 1,
+        "request_id": uuid.uuid4().hex,
+        "owner_id": owner["owner_id"],
+        "owner_pid": owner["pid"],
+        "owner_mode": "embedded",
+        "state": "quiesced",
+    }
+    ack[field] = value
+
+    assert dispatcher._valid_quiesce_ack(ack, owner) is False
+
+
+@pytest.mark.parametrize(
     "request_case",
     ["empty_object", "current_owner_missing_pid", "current_owner_contradictory_pid"],
 )
