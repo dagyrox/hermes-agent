@@ -325,6 +325,80 @@ def test_quiesce_never_signals_the_expected_process(monkeypatch, tmp_path):
         release_dispatcher_lock(handle)
 
 
+@pytest.mark.parametrize(
+    "request_case",
+    ["empty_object", "current_owner_missing_pid", "current_owner_contradictory_pid"],
+)
+def test_quiesce_does_not_overwrite_unclassifiable_existing_request(
+    monkeypatch, tmp_path, request_case,
+):
+    import uuid
+
+    import hermes_cli.kanban_dispatcher as dispatcher
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    handle, state = dispatcher.acquire_dispatcher_lock(owner_mode="embedded")
+    assert state == "held"
+    try:
+        owner = dispatcher.read_dispatcher_owner()
+        assert owner is not None
+        request = {
+            "protocol": 1,
+            "request_id": uuid.uuid4().hex,
+            "owner_id": owner["owner_id"],
+            "owner_pid": owner["pid"],
+        }
+        if request_case == "empty_object":
+            request = {}
+        elif request_case == "current_owner_missing_pid":
+            request.pop("owner_pid")
+        elif request_case == "current_owner_contradictory_pid":
+            request["owner_pid"] = owner["pid"] + 1
+        request_path = dispatcher._dispatcher_control_path(
+            ".dispatcher.quiesce.request.json"
+        )
+        dispatcher._atomic_write_control(request_path, request)
+
+        assert dispatcher.request_dispatcher_quiescence(
+            expected_pid=owner["pid"], timeout_seconds=0.02, poll_interval=0.01
+        ) == {"ok": False, "state": "indeterminate"}
+        assert json.loads(request_path.read_text()) == request
+    finally:
+        dispatcher.release_dispatcher_lock(handle)
+
+
+def test_quiesce_rejects_boolean_protocol_ack(monkeypatch, tmp_path):
+    import uuid
+
+    import hermes_cli.kanban_dispatcher as dispatcher
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    handle, state = dispatcher.acquire_dispatcher_lock(owner_mode="embedded")
+    assert state == "held"
+    try:
+        owner = dispatcher.read_dispatcher_owner()
+        assert owner is not None
+        dispatcher._atomic_write_control(
+            dispatcher._dispatcher_control_path(".dispatcher.quiesce.ack.json"),
+            {
+                "protocol": True,
+                "request_id": uuid.uuid4().hex,
+                "owner_id": owner["owner_id"],
+                "owner_pid": owner["pid"],
+                "owner_mode": "embedded",
+                "state": "quiesced",
+            },
+        )
+
+        result = dispatcher.request_dispatcher_quiescence(
+            expected_pid=owner["pid"], timeout_seconds=0.02, poll_interval=0.01
+        )
+        assert result["ok"] is False
+        assert result["state"] == "timeout"
+    finally:
+        dispatcher.release_dispatcher_lock(handle)
+
+
 def test_stale_ack_cannot_succeed_across_owner_turnover(monkeypatch, tmp_path):
     import uuid
 
@@ -389,7 +463,74 @@ def test_ack_write_failure_keeps_dispatcher_quiesced(monkeypatch, tmp_path):
         dispatcher.release_dispatcher_lock(handle)
 
 
-def test_malformed_request_for_current_owner_fails_closed(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "request_case",
+    [
+        "empty_object",
+        "current_owner_missing_pid",
+        "current_owner_contradictory_pid",
+        "boolean_protocol",
+        "non_string_request_id",
+        "non_string_owner_id",
+        "boolean_owner_pid",
+        "invalid_current_protocol",
+    ],
+)
+def test_malformed_or_unclassifiable_request_fails_closed(
+    monkeypatch, tmp_path, request_case,
+):
+    import uuid
+
+    import hermes_cli.kanban_dispatcher as dispatcher
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    handle, state = dispatcher.acquire_dispatcher_lock(owner_mode="embedded")
+    assert state == "held"
+    try:
+        owner = dispatcher.read_dispatcher_owner()
+        assert owner is not None
+        request = {
+            "protocol": 1,
+            "request_id": uuid.uuid4().hex,
+            "owner_id": owner["owner_id"],
+            "owner_pid": owner["pid"],
+        }
+        if request_case == "empty_object":
+            request = {}
+        elif request_case == "current_owner_missing_pid":
+            request.pop("owner_pid")
+        elif request_case == "current_owner_contradictory_pid":
+            request["owner_pid"] = owner["pid"] + 1
+        elif request_case == "boolean_protocol":
+            request["protocol"] = True
+        elif request_case == "non_string_request_id":
+            request["request_id"] = 1
+        elif request_case == "non_string_owner_id":
+            request["owner_id"] = 1
+        elif request_case == "boolean_owner_pid":
+            request["owner_pid"] = True
+        elif request_case == "invalid_current_protocol":
+            request["protocol"] = 999
+        dispatcher._atomic_write_control(
+            tmp_path
+            / "kanban"
+            / ".dispatcher-control"
+            / ".dispatcher.quiesce.request.json",
+            request,
+        )
+        boundary = dispatcher.DispatcherTickBoundary(owner)
+        assert boundary.begin_tick() == "quiesced"
+        assert not (
+            tmp_path
+            / "kanban"
+            / ".dispatcher-control"
+            / ".dispatcher.quiesce.ack.json"
+        ).exists()
+    finally:
+        dispatcher.release_dispatcher_lock(handle)
+
+
+def test_complete_valid_different_generation_request_is_ignored(monkeypatch, tmp_path):
     import uuid
 
     import hermes_cli.kanban_dispatcher as dispatcher
@@ -406,14 +547,15 @@ def test_malformed_request_for_current_owner_fails_closed(monkeypatch, tmp_path)
             / ".dispatcher-control"
             / ".dispatcher.quiesce.request.json",
             {
-                "protocol": 999,
+                "protocol": 1,
                 "request_id": uuid.uuid4().hex,
-                "owner_id": owner["owner_id"],
+                "owner_id": uuid.uuid4().hex,
                 "owner_pid": owner["pid"],
             },
         )
         boundary = dispatcher.DispatcherTickBoundary(owner)
-        assert boundary.begin_tick() == "quiesced"
+        assert boundary.begin_tick() == "dispatch"
+        assert boundary.end_tick() is False
     finally:
         dispatcher.release_dispatcher_lock(handle)
 

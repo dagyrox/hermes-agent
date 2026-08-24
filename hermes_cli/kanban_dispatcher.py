@@ -95,14 +95,62 @@ def _valid_id(value: Any) -> bool:
         return False
 
 
+def _valid_positive_pid(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def _valid_owner(value: Optional[Mapping[str, Any]]) -> bool:
     return bool(
         value
         and value.get("protocol") == _CONTROL_PROTOCOL
         and _valid_id(value.get("owner_id"))
-        and isinstance(value.get("pid"), int)
-        and value["pid"] > 0
+        and _valid_positive_pid(value.get("pid"))
         and value.get("mode") in _OWNER_MODES
+    )
+
+
+def _valid_quiesce_request(value: Mapping[str, Any]) -> bool:
+    return bool(
+        value
+        and type(value.get("protocol")) is int
+        and value["protocol"] == _CONTROL_PROTOCOL
+        and _valid_id(value.get("request_id"))
+        and _valid_id(value.get("owner_id"))
+        and _valid_positive_pid(value.get("owner_pid"))
+    )
+
+
+def _quiesce_request_state(
+    value: Optional[Mapping[str, Any]], owner: Mapping[str, Any]
+) -> str:
+    if value is None:
+        return "none"
+    if value.get("_invalid") or not _valid_quiesce_request(value):
+        return "invalid"
+    if value["owner_id"] != owner["owner_id"]:
+        return "other"
+    if value["owner_pid"] != owner["pid"]:
+        return "invalid"
+    return "targeted"
+
+
+def _valid_quiesce_ack(
+    value: Optional[Mapping[str, Any]],
+    owner: Mapping[str, Any],
+    *,
+    request_id: Optional[str] = None,
+) -> bool:
+    return bool(
+        value
+        and type(value.get("protocol")) is int
+        and value["protocol"] == _CONTROL_PROTOCOL
+        and _valid_id(value.get("request_id"))
+        and (request_id is None or value["request_id"] == request_id)
+        and value.get("owner_id") == owner["owner_id"]
+        and _valid_positive_pid(value.get("owner_pid"))
+        and value["owner_pid"] == owner["pid"]
+        and value.get("owner_mode") == "embedded"
+        and value.get("state") == "quiesced"
     )
 
 
@@ -194,24 +242,8 @@ class DispatcherTickBoundary:
         request = _read_control(
             _dispatcher_control_path(".dispatcher.quiesce.request.json")
         )
-        if request is None:
-            return "none", None
-        if request.get("_invalid"):
-            return "invalid", None
-        targets_owner = bool(
-            request.get("owner_id") == self.owner["owner_id"]
-            and request.get("owner_pid") == self.owner["pid"]
-        )
-        valid = bool(
-            targets_owner
-            and request.get("protocol") == _CONTROL_PROTOCOL
-            and _valid_id(request.get("request_id"))
-        )
-        if valid:
-            return "targeted", request
-        if targets_owner:
-            return "invalid", None
-        return "other", request
+        state = _quiesce_request_state(request, self.owner)
+        return state, request if state in {"targeted", "other"} else None
 
     def _acknowledge(self, request: Mapping[str, Any]) -> bool:
         try:
@@ -333,15 +365,7 @@ def request_dispatcher_quiescence(
     ack_path = _dispatcher_control_path(".dispatcher.quiesce.ack.json")
     request_path = _dispatcher_control_path(".dispatcher.quiesce.request.json")
     existing_ack = _read_control(ack_path)
-    if (
-        existing_ack
-        and existing_ack.get("protocol") == _CONTROL_PROTOCOL
-        and _valid_id(existing_ack.get("request_id"))
-        and existing_ack.get("owner_id") == owner["owner_id"]
-        and existing_ack.get("owner_pid") == expected_pid
-        and existing_ack.get("owner_mode") == "embedded"
-        and existing_ack.get("state") == "quiesced"
-    ):
+    if _valid_quiesce_ack(existing_ack, owner):
         generation_state = _owner_generation_state(owner)
         if generation_state != "current":
             return {"ok": False, "state": generation_state}
@@ -353,18 +377,10 @@ def request_dispatcher_quiescence(
         }
 
     existing_request = _read_control(request_path)
-    if existing_request and existing_request.get("_invalid"):
+    existing_request_state = _quiesce_request_state(existing_request, owner)
+    if existing_request_state == "invalid":
         return {"ok": False, "state": "indeterminate"}
-    if (
-        existing_request
-        and existing_request.get("owner_id") == owner["owner_id"]
-        and existing_request.get("owner_pid") == expected_pid
-    ):
-        if (
-            existing_request.get("protocol") != _CONTROL_PROTOCOL
-            or not _valid_id(existing_request.get("request_id"))
-        ):
-            return {"ok": False, "state": "indeterminate"}
+    if existing_request_state == "targeted" and existing_request is not None:
         request_id = existing_request["request_id"]
     else:
         request_id = uuid.uuid4().hex
@@ -385,15 +401,7 @@ def request_dispatcher_quiescence(
     deadline = time.monotonic() + timeout_value
     while time.monotonic() < deadline:
         ack = _read_control(ack_path)
-        if (
-            ack
-            and ack.get("protocol") == _CONTROL_PROTOCOL
-            and ack.get("request_id") == request_id
-            and ack.get("owner_id") == owner["owner_id"]
-            and ack.get("owner_pid") == expected_pid
-            and ack.get("owner_mode") == "embedded"
-            and ack.get("state") == "quiesced"
-        ):
+        if _valid_quiesce_ack(ack, owner, request_id=request_id):
             generation_state = _owner_generation_state(owner)
             if generation_state != "current":
                 return {"ok": False, "state": generation_state}
