@@ -112,13 +112,31 @@ The shape every kanban worker takes today: the assignee is a profile name, the d
 
 When you create profiles for your fleet, choose names that match the *role* you want the orchestrator to route to. The orchestrator (when there is one) discovers your profile names via `hermes profile list` — there's no fixed roster the system assumes (the orchestrator side of the contract is part of the injected `KANBAN_GUIDANCE`).
 
+### Claude Code CLI profile lane (opt-in)
+
+A dispatcher can route selected existing profiles through an authenticated Claude Code CLI instead of the profile's configured Hermes model provider:
+
+```yaml
+kanban:
+  claude_code_worker:
+    binary: /absolute/path/to/claude
+    model: opus
+    max_turns: 80
+    timeout_seconds: 3600
+    read_only: true
+```
+
+Add this to the assigned profile's own `config.yaml`. This is a worker-lane selection, not a `provider:` value. The dispatcher still owns the claim, workspace, run id, timeout, worker log, crash detection, and lifecycle. The adapter passes the profile's `SOUL.md` plus workspace context files to Claude Code, starts a process-scoped Hermes MCP server exposing only the assigned task's lifecycle tools, and requires a terminal Kanban handoff. It does not fall back to the profile's direct API provider when Claude Code fails.
+
+Claude Code Kanban lanes are intentionally review-only. They receive Claude Code's `Read`, `Glob`, and `Grep` tools but no Bash, edit, write, notebook, delegation, or web mutation capability; `read_only: false` is rejected. Authentication remains Claude Code's own responsibility (for example a logged-in Claude subscription); Hermes provider API keys are not forwarded into the CLI process.
+
 ### Orchestrator profile lane
 
 A specialisation of the profile lane: an orchestrator is a Hermes profile whose toolset includes `kanban` but excludes `terminal` / `file` / `code` / `web` for implementation. Its job is decomposing a high-level goal into child tasks via `kanban_create` + `kanban_link` and stepping back. The orchestrator skill encodes the anti-temptation rules.
 
 ## Adding an external CLI worker lane
 
-Wiring a non-Hermes CLI tool (Codex CLI, Claude Code CLI, OpenCode CLI, a local coding-model runner, etc.) as a kanban worker lane is *not yet a paved path*. The dispatcher's spawn function is pluggable (`spawn_fn` is a parameter on `dispatch_once`), and a plugin could register its own `spawn_fn` for a non-Hermes assignee, but the surrounding integration work — wrapping the CLI's exit code into `kanban_complete` / `kanban_block` calls, mapping the CLI's workspace/sandbox conventions onto the dispatcher's `HERMES_KANBAN_WORKSPACE` env, handling auth and per-CLI policy — is still per-integration design work.
+Claude Code has the opt-in profile lane documented above. Wiring other non-Hermes CLI tools (Codex CLI, OpenCode CLI, a local coding-model runner, etc.) remains a per-integration design: the dispatcher's spawn function is pluggable (`spawn_fn` is a parameter on `dispatch_once`), but each integration must preserve the claim/run lifecycle, workspace boundary, auth policy, timeout/cancellation behavior, and durable terminal handoff.
 
 If you're considering adding a CLI lane, open an issue describing the specific CLI and the workflow you're trying to enable. The contract above is the constraints any such lane must satisfy; the implementation shape (one plugin per CLI vs a generic CLI-runner plugin parameterised by config) is open.
 

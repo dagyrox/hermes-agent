@@ -2666,6 +2666,52 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     return cmd
 
 
+def _claude_code_lane_options(
+    profile_arg: str, profile_home: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Return the configured external Claude Code lane for *profile_arg*.
+
+    Configuration lives in the assigned profile's own config.yaml. A malformed
+    target-profile config fails closed, while unrelated profile lanes are untouched.
+    """
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        if not profile_home:
+            return None
+        raw = (load_user_config_effective(
+            Path(profile_home) / "config.yaml", fail_closed=True).get("kanban") or {}).get(
+            "claude_code_worker")
+    except Exception as exc:
+        raise RuntimeError(
+            f"cannot resolve Claude Code worker lane for {profile_arg}: {type(exc).__name__}: {exc}"
+        ) from exc
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise RuntimeError(f"{profile_arg}: kanban.claude_code_worker must be a mapping, true, or null")
+    return dict(raw)
+
+
+def _claude_code_worker_argv(task: Task, profile_arg: str, options: Mapping[str, Any]) -> list[str]:
+    if options.get("read_only") is False:
+        raise RuntimeError(
+            f"{profile_arg}: Claude Code Kanban lanes are review-only; read_only=false is unsupported")
+    cmd = [
+        sys.executable, "-m", "hermes_cli.claude_code_worker",
+        "--profile", profile_arg,
+        "--task", task.id,
+        "--model", str(options.get("model") or "opus"),
+        "--binary", str(options.get("binary") or "claude"),
+        "--max-turns", str(int(options.get("max_turns") or 80)),
+        "--timeout-seconds", str(int(
+            options.get("timeout_seconds") or getattr(task, "max_runtime_seconds", None) or 3600)),
+    ]
+    cmd.append("--read-only")
+    return cmd
+
+
 def _open_worker_log(task: Task, board: Optional[str]):
     """Append-mode per-task log (a re-run on unblock appends, never overwrites),
     rotated first. Anchored at the board root (not the shared kanban root) so
@@ -2829,7 +2875,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    claude_code_options = _claude_code_lane_options(profile_arg, profile_home)
+    cmd = (_claude_code_worker_argv(task, profile_arg, claude_code_options)
+           if claude_code_options is not None
+           else _worker_argv(task, profile_arg, env.get("HERMES_HOME")))
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.

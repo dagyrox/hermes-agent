@@ -107,6 +107,32 @@ class TestModuleSurface:
             f"because codex has built-in equivalents: {leaked}"
         )
 
+    def test_process_scoped_tool_subset(self, monkeypatch):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        monkeypatch.setenv("HERMES_MCP_EXPOSED_TOOLS", "kanban_show,kanban_heartbeat")
+        assert m._configured_exposed_tools() == ("kanban_show", "kanban_heartbeat")
+
+    def test_process_scoped_tool_subset_rejects_unknown(self, monkeypatch):
+        import pytest
+        from agent.transports import hermes_tools_mcp_server as m
+
+        monkeypatch.setenv("HERMES_MCP_EXPOSED_TOOLS", "kanban_show,terminal")
+        with pytest.raises(RuntimeError, match="unknown Hermes MCP tools"):
+            m._configured_exposed_tools()
+
+    def test_lifecycle_mutation_is_pinned_to_assigned_task(self, monkeypatch):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        monkeypatch.setenv("HERMES_MCP_ASSIGNED_TASK", "t_owned")
+        scoped, error = m._scope_task_arguments("kanban_complete", {})
+        assert error is None
+        assert scoped["task_id"] == "t_owned"
+        _, error = m._scope_task_arguments("kanban_comment", {"task_id": "t_other"})
+        assert error == "MCP lifecycle tool is scoped to the assigned Kanban task"
+        _, error = m._scope_task_arguments("kanban_show", {"task_id": "t_other"})
+        assert error == "MCP lifecycle tool is scoped to the assigned Kanban task"
+
 
 
 

@@ -57,6 +57,33 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_create", "kanban_unblock", "kanban_link",
 )
 
+_TASK_SCOPED_TOOLS = frozenset({
+    "kanban_complete", "kanban_block", "kanban_request_review",
+    "kanban_request_changes", "kanban_comment", "kanban_heartbeat", "kanban_show",
+})
+
+
+def _configured_exposed_tools() -> tuple[str, ...]:
+    """Return the process-scoped subset requested by an external runtime."""
+    raw = os.environ.get("HERMES_MCP_EXPOSED_TOOLS", "").strip()
+    if not raw:
+        return EXPOSED_TOOLS
+    requested = tuple(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
+    unknown = set(requested) - set(EXPOSED_TOOLS)
+    if unknown:
+        raise RuntimeError(f"unknown Hermes MCP tools requested: {', '.join(sorted(unknown))}")
+    return requested
+
+
+def _scope_task_arguments(tool_name: str, kwargs: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    assigned_task = os.environ.get("HERMES_MCP_ASSIGNED_TASK", "").strip()
+    if not assigned_task or tool_name not in _TASK_SCOPED_TOOLS:
+        return kwargs, None
+    requested_task = str(kwargs.get("task_id") or assigned_task)
+    if requested_task != assigned_task:
+        return kwargs, "MCP lifecycle tool is scoped to the assigned Kanban task"
+    return {**kwargs, "task_id": assigned_task}, None
+
 
 def _build_server() -> Any:
     """Create the MCP server with Hermes tools attached (lazy imports: importable without ``mcp``)."""
@@ -92,6 +119,9 @@ def _build_server() -> Any:
 
         def _dispatch(**kwargs: Any) -> str:
             try:
+                kwargs, scope_error = _scope_task_arguments(tool_name, kwargs)
+                if scope_error:
+                    return json.dumps({"error": scope_error, "tool": tool_name})
                 # Drop None so unset optionals aren't forwarded to the handler.
                 return handle_function_call(tool_name, {k: v for k, v in kwargs.items() if v is not None})
             except Exception as exc:
@@ -104,8 +134,9 @@ def _build_server() -> Any:
         _dispatch.__annotations__ = {**annots, "return": str}
         return _dispatch
 
+    configured_tools = _configured_exposed_tools()
     exposed_count = 0
-    for name in EXPOSED_TOOLS:
+    for name in configured_tools:
         spec = all_defs.get(name)
         if spec is None:
             logger.debug("skipping %s — not registered in this Hermes process", name)
@@ -119,7 +150,7 @@ def _build_server() -> Any:
             mcp.tool(name=name, description=description)(_make_handler(name, params_schema, description))
         exposed_count += 1
 
-    logger.info("hermes-tools MCP server registered %d/%d tools", exposed_count, len(EXPOSED_TOOLS))
+    logger.info("hermes-tools MCP server registered %d/%d tools", exposed_count, len(configured_tools))
     return mcp
 
 
