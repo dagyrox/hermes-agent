@@ -88,9 +88,29 @@ def _tool_failed(result: str) -> bool:
 def _terminate_process_group(proc: subprocess.Popen[str], *, force: bool = False) -> None:
     if proc.poll() is not None:
         return
-    sig = signal.SIGKILL if force else signal.SIGTERM
+    if os.name == "nt":
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        command = ["taskkill", "/PID", str(proc.pid), "/T"]
+        if force:
+            command.append("/F")
+        try:
+            subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=TERMINATION_GRACE_SECONDS,
+                creationflags=windows_hide_flags(),
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            (proc.kill if force else proc.terminate)()
+        return
+    sig = getattr(signal, "SIGKILL", signal.SIGTERM) if force else signal.SIGTERM
     with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(proc.pid, sig)
+        os.killpg(proc.pid, sig)  # windows-footgun: ok — POSIX branch only
 
 
 def _terminate_with_grace(proc: subprocess.Popen[str]) -> None:

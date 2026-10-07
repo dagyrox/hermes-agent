@@ -169,6 +169,29 @@ def test_process_group_cancellation_escalates(monkeypatch):
     assert calls == [(1234, ccw.signal.SIGTERM), (1234, ccw.signal.SIGKILL)]
 
 
+def test_windows_process_tree_cancellation_uses_taskkill(monkeypatch):
+    calls = []
+    proc = SimpleNamespace(
+        pid=1234,
+        poll=lambda: None,
+        terminate=lambda: calls.append("terminate"),
+        kill=lambda: calls.append("kill"),
+    )
+    monkeypatch.setattr(ccw.os, "name", "nt")
+    monkeypatch.setattr(
+        ccw.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+
+    ccw._terminate_process_group(cast(Any, proc))
+    ccw._terminate_process_group(cast(Any, proc), force=True)
+
+    assert calls[0][0] == ["taskkill", "/PID", "1234", "/T"]
+    assert calls[1][0] == ["taskkill", "/PID", "1234", "/T", "/F"]
+    assert all(call[1]["check"] is False for call in calls)
+
+
 def test_tool_failure_parser_fails_closed():
     assert ccw._tool_failed('{"ok": true}') is False
     assert ccw._tool_failed('{"ok": false}') is True
