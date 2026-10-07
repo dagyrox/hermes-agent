@@ -24,11 +24,12 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         env:
-          BASE_REF: origin/${{ github.base_ref }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           # Compare with the PR's actual target branch. Fork maintenance PRs may
-          # intentionally target a staging/base branch instead of main.
-          MERGE_BASE=$(git merge-base "$BASE_REF" HEAD)
+          # intentionally target a staging/base branch instead of main. Push
+          # events have no github.base_ref, so they compare against main.
+          MERGE_BASE=$(git merge-base "origin/${BASE_REF:-main}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
