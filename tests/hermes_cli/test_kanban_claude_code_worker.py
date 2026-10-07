@@ -73,7 +73,9 @@ def test_mcp_config_grants_only_callback_scope(monkeypatch, tmp_path):
         assert server["env"]["HERMES_DELEGATED_CHILD_CONTEXT"] == ""
         assert server["env"]["HERMES_MCP_EXPOSED_TOOLS"] == ",".join(ccw.LIFECYCLE_TOOLS)
         assert server["env"]["HERMES_MCP_ASSIGNED_TASK"] == "t_probe"
-        assert server["env"]["PYTHONPATH"].endswith("hermes-claude-code-lanes-t_5479101a")
+        assert Path(server["env"]["PYTHONPATH"].split(ccw.os.pathsep)[0]).resolve() == Path(
+            ccw.__file__
+        ).resolve().parents[1]
         assert path.stat().st_mode & 0o777 == 0o600
     finally:
         path.unlink(missing_ok=True)

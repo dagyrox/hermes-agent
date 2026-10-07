@@ -59,7 +59,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 
 _TASK_SCOPED_TOOLS = frozenset({
     "kanban_complete", "kanban_block", "kanban_request_review",
-    "kanban_request_changes", "kanban_comment", "kanban_heartbeat", "kanban_show",
+    "kanban_request_changes", "kanban_comment", "kanban_heartbeat",
 })
 
 

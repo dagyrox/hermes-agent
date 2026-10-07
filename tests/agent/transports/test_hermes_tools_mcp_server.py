@@ -130,8 +130,9 @@ class TestModuleSurface:
         assert scoped["task_id"] == "t_owned"
         _, error = m._scope_task_arguments("kanban_comment", {"task_id": "t_other"})
         assert error == "MCP lifecycle tool is scoped to the assigned Kanban task"
-        _, error = m._scope_task_arguments("kanban_show", {"task_id": "t_other"})
-        assert error == "MCP lifecycle tool is scoped to the assigned Kanban task"
+        shown, error = m._scope_task_arguments("kanban_show", {"task_id": "t_other"})
+        assert error is None
+        assert shown == {"task_id": "t_other"}
 
 
 
