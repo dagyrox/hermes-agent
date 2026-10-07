@@ -5,11 +5,12 @@ Mirrors the CI gate in .github/workflows/contributor-check.yml so salvage
 branches never bounce off the check-attribution job. Run it from the branch
 you are about to push:
 
-    python3 scripts/audit_pr_attribution.py            # report only
-    python3 scripts/audit_pr_attribution.py --fix      # create mapping files
+    python3 scripts/audit_pr_attribution.py                         # report only
+    python3 scripts/audit_pr_attribution.py --base origin/release   # custom PR base
+    python3 scripts/audit_pr_attribution.py --fix                   # create mapping files
 
 Logic (kept in sync with contributor-check.yml):
-  - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
+  - scans ``git log $(git merge-base <base> HEAD)..HEAD --format=%ae``
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
   - everything else must have ``contributors/emails/<email>`` or a legacy
@@ -55,8 +56,8 @@ def run(*args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def new_emails() -> list[str]:
-    base = run("git", "merge-base", "origin/main", "HEAD")
+def new_emails(base_ref: str = "origin/main") -> list[str]:
+    base = run("git", "merge-base", base_ref, "HEAD")
     log = run("git", "log", f"{base}..HEAD", "--format=%ae", "--no-merges", check=False)
     return sorted({e for e in log.splitlines() if e.strip()})
 
@@ -101,11 +102,13 @@ def resolve_login(email: str) -> tuple[str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", default="origin/main",
+                        help="target branch/ref used to compute the PR merge base")
     parser.add_argument("--fix", action="store_true",
                         help="auto-create contributors/emails/ mapping files")
     args = parser.parse_args()
 
-    unmapped = [e for e in new_emails() if not is_mapped(e)]
+    unmapped = [e for e in new_emails(args.base) if not is_mapped(e)]
     if not unmapped:
         print("✅ All contributor emails on this branch are mapped.")
         return 0
