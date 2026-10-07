@@ -28,7 +28,8 @@ from agent.delegation_context import (
 from tools.environments.local import hermes_subprocess_env
 
 
-TERMINAL_STATUSES = {"done", "blocked", "review", "changes_requested", "superseded"}
+TERMINAL_STATUSES = {"done", "blocked", "review", "changes_requested"}
+CLAIM_LOST_STATUSES = {"missing", "superseded"}
 CLAIM_LOST_EXIT_CODE = 74
 PROTOCOL_VIOLATION_EXIT_CODE = 70
 TIMEOUT_EXIT_CODE = 124
@@ -264,6 +265,9 @@ def run(argv: list[str] | None = None) -> int:
         raise RuntimeError("task argument does not match dispatcher-owned HERMES_KANBAN_TASK")
     if os.environ.get("HERMES_PROFILE") != args.profile:
         raise RuntimeError("profile argument does not match dispatcher-owned HERMES_PROFILE")
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not run_id.isdigit():
+        raise RuntimeError("dispatcher did not provide a valid HERMES_KANBAN_RUN_ID")
     if not args.read_only:
         raise RuntimeError("Claude Code Kanban lanes are review-only and require --read-only")
     profile_home = Path(os.environ.get("HERMES_HOME", "")).expanduser().resolve()
@@ -342,7 +346,7 @@ def run(argv: list[str] | None = None) -> int:
             status = _task_status(args.task)
             if status in TERMINAL_STATUSES:
                 return 0
-            if status == "missing":
+            if status in CLAIM_LOST_STATUSES:
                 return CLAIM_LOST_EXIT_CODE
             with contextlib.suppress(Exception):
                 _call_kanban_tool(
@@ -375,7 +379,7 @@ def run(argv: list[str] | None = None) -> int:
         status = _task_status(args.task)
         if status in TERMINAL_STATUSES:
             return 0
-        if status == "missing":
+        if status in CLAIM_LOST_STATUSES:
             print("CLAUDE_CODE_WORKER_CLAIM_LOST", file=sys.stderr)
             return CLAIM_LOST_EXIT_CODE
         if claim_lost.is_set():

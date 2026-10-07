@@ -117,6 +117,7 @@ def _prepare_run(monkeypatch, tmp_path, *, returncode: int, status: str, stdout:
     (profile / "SOUL.md").write_text("You are Athena.", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     monkeypatch.setenv("HERMES_PROFILE", "athena")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
     monkeypatch.setattr(ccw, "_call_kanban_tool", lambda *_args, **_kwargs: '{"ok": true}')
@@ -204,6 +205,7 @@ def test_rejected_initial_claim_never_spawns_duplicate_worker(monkeypatch, tmp_p
     profile.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     monkeypatch.setenv("HERMES_PROFILE", "athena")
     monkeypatch.setattr(ccw, "_call_kanban_tool", lambda *_args, **_kwargs: '{"ok": false}')
     monkeypatch.setattr(
@@ -227,6 +229,7 @@ def test_wall_clock_timeout_terminates_process_group(monkeypatch, tmp_path):
     (profile / "SOUL.md").write_text("You are Athena.", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     monkeypatch.setenv("HERMES_PROFILE", "athena")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
     calls = []
@@ -258,9 +261,71 @@ def test_wall_clock_timeout_terminates_process_group(monkeypatch, tmp_path):
     assert any(name == "kanban_comment" and "wall-clock" in args["body"] for name, args in calls if name != "terminate")
 
 
+def test_wall_clock_timeout_after_supersession_returns_claim_lost(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    workspace = tmp_path / "workspace"
+    profile.mkdir()
+    workspace.mkdir()
+    (profile / "SOUL.md").write_text("You are Athena.", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    monkeypatch.setenv("HERMES_PROFILE", "athena")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setattr(ccw, "_call_kanban_tool", lambda *_args, **_kwargs: '{"ok": true}')
+    monkeypatch.setattr(ccw, "_task_status", lambda _task: "superseded")
+    monkeypatch.setattr(ccw, "hermes_subprocess_env", lambda **_kwargs: {})
+    monkeypatch.setattr(ccw, "_terminate_with_grace", lambda _proc: None)
+
+    class TimedOutProc:
+        pid = 9002
+        returncode = -9
+        attempts = 0
+
+        def communicate(self, timeout=None):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ccw.subprocess.TimeoutExpired("claude", float(timeout or 1))
+            return "", ""
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(ccw.subprocess, "Popen", lambda *_args, **_kwargs: TimedOutProc())
+    assert ccw.run([
+        "--profile", "athena", "--task", "t_probe", "--read-only", "--timeout-seconds", "1",
+    ]) == ccw.CLAIM_LOST_EXIT_CODE
+
+
 def test_cli_failure_stays_failure_without_fallback(monkeypatch, tmp_path):
     _prepare_run(monkeypatch, tmp_path, returncode=29, status="running")
     assert ccw.run(["--profile", "athena", "--task", "t_probe", "--read-only"]) == 69
+
+
+def test_superseded_run_returns_claim_lost(monkeypatch, tmp_path, capsys):
+    _prepare_run(monkeypatch, tmp_path, returncode=0, status="superseded")
+    assert ccw.run(["--profile", "athena", "--task", "t_probe", "--read-only"]) == ccw.CLAIM_LOST_EXIT_CODE
+    assert "CLAUDE_CODE_WORKER_CLAIM_LOST" in capsys.readouterr().err
+
+
+def test_invalid_run_id_fails_before_spawn(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "not-a-run")
+    monkeypatch.setenv("HERMES_PROFILE", "athena")
+    monkeypatch.setattr(
+        ccw.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+    try:
+        ccw.run(["--profile", "athena", "--task", "t_probe", "--read-only"])
+    except RuntimeError as exc:
+        assert "HERMES_KANBAN_RUN_ID" in str(exc)
+    else:
+        raise AssertionError("invalid run id must fail before spawning Claude")
 
 
 def test_success_without_lifecycle_is_protocol_violation(monkeypatch, tmp_path):
