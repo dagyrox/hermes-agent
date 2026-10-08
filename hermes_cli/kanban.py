@@ -28,6 +28,7 @@ from hermes_cli.kanban_output import (
     _task_to_dict,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
+from hermes_cli.kanban_policy import _dispatch_policy
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
@@ -187,6 +188,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         except Exception as exc:
             return _err(f"kanban: could not initialize database: {exc}")
 
+        if action == "policy":
+            return _dispatch_policy(args)
         handler = _HANDLERS.get(action)
         if not handler:
             return _err(f"kanban: unknown action {action!r}", 2)
@@ -217,7 +220,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
-    "gc",
+    "gc", "policy",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({

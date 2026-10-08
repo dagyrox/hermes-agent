@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import subprocess
 from typing import Any
 from urllib.parse import quote
@@ -96,35 +97,14 @@ def _phase_api(phase: str, endpoint: str, *, query: str | None = None, paginate:
 
 
 def _configured_required(repo: str) -> set[tuple[str, int | None]]:
-    """Read the explicit per-repository CI policy from the active profile."""
+    """Read the explicit per-repository CI policy from the pinned board DB."""
     try:
-        from hermes_cli.config_effective import load_user_config_effective
-        cfg = load_user_config_effective(fail_closed=True)
-    except Exception:
-        raise _EvidenceError("required CI configuration", "config.yaml is unreadable") from None
-    kanban = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    acceptance = kanban.get("pr_acceptance", {}) if isinstance(kanban, dict) else {}
-    policies = acceptance.get("required_checks", {}) if isinstance(acceptance, dict) else {}
-    if not isinstance(policies, dict):
-        raise _EvidenceError("required CI configuration", "kanban.pr_acceptance.required_checks must be a mapping")
-    entries = policies.get(repo, [])
-    if not isinstance(entries, list):
-        raise _EvidenceError("required CI configuration", f"the {repo} policy must be a list")
-    required: set[tuple[str, int | None]] = set()
-    for entry in entries:
-        if isinstance(entry, str):
-            context, app_id = entry.strip(), None
-        elif isinstance(entry, dict):
-            context, app_id = entry.get("context"), entry.get("app_id")
-            context = context.strip() if isinstance(context, str) else ""
-            if app_id is not None and (not isinstance(app_id, int) or isinstance(app_id, bool)):
-                raise _EvidenceError("required CI configuration", f"the {repo} policy has a non-integer app_id")
-        else:
-            raise _EvidenceError("required CI configuration", f"the {repo} policy has an invalid check entry")
-        if not context:
-            raise _EvidenceError("required CI configuration", f"the {repo} policy has an empty check context")
-        required.add((context, app_id))
-    return required
+        from hermes_cli import kanban_pr_policy
+        from hermes_cli.kanban_db_connect import connect_closing
+        with connect_closing() as conn:
+            return kanban_pr_policy.required_checks(conn, repo)
+    except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+        raise _EvidenceError("required CI configuration", str(exc)) from None
 
 
 def collect_acceptance(contract: str, published_pr: str | None) -> dict:
@@ -163,7 +143,7 @@ def collect_acceptance(contract: str, published_pr: str | None) -> dict:
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
             receipt["detail"] = ("No required CI policy is configured for this repository. Configure GitHub protection/rules "
-                                 "or kanban.pr_acceptance.required_checks; PR contracts never auto-pass zero checks.")
+                                 "or `hermes kanban policy add-required-check`; PR contracts never auto-pass zero checks.")
             return receipt
         pages = _phase_api("check runs", f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest", paginate=True)
         runs = [run for page in pages for run in page["check_runs"]]

@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_pr_acceptance as acceptance
+from hermes_cli import kanban_pr_policy as policy
 from hermes_cli.kanban_db_connect import connect
 
 
@@ -155,17 +156,29 @@ def test_api_uses_old_gh_compatible_pagination(monkeypatch):
     assert "--slurp" not in seen["command"]
 
 
-def test_configured_policy_supplies_required_check_without_github_protection(github, tmp_path):
-    (tmp_path / "home" / "config.yaml").write_text(
-        "kanban:\n  pr_acceptance:\n    required_checks:\n      acme/repo: [required]\n",
-        encoding="utf-8",
-    )
+def test_configured_policy_supplies_required_check_without_github_protection(github):
+    with connect() as conn:
+        policy.add_required_check(conn, "acme/repo", "required")
     github["protected"] = False
     original_requests = github["requests"]
     with connect() as conn:
         tid = kb.create_task(conn, title="configured", completion_contract="acme/repo")
         assert kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
     assert original_requests
+
+
+def test_board_policy_is_shared_across_profile_homes(github, tmp_path, monkeypatch):
+    board_db = tmp_path / "home" / "kanban.db"
+    with connect() as conn:
+        policy.add_required_check(conn, "acme/repo", "required")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board_db))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-profile"))
+    github["protected"] = False
+
+    receipt = acceptance.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+
+    assert receipt["ok"]
+    assert receipt["required"] == [{"context": "required", "app_id": None}]
 
 
 def test_missing_policy_never_auto_passes_zero_checks(github):
@@ -176,16 +189,15 @@ def test_missing_policy_never_auto_passes_zero_checks(github):
     assert "never auto-pass zero checks" in receipt["detail"]
 
 
-def test_missing_or_invalid_policy_fails_closed_with_specific_phase(github, tmp_path):
-    # The fixture supplies remote protection, so malformed explicit policy must
-    # fail instead of silently falling back to that otherwise-valid check.
-    (tmp_path / "home" / "config.yaml").write_text(
-        "kanban:\n  pr_acceptance:\n    required_checks:\n      acme/repo: wrong-shape\n",
-        encoding="utf-8",
-    )
+def test_policy_read_failure_is_phase_specific(github, monkeypatch):
+    def broken(*args, **kwargs):
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(policy, "required_checks", broken)
     receipt = acceptance.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
     assert receipt["classification"] == "infra"
     assert "required CI configuration" in receipt["detail"]
+    assert "database unavailable" in receipt["detail"]
 
 
 def test_api_failure_names_phase_without_leaking_stderr(monkeypatch, tmp_path):

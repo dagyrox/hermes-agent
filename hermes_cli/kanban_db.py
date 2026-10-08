@@ -1063,6 +1063,16 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Board-scoped exact-head acceptance policy. app_id=-1 means any GitHub App
+-- (or a legacy commit status) may satisfy the named context. Keeping this in
+-- the board DB makes one policy apply to every profile that can claim a card.
+CREATE TABLE IF NOT EXISTS kanban_pr_required_checks (
+    repo       TEXT NOT NULL,
+    context    TEXT NOT NULL,
+    app_id     INTEGER NOT NULL DEFAULT -1,
+    PRIMARY KEY (repo, context, app_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -1072,6 +1082,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_pr_required_repo       ON kanban_pr_required_checks(repo);
 """
 
 

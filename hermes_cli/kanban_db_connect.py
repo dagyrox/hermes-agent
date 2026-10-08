@@ -615,19 +615,21 @@ def repair_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) ->
 
 
 def _schema_is_present(conn: sqlite3.Connection) -> bool:
-    """Whether an open connection actually sees the kanban schema. ``tasks`` is
-    the sentinel (SCHEMA_SQL always creates it; SQLite loses tables
-    all-or-nothing), so one ``sqlite_master`` lookup on the resident page 1
-    suffices — cheap by design, it runs on every steady-state connect()."""
+    """Whether an open connection sees the current minimum kanban schema.
+
+    Include the board policy table so a process whose init cache predates that
+    migration re-enters the idempotent schema path instead of failing later.
+    """
     try:
         row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1"
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name IN ('tasks', 'kanban_pr_required_checks')"
         ).fetchone()
     except sqlite3.DatabaseError:
         # Unreadable schema table is not this guard's call — the full init
         # path's header/integrity probes classify and quarantine it.
         return False
-    return row is not None
+    return row is not None and int(row[0]) == 2
 
 
 def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
