@@ -1876,6 +1876,11 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
+        # Optional per-profile Claude Code CLI lane configuration. Put this key in the
+        # assigned profile's own config.yaml. None keeps the normal `hermes -p <profile>`
+        # worker; a mapping uses the authenticated `claude` executable with scoped Kanban
+        # lifecycle tools. Example: {"model": "opus", "read_only": True}.
+        "claude_code_worker": None,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,
