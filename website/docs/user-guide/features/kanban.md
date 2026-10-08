@@ -57,13 +57,26 @@ URL binds the card permanently; retries cannot substitute a green sibling PR.
 CLI `show --json` and `kanban_show` expose the persisted contract.
 
 The shared `complete_task` boundary covers worker tools, CLI, review approval and
-dashboard completion. It reads classic branch protection and active ruleset
-required contexts, paginates exact-head check runs and legacy statuses, then
+dashboard completion. It reads classic branch protection, active ruleset
+required contexts, and optional explicit policy from the board database. The
+board-scoped and GitHub sets are unioned, so adding remote protection cannot
+weaken an existing local policy and every profile working the same board sees
+the same requirements. Configure a repository without GitHub protection with:
+
+```bash
+hermes kanban policy add-required-check OWNER/REPO verify
+hermes kanban policy list-required-checks OWNER/REPO
+```
+
+Pass `--app-id N` to pin a context to one GitHub App. The collector paginates
+exact-head check runs and legacy statuses, then
 re-reads the PR head/base. Optional failed/skipped telemetry does not veto accepted
 required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped or
 neutral **required** evidence cannot complete the card. Neither can zero-run
-acceptance, unreadable policy or GitHub API failures. A repository without required
-checks needs a local-only contract. `gh` must be authenticated with read access to
+acceptance, unreadable policy or GitHub API failures. A repository without GitHub
+protection needs an explicit board policy (for example `dagyrox/or7-platform`
+requiring `verify`) or a deliberately local-only contract; a PR contract never accepts zero
+checks. `gh` must be authenticated with read access to
 the repository's checks and rules; no remote writes are performed by this gate.
 
 Rejection retains the active card and workspace. Durable `pr_acceptance` events

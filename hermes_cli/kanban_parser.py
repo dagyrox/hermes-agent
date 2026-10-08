@@ -134,6 +134,23 @@ _BOARD_SPECS = [
     )),
 ]
 
+_POLICY_SPECS = [
+    _cmd("list-required-checks", [
+        _arg("repo", nargs="?", help="Optional OWNER/REPO filter"),
+        _json_flag(),
+    ], aliases=["list"], help="List board-scoped required CI checks"),
+    _cmd("add-required-check", [
+        _arg("repo", help="GitHub repository as OWNER/REPO"),
+        _arg("context", help="Required check-run name or legacy status context"),
+        _arg("--app-id", type=int, help="Optional GitHub App database id that must own the check"),
+    ], aliases=["add"], help="Add a required CI check to this board's PR acceptance policy"),
+    _cmd("remove-required-check", [
+        _arg("repo", help="GitHub repository as OWNER/REPO"),
+        _arg("context", help="Required check-run name or legacy status context"),
+        _arg("--app-id", type=int, help="Optional GitHub App database id used when it was added"),
+    ], aliases=["remove", "rm"], help="Remove a required CI check from this board's policy"),
+]
+
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
@@ -145,6 +162,8 @@ _SPECS = [
              "loop — tasks on one board cannot collide with tasks on another. The first board is "
              "'default' and always exists."
          )),
+    _cmd("policy", children=("policy_action", _POLICY_SPECS),
+         help="Manage board-scoped PR acceptance policy"),
     _cmd("create", [
         _arg("title", help="Task title"),
         _arg("--body", help="Optional opening post"),

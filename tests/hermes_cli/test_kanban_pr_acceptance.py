@@ -8,12 +8,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_pr_acceptance as acceptance
+from hermes_cli import kanban_pr_policy as policy
 from hermes_cli.kanban_db_connect import connect
 
 
 @pytest.fixture
 def github(tmp_path, monkeypatch):
-    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
+    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": [],
+             "protected": True}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -22,8 +25,9 @@ def github(tmp_path, monkeypatch):
             if self.path == "/graphql":
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
-                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                    "baseRef": {"branchProtectionRule": ({"requiredStatusChecks": [
+                        {"context": "required", "app": {"databaseId": 1}}]}
+                        if state["protected"] else None)}}}}}
             elif "/rules/branches/" in self.path:
                 value = [[]]
             elif "/check-runs" in self.path:
@@ -129,3 +133,82 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
             assert kb.get_task(conn, tid).status != "done"
             assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0] == 0
             github.pop("race")
+
+
+def test_paginated_api_decoder_accepts_old_stream_and_slurp_shapes():
+    pages = [{"page": 1}, {"page": 2}]
+    wrapped = [{"__hermes_page": page} for page in pages]
+    assert acceptance._decode_api_output('\n'.join(json.dumps(page) for page in wrapped), paginate=True) == pages
+    assert acceptance._decode_api_output(json.dumps(pages), paginate=True) == pages
+
+
+def test_api_uses_old_gh_compatible_pagination(monkeypatch):
+    seen = {}
+
+    def run(command, **kwargs):
+        seen["command"] = command
+        return type("Result", (), {"stdout": '{"__hermes_page": []}\n{"__hermes_page": []}\n'})()
+
+    monkeypatch.setattr(acceptance.subprocess, "run", run)
+    assert acceptance._api("repos/acme/repo/rules/branches/main", paginate=True) == [[], []]
+    assert "--paginate" in seen["command"]
+    assert seen["command"][seen["command"].index("--jq") + 1] == "{__hermes_page: .}"
+    assert "--slurp" not in seen["command"]
+
+
+def test_configured_policy_supplies_required_check_without_github_protection(github):
+    with connect() as conn:
+        policy.add_required_check(conn, "acme/repo", "required")
+    github["protected"] = False
+    original_requests = github["requests"]
+    with connect() as conn:
+        tid = kb.create_task(conn, title="configured", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+    assert original_requests
+
+
+def test_board_policy_is_shared_across_profile_homes(github, tmp_path, monkeypatch):
+    board_db = tmp_path / "home" / "kanban.db"
+    with connect() as conn:
+        policy.add_required_check(conn, "acme/repo", "required")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board_db))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-profile"))
+    github["protected"] = False
+
+    receipt = acceptance.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+
+    assert receipt["ok"]
+    assert receipt["required"] == [{"context": "required", "app_id": None}]
+
+
+def test_missing_policy_never_auto_passes_zero_checks(github):
+    github["protected"] = False
+    receipt = acceptance.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "missing"
+    assert not receipt["ok"]
+    assert "never auto-pass zero checks" in receipt["detail"]
+
+
+def test_policy_read_failure_is_phase_specific(github, monkeypatch):
+    def broken(*args, **kwargs):
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(policy, "required_checks", broken)
+    receipt = acceptance.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "infra"
+    assert "required CI configuration" in receipt["detail"]
+    assert "database unavailable" in receipt["detail"]
+
+
+def test_api_failure_names_phase_without_leaking_stderr(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    secret = "sensitive-token-value"
+
+    def run(*args, **kwargs):
+        raise acceptance.subprocess.CalledProcessError(1, ["gh"], stderr=secret)
+
+    monkeypatch.setattr(acceptance.subprocess, "run", run)
+    receipt = acceptance.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["classification"] == "infra"
+    assert "pull request metadata" in receipt["detail"]
+    assert secret not in json.dumps(receipt)
