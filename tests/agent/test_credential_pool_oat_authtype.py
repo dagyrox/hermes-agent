@@ -106,7 +106,7 @@ def test_load_heals_legacy_row_and_exposes_it_to_resolver(tmp_path, monkeypatch)
     assert resolve_anthropic_token() == token
 
 
-def test_profile_global_fallback_normalizes_in_memory_without_writing(tmp_path, monkeypatch):
+def test_anthropic_profile_global_fallback_is_denied(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     global_root = tmp_path / ".hermes"
     global_root.mkdir()
@@ -131,8 +131,8 @@ def test_profile_global_fallback_normalizes_in_memory_without_writing(tmp_path, 
 
     from agent.credential_pool import load_pool
 
-    entry = load_pool("anthropic").entries()[0]
+    entries = load_pool("anthropic").entries()
     persisted = json.loads(global_auth.read_text())
-    assert entry.auth_type == AUTH_TYPE_OAUTH
+    assert entries == []
     assert persisted["credential_pool"]["anthropic"][0]["auth_type"] == AUTH_TYPE_API_KEY
     assert not (profile_home / "auth.json").exists()

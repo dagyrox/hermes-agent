@@ -526,10 +526,10 @@ DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
 
 def _write_through_provider_state_to_global_root(
     provider_id: str, state: Dict[str, Any]
-) -> None:
+) -> bool:
     """Persist a rotated OAuth ``state`` into the global-root auth.json.
 
-    Best-effort write-through for the multi-profile rotation hazard
+    Verified write-through for the multi-profile rotation hazard
     (#48415 / #43589): nous, openai-codex, and xai-oauth rotate the
     refresh_token on refresh, so when a profile pool refresh rotates a grant
     it resolved from the root fallback, the rotated chain must land back in
@@ -538,19 +538,27 @@ def _write_through_provider_state_to_global_root(
     ``invalid_grant`` once its access token expires.
 
     Only updates ``providers.<provider_id>`` in the root store; never touches
-    the profile store (the caller already saved that). Swallows all errors — a
-    failed write-through degrades to the pre-existing behavior (root stale), it
-    must never break the profile's own successful save. Mirrors
+    the profile store (the caller already saved that). Returns whether the
+    persisted state was verified. A failure never breaks the already-successful
+    upstream refresh, but is surfaced at WARNING rather than silently leaving
+    other profiles on a consumed chain. Mirrors
     ``hermes_cli.auth._write_through_xai_oauth_to_global_root`` (which covers
     the non-pool xAI refresh path) for the credential-pool refresh path.
     """
     try:
+        global_path = auth_mod._global_auth_file_path(provider_id)
+    except TypeError:
         global_path = auth_mod._global_auth_file_path()
-    except Exception:
-        return
+    except Exception as exc:
+        logger.warning(
+            "%s pool refresh: shared root path unavailable (%s)",
+            provider_id,
+            type(exc).__name__,
+        )
+        return False
     if global_path is None:
         # Classic mode (profile == root); the profile save already hit root.
-        return
+        return True
     # Seat belt: under pytest, refuse to write the real user's
     # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
     # (mirrors the read-side guard in _load_global_auth_store). Uses the
@@ -561,22 +569,36 @@ def _write_through_provider_state_to_global_root(
             real_root = Path(real_home_env) / ".hermes" / "auth.json"
             try:
                 if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return
+                    return False
             except Exception:
-                return
+                return False
     try:
-        auth_mod._persist_provider_state_to_store(
+        with auth_mod._auth_store_lock(target_path=global_path):
+            auth_mod._persist_provider_state_to_store(
+                provider_id,
+                state,
+                global_path,
+                set_active=False,
+            )
+            persisted_store = auth_mod._load_auth_store(global_path)
+            providers = persisted_store.get("providers")
+            persisted = providers.get(provider_id) if isinstance(providers, dict) else None
+            if persisted != state:
+                logger.warning(
+                    "%s pool refresh: shared root write-through verification failed (path=%s)",
+                    provider_id,
+                    global_path,
+                )
+                return False
+        return True
+    except Exception as exc:
+        logger.warning(
+            "%s pool refresh: shared root write-through failed (path=%s, error=%s)",
             provider_id,
-            state,
             global_path,
-            set_active=False,
+            type(exc).__name__,
         )
-    except Exception as exc:  # pragma: no cover - best effort
-        logger.debug(
-            "%s pool refresh: write-through to global root failed: %s",
-            provider_id,
-            exc,
-        )
+        return False
 
 
 class CredentialPool:

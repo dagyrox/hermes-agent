@@ -3590,6 +3590,16 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Root-only, opt-in credential inheritance for explicitly trusted profiles.
+    # Profile-local copies are ignored by agent.credential_trust.
+    "profiles": {
+        "shared_credentials": {
+            "enabled": False,
+            "trusted_profiles": [],
+            "providers": [],
+        },
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 33,
 }

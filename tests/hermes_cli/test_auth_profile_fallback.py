@@ -1,9 +1,9 @@
 """Tests for cross-profile auth fallback.
 
-When ``HERMES_HOME`` points to a named profile, ``read_credential_pool()``
-and ``get_provider_auth_state()`` fall back to the global-root
-``auth.json`` per-provider when the profile has no entries for that
-provider.  Writes still target the profile only.
+When ``HERMES_HOME`` points to an explicitly trusted named profile,
+``read_credential_pool()`` and ``get_provider_auth_state()`` fall back to the
+global-root ``auth.json`` for allowlisted providers when the profile has no
+local entries. Writes still target the profile only.
 
 See the #18594 follow-up report: profile workers couldn't see providers
 authenticated only at the global root.
@@ -45,6 +45,14 @@ def profile_env(tmp_path, monkeypatch):
     profile_dir = global_root / "profiles" / "coder"
     profile_dir.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+    (global_root / "config.yaml").write_text(
+        "profiles:\n"
+        "  shared_credentials:\n"
+        "    enabled: true\n"
+        "    trusted_profiles: [coder]\n"
+        "    providers: [openrouter, deepseek, nous]\n",
+        encoding="utf-8",
+    )
     return {"global": global_root, "profile": profile_dir}
 
 
@@ -148,7 +156,7 @@ def test_per_provider_shadowing_is_independent(profile_env):
     or_entries = read_credential_pool("openrouter")
     ant_entries = read_credential_pool("anthropic")
     assert [e["id"] for e in or_entries] == ["prof-or"]
-    assert [e["id"] for e in ant_entries] == ["glob-ant"]
+    assert ant_entries == []
 
 
 def test_missing_global_auth_file_is_safe(profile_env):
@@ -230,9 +238,9 @@ def test_whole_pool_merges_global_providers_when_missing_locally(profile_env):
     }))
 
     pool = read_credential_pool(None)
-    # Profile wins for openrouter, global fills in anthropic.
+    # Profile wins for openrouter; Anthropic is never inherited.
     assert [e["id"] for e in pool["openrouter"]] == ["prof-or"]
-    assert [e["id"] for e in pool["anthropic"]] == ["glob-ant"]
+    assert "anthropic" not in pool
 
 
 # ---------------------------------------------------------------------------

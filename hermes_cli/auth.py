@@ -51,6 +51,10 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
+from agent.credential_trust import (
+    describe_credential_trust,
+    is_shared_inheritance_allowed,
+)
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -924,7 +928,7 @@ def _auth_file_path() -> Path:
     return path
 
 
-def _global_auth_file_path() -> Optional[Path]:
+def _global_auth_file_path(provider_id: Optional[str] = None) -> Optional[Path]:
     """Return the global-root auth.json when the process is in profile mode.
 
     Returns ``None`` when the profile and global root resolve to the same
@@ -934,6 +938,8 @@ def _global_auth_file_path() -> Optional[Path]:
 
     See issue #18594 follow-up (credential_pool shadowing).
     """
+    if provider_id is not None and not is_shared_inheritance_allowed(provider_id):
+        return None
     try:
         from hermes_constants import get_default_hermes_root
         global_root = get_default_hermes_root()
@@ -955,7 +961,7 @@ def _global_auth_file_path() -> Optional[Path]:
     return global_root / "auth.json"
 
 
-def _load_global_auth_store() -> Dict[str, Any]:
+def _load_global_auth_store(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Load the global-root auth store (read-only fallback).
 
     Returns an empty dict when no global fallback exists (classic mode,
@@ -971,7 +977,10 @@ def _load_global_auth_store() -> Dict[str, Any]:
     not ``Path.home()``, because ``Path.home`` is sometimes monkeypatched
     by fixtures that want to relocate the global root to a tmp path.
     """
-    global_path = _global_auth_file_path()
+    try:
+        global_path = _global_auth_file_path(provider_id)
+    except TypeError:
+        global_path = _global_auth_file_path()
     if global_path is None or not global_path.exists():
         return {}
     if os.environ.get("PYTEST_CURRENT_TEST"):
@@ -984,11 +993,27 @@ def _load_global_auth_store() -> Dict[str, Any]:
             except Exception:
                 pass
     try:
-        return _load_auth_store(global_path)
+        raw = json.loads(global_path.read_text(encoding="utf-8"))
     except Exception:
-        # A malformed global store must not break profile reads. The
-        # profile's own auth store is still authoritative.
+        try:
+            byte_length = global_path.stat().st_size
+        except OSError:
+            byte_length = None
+        logger.warning(
+            "auth: shared root store unavailable (path=%s, bytes=%s)",
+            global_path,
+            byte_length,
+        )
         return {}
+    if not isinstance(raw, dict):
+        logger.warning("auth: shared root store has invalid shape (path=%s)", global_path)
+        return {}
+    if not isinstance(raw.get("providers"), dict) and not isinstance(
+        raw.get("credential_pool"), dict
+    ):
+        logger.warning("auth: shared root store has invalid shape (path=%s)", global_path)
+        return {}
+    return raw
 
 
 def _auth_lock_path() -> Path:
@@ -1117,6 +1142,16 @@ def _auth_store_lock(
         yield
 
 
+_corrupt_auth_store_paths: set[str] = set()
+
+
+def _auth_path_key(path: Path) -> str:
+    try:
+        return str(path.resolve(strict=False))
+    except Exception:
+        return str(path)
+
+
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
@@ -1125,6 +1160,7 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     try:
         raw = json.loads(auth_file.read_text())
     except Exception as exc:
+        _corrupt_auth_store_paths.add(_auth_path_key(auth_file))
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         try:
             import shutil
@@ -1142,6 +1178,7 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         isinstance(raw.get("providers"), dict)
         or isinstance(raw.get("credential_pool"), dict)
     ):
+        _corrupt_auth_store_paths.discard(_auth_path_key(auth_file))
         raw.setdefault("providers", {})
         if isinstance(raw.get("providers"), dict):
             _migrate_stale_nous_portal_url(raw["providers"])
@@ -1210,7 +1247,21 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
         auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
+    _corrupt_auth_store_paths.discard(_auth_path_key(auth_file))
     return auth_file
+
+
+def _provider_state_has_usable_access(state: Dict[str, Any]) -> bool:
+    """Return whether shared provider state contains a usable access token."""
+    direct = state.get("access_token")
+    if isinstance(direct, str) and direct.strip():
+        return True
+    tokens = state.get("tokens")
+    return bool(
+        isinstance(tokens, dict)
+        and isinstance(tokens.get("access_token"), str)
+        and tokens["access_token"].strip()
+    )
 
 
 def _load_provider_state_with_source(
@@ -1232,13 +1283,27 @@ def _load_provider_state_with_source(
         if isinstance(state, dict):
             return dict(state), _auth_file_path()
 
-    global_path = _global_auth_file_path()
-    global_store = _load_global_auth_store()
+    if _auth_path_key(_auth_file_path()) in _corrupt_auth_store_paths:
+        return None, None
+    try:
+        global_path = _global_auth_file_path(provider_id)
+    except TypeError:
+        # Backward compatibility for plugin/test doubles implementing the
+        # pre-policy no-argument helper contract.
+        global_path = _global_auth_file_path()
+    if global_path is None:
+        return None, None
+    try:
+        global_store = _load_global_auth_store(provider_id)
+    except TypeError:
+        global_store = _load_global_auth_store()
     if global_store:
         global_providers = global_store.get("providers")
         if isinstance(global_providers, dict):
             global_state = global_providers.get(provider_id)
-            if isinstance(global_state, dict):
+            if isinstance(global_state, dict) and _provider_state_has_usable_access(
+                global_state
+            ):
                 return dict(global_state), global_path
     return None, None
 
@@ -1411,7 +1476,9 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def read_credential_pool(
+    provider_id: Optional[str] = None,
+) -> Dict[str, Any] | List[Any]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1432,16 +1499,17 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(pool, dict):
         pool = {}
 
-    global_pool: Dict[str, Any] = {}
-    global_store = _load_global_auth_store()
-    maybe_global_pool = global_store.get("credential_pool") if global_store else None
-    if isinstance(maybe_global_pool, dict):
-        global_pool = maybe_global_pool
-
     if provider_id is None:
         merged = dict(pool)
+        if _auth_path_key(_auth_file_path()) in _corrupt_auth_store_paths:
+            return merged
+        global_store = _load_global_auth_store()
+        maybe_global_pool = global_store.get("credential_pool") if global_store else None
+        global_pool = maybe_global_pool if isinstance(maybe_global_pool, dict) else {}
         for gp_key, gp_entries in global_pool.items():
             if not isinstance(gp_entries, list) or not gp_entries:
+                continue
+            if not is_shared_inheritance_allowed(gp_key):
                 continue
             # Per-provider shadowing: profile wins whenever it has ANY entries.
             existing = merged.get(gp_key)
@@ -1453,7 +1521,12 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     provider_entries = pool.get(provider_id)
     if isinstance(provider_entries, list) and provider_entries:
         return list(provider_entries)
+    if _auth_path_key(_auth_file_path()) in _corrupt_auth_store_paths:
+        return []
     # Profile has no entries for this provider — fall back to global.
+    global_store = _load_global_auth_store(provider_id)
+    maybe_global_pool = global_store.get("credential_pool") if global_store else None
+    global_pool = maybe_global_pool if isinstance(maybe_global_pool, dict) else {}
     global_entries = global_pool.get(provider_id)
     return list(global_entries) if isinstance(global_entries, list) else []
 
@@ -6684,6 +6757,32 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
         }
 
 
+def _credential_trust_status(provider_id: str) -> Dict[str, Any]:
+    """Return non-secret provenance metadata for root credential inheritance."""
+    status = describe_credential_trust(provider_id)
+    status["write_through_ok"] = None
+    local_store = _load_auth_store()
+    providers = local_store.get("providers")
+    pool = local_store.get("credential_pool")
+    has_local = (
+        isinstance(providers, dict)
+        and isinstance(providers.get(provider_id), dict)
+    ) or (
+        isinstance(pool, dict)
+        and isinstance(pool.get(provider_id), list)
+        and bool(pool.get(provider_id))
+    )
+    if has_local:
+        status.update({
+            "inherited": False,
+            "source_store": str(_auth_file_path()),
+            "shadowed_by_local": True,
+        })
+    elif status.get("inherited"):
+        status["shadowed_by_local"] = False
+    return status
+
+
 def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for API-key providers (z.ai, Kimi, MiniMax)."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
@@ -6705,7 +6804,7 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     else:
         base_url = pconfig.inference_base_url
 
-    return {
+    status = {
         "configured": bool(api_key),
         "provider": provider_id,
         "name": pconfig.name,
@@ -6713,6 +6812,8 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
         "base_url": base_url,
         "logged_in": bool(api_key),  # compat with OAuth status shape
     }
+    status.update(_credential_trust_status(provider_id))
+    return status
 
 
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
@@ -6755,7 +6856,9 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if target == "nous":
         return get_nous_auth_status()
     if target == "openai-codex":
-        return get_codex_auth_status()
+        status = get_codex_auth_status()
+        status.update(_credential_trust_status(target))
+        return status
     if target == "xai-oauth":
         return get_xai_oauth_auth_status()
     if target == "qwen-oauth":
