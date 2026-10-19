@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from agent import credential_pool
 from hermes_cli import auth
@@ -40,3 +41,17 @@ def test_shared_write_through_detects_silent_noop(tmp_path, monkeypatch, caplog)
     assert "verification failed" in caplog.text
     assert "rotated-access" not in caplog.text
     assert "rotated-refresh" not in caplog.text
+
+
+def test_shared_write_through_reports_policy_denial(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "talos"
+    profile.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    assert credential_pool._write_through_provider_state_to_global_root(
+        "openai-codex", _codex_state("rotated-access", "rotated-refresh")
+    ) is False

@@ -4422,7 +4422,9 @@ def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
         auth_store = _load_auth_store()
     state = _xai_oauth_state_from_store(auth_store)
     if not _xai_oauth_state_has_usable_tokens(state):
-        global_state = _xai_oauth_state_from_store(_load_global_auth_store())
+        global_state = _xai_oauth_state_from_store(
+            _load_global_auth_store("xai-oauth")
+        )
         if _xai_oauth_state_has_usable_tokens(global_state):
             state = global_state
     if not state:

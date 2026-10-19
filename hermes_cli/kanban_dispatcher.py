@@ -49,7 +49,7 @@ def _ensure_private_directory(path: Path) -> None:
         )
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():  # windows-footgun: ok
         raise PermissionError(f"dispatcher control directory is not privately owned: {path}")
     path.chmod(0o700)
     if stat.S_IMODE(path.stat().st_mode) & 0o077:

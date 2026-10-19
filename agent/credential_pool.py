@@ -546,9 +546,13 @@ def _write_through_provider_state_to_global_root(
     the non-pool xAI refresh path) for the credential-pool refresh path.
     """
     try:
+        # Distinguish classic mode (the active store is already root) from a
+        # named profile denied by the shared-credential policy. The gated call
+        # returns None for both, so establish the physical root path first.
+        ungated_global_path = auth_mod._global_auth_file_path()
+        if ungated_global_path is None:
+            return True
         global_path = auth_mod._global_auth_file_path(provider_id)
-    except TypeError:
-        global_path = auth_mod._global_auth_file_path()
     except Exception as exc:
         logger.warning(
             "%s pool refresh: shared root path unavailable (%s)",
@@ -557,8 +561,11 @@ def _write_through_provider_state_to_global_root(
         )
         return False
     if global_path is None:
-        # Classic mode (profile == root); the profile save already hit root.
-        return True
+        logger.warning(
+            "%s pool refresh: shared root write-through denied by policy",
+            provider_id,
+        )
+        return False
     # Seat belt: under pytest, refuse to write the real user's
     # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
     # (mirrors the read-side guard in _load_global_auth_store). Uses the

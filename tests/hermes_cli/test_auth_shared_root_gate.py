@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 import yaml
 
 from hermes_cli import auth
@@ -72,6 +73,29 @@ def test_trusted_profile_inherits_only_allowlisted_root_credentials(tmp_path, mo
     assert status["source_store"] == "root"
     assert status["shadowed_by_local"] is False
     assert "api_key" not in status
+
+
+def test_xai_root_tokens_are_not_read_when_provider_is_not_allowlisted(
+    tmp_path, monkeypatch
+):
+    root, _profile = _configure(tmp_path, monkeypatch, "talos")
+    _write_store(
+        root / "auth.json",
+        {
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "xai-root-access",
+                        "refresh_token": "xai-root-refresh",
+                    }
+                }
+            },
+        },
+    )
+
+    with pytest.raises(auth.AuthError, match="No xAI OAuth credentials stored"):
+        auth._read_xai_oauth_tokens()
 
 
 def test_untrusted_profile_cannot_inherit_valid_root_store(tmp_path, monkeypatch):
