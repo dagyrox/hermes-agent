@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 import yaml
 
+from agent.credential_pool import load_pool
 from hermes_cli import auth
 
 
@@ -96,6 +97,98 @@ def test_xai_root_tokens_are_not_read_when_provider_is_not_allowlisted(
 
     with pytest.raises(auth.AuthError, match="No xAI OAuth credentials stored"):
         auth._read_xai_oauth_tokens()
+
+
+def test_xai_save_from_excluded_profile_does_not_mutate_root(tmp_path, monkeypatch):
+    root, _profile = _configure(tmp_path, monkeypatch, "guestwhatsapp")
+    root_auth = root / "auth.json"
+    _write_store(
+        root_auth,
+        {
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                }
+            },
+        },
+    )
+    before = root_auth.read_bytes()
+
+    auth._save_xai_oauth_tokens(
+        {"access_token": "profile-access", "refresh_token": "profile-refresh"}
+    )
+
+    assert root_auth.read_bytes() == before
+
+
+def test_inherited_pool_entry_is_not_materialized_as_local_shadow(tmp_path, monkeypatch):
+    root, profile = _configure(tmp_path, monkeypatch, "talos")
+    _write_store(
+        root / "auth.json",
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "root-codex",
+                        "label": "root",
+                        "source": "device_code",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                ]
+            },
+        },
+    )
+
+    pool = load_pool("openai-codex")
+    assert pool.entries()[0].extra.get("shared_root_source") is True
+    pool._persist()
+
+    profile_store = json.loads((profile / "auth.json").read_text(encoding="utf-8"))
+    assert not profile_store.get("providers", {}).get("openai-codex")
+    assert not profile_store.get("credential_pool", {}).get("openai-codex")
+
+
+def test_inherited_singleton_seed_is_not_materialized_as_local_shadow(
+    tmp_path, monkeypatch
+):
+    root, profile = _configure(tmp_path, monkeypatch, "talos")
+    _write_store(
+        root / "auth.json",
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                }
+            },
+        },
+    )
+
+    pool = load_pool("openai-codex")
+
+    assert pool.entries()[0].extra.get("shared_root_source") is True
+    profile_store = json.loads((profile / "auth.json").read_text(encoding="utf-8"))
+    assert not profile_store.get("providers", {}).get("openai-codex")
+    assert not profile_store.get("credential_pool", {}).get("openai-codex")
 
 
 def test_untrusted_profile_cannot_inherit_valid_root_store(tmp_path, monkeypatch):

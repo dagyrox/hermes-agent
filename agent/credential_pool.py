@@ -147,6 +147,7 @@ _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "shared_root_source", "write_through_ok",
 })
 
 
@@ -159,6 +160,34 @@ def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
     ):
         return AUTH_TYPE_OAUTH
     return str(auth_type or AUTH_TYPE_API_KEY)
+
+
+def _profile_owned_entries(
+    entries: List["PooledCredential"],
+) -> List["PooledCredential"]:
+    """Exclude root-inherited reference rows from profile persistence."""
+    return [
+        entry
+        for entry in entries
+        if not entry.extra.get("shared_root_source")
+    ]
+
+
+def _singleton_is_root_sourced(provider: str) -> bool:
+    """Return whether the provider singleton resolves from the gated root."""
+    try:
+        with _auth_store_lock():
+            local_store = _load_auth_store()
+            _state, source_path = auth_mod._load_provider_state_with_source(
+                local_store, provider
+            )
+        if source_path is None:
+            return False
+        return source_path.resolve(strict=False) != auth_mod._auth_file_path().resolve(
+            strict=False
+        )
+    except Exception:
+        return False
 
 
 @dataclass
@@ -658,10 +687,37 @@ class CredentialPool:
                 self._entries[idx] = new
                 return
 
+    def _shared_root_auth_path(
+        self, entry: PooledCredential
+    ) -> Optional[Path]:
+        """Return the policy-gated root store for an inherited row."""
+        if not entry.extra.get("shared_root_source"):
+            return None
+        return auth_mod._global_auth_file_path(self.provider)
+
+    def _load_entry_provider_state(
+        self, entry: PooledCredential, provider_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Load singleton state from the store that owns ``entry``."""
+        root_path = self._shared_root_auth_path(entry)
+        if entry.extra.get("shared_root_source") and root_path is None:
+            return None
+        with _auth_store_lock(target_path=root_path):
+            auth_store = _load_auth_store(root_path)
+            if root_path is not None:
+                providers = auth_store.get("providers")
+                raw = providers.get(provider_id) if isinstance(providers, dict) else None
+                return dict(raw) if isinstance(raw, dict) else None
+            return _load_provider_state(auth_store, provider_id)
+
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+        # Root-inherited rows are references, not profile-owned credentials.
+        # Persisting them into the profile would create a permanent local
+        # shadow that stops observing rotations made by another trusted lane.
+        local_entries = _profile_owned_entries(self._entries)
         write_credential_pool(
             self.provider,
-            [entry.to_dict() for entry in self._entries],
+            [entry.to_dict() for entry in local_entries],
             removed_ids=removed_ids,
         )
 
@@ -794,9 +850,7 @@ class CredentialPool:
         if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                state = _load_provider_state(auth_store, "openai-codex")
+            state = self._load_entry_provider_state(entry, "openai-codex")
             if not isinstance(state, dict):
                 return entry
             tokens = state.get("tokens")
@@ -855,9 +909,7 @@ class CredentialPool:
         if self.provider != "xai-oauth" or entry.source != "device_code":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                state = _load_provider_state(auth_store, "xai-oauth")
+            state = self._load_entry_provider_state(entry, "xai-oauth")
             if not isinstance(state, dict):
                 return entry
             tokens = state.get("tokens")
@@ -1007,7 +1059,9 @@ class CredentialPool:
             logger.debug("Failed to sync Nous entry from auth.json: %s", exc)
         return entry
 
-    def _sync_device_code_entry_to_auth_store(self, entry: PooledCredential) -> None:
+    def _sync_device_code_entry_to_auth_store(
+        self, entry: PooledCredential
+    ) -> Optional[bool]:
         """Write refreshed pool entry tokens back to auth.json providers.
 
         After a pool-level refresh, the pool entry has fresh tokens but
@@ -1034,10 +1088,14 @@ class CredentialPool:
         # and must not write back to the singleton.  All singleton-seeded
         # device-code sources (nous, openai-codex, xAI) use ``device_code``.
         if entry.source != "device_code":
-            return
+            return None
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            root_path = self._shared_root_auth_path(entry)
+            if entry.extra.get("shared_root_source") and root_path is None:
+                entry.extra["write_through_ok"] = False
+                return False
+            with _auth_store_lock(target_path=root_path):
+                auth_store = _load_auth_store(root_path)
                 # Decide BEFORE writing whether this profile is reading the
                 # grant from the global root (no own providers.<id> block) vs.
                 # genuinely shadowing it. A pool refresh rotates single-use
@@ -1054,16 +1112,20 @@ class CredentialPool:
                     "openai-codex": "openai-codex",
                     "xai-oauth": "xai-oauth",
                 }.get(self.provider)
-                write_through_to_root = bool(_wt_provider_id) and not (
+                write_through_to_root = root_path is None and bool(_wt_provider_id) and not (
                     isinstance(auth_store.get("providers"), dict)
                     and isinstance(
                         auth_store["providers"].get(_wt_provider_id), dict
                     )
                 )
                 if self.provider == "nous":
-                    state = _load_provider_state(auth_store, "nous")
+                    state = (
+                        auth_store.get("providers", {}).get("nous")
+                        if root_path is not None
+                        else _load_provider_state(auth_store, "nous")
+                    )
                     if state is None:
-                        return
+                        return None
                     state["access_token"] = entry.access_token
                     if entry.refresh_token:
                         state["refresh_token"] = entry.refresh_token
@@ -1084,12 +1146,16 @@ class CredentialPool:
                     _store_provider_state(auth_store, "nous", state, set_active=False)
 
                 elif self.provider == "openai-codex":
-                    state = _load_provider_state(auth_store, "openai-codex")
+                    state = (
+                        auth_store.get("providers", {}).get("openai-codex")
+                        if root_path is not None
+                        else _load_provider_state(auth_store, "openai-codex")
+                    )
                     if not isinstance(state, dict):
-                        return
+                        return None
                     tokens = state.get("tokens")
                     if not isinstance(tokens, dict):
-                        return
+                        return None
                     tokens["access_token"] = entry.access_token
                     if entry.refresh_token:
                         tokens["refresh_token"] = entry.refresh_token
@@ -1098,12 +1164,16 @@ class CredentialPool:
                     _store_provider_state(auth_store, "openai-codex", state, set_active=False)
 
                 elif self.provider == "xai-oauth":
-                    state = _load_provider_state(auth_store, "xai-oauth")
+                    state = (
+                        auth_store.get("providers", {}).get("xai-oauth")
+                        if root_path is not None
+                        else _load_provider_state(auth_store, "xai-oauth")
+                    )
                     if not isinstance(state, dict):
-                        return
+                        return None
                     tokens = state.get("tokens")
                     if not isinstance(tokens, dict):
-                        return
+                        return None
                     tokens["access_token"] = entry.access_token
                     if entry.refresh_token:
                         tokens["refresh_token"] = entry.refresh_token
@@ -1112,15 +1182,51 @@ class CredentialPool:
                     _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
 
                 else:
-                    return
+                    return None
 
-                _save_auth_store(auth_store)
+                _save_auth_store(auth_store, target_path=root_path)
                 if write_through_to_root and _wt_provider_id:
-                    _write_through_provider_state_to_global_root(
+                    write_through_ok = _write_through_provider_state_to_global_root(
                         _wt_provider_id, state
                     )
+                    entry.extra["write_through_ok"] = write_through_ok
+                    return write_through_ok
+                if root_path is not None:
+                    entry.extra["write_through_ok"] = True
+                return True
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
+            if entry.extra.get("shared_root_source"):
+                entry.extra["write_through_ok"] = False
+            return False
+
+    def _record_shared_write_through_status(
+        self, entry: Optional[PooledCredential]
+    ) -> None:
+        """Persist non-secret write-through diagnostics in the profile store."""
+        if entry is None or not entry.extra.get("shared_root_source"):
+            return
+        write_through_ok = entry.extra.get("write_through_ok")
+        if not isinstance(write_through_ok, bool):
+            return
+        try:
+            with _auth_store_lock():
+                auth_store = _load_auth_store()
+                statuses = auth_store.setdefault("credential_inheritance_status", {})
+                if not isinstance(statuses, dict):
+                    statuses = {}
+                    auth_store["credential_inheritance_status"] = statuses
+                statuses[self.provider] = {
+                    "write_through_ok": write_through_ok,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                _save_auth_store(auth_store)
+        except Exception as exc:
+            logger.debug(
+                "Failed to record %s shared write-through status: %s",
+                self.provider,
+                type(exc).__name__,
+            )
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
@@ -1143,23 +1249,39 @@ class CredentialPool:
                 if self.provider == "openai-codex"
                 else self._sync_xai_oauth_entry_from_pool_store
             )
+            root_path = self._shared_root_auth_path(entry)
+            if entry.extra.get("shared_root_source") and root_path is None:
+                logger.warning(
+                    "%s pool refresh: shared root access denied by policy",
+                    self.provider,
+                )
+                return None
             with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+                target_path=root_path,
             ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
                     if synced is not entry:
                         entry = synced
                         if not force and not self._entry_needs_refresh(entry):
-                            return entry
-                    return self._refresh_entry_impl(entry, force=force)
-                if (
+                            result = entry
+                        else:
+                            result = self._refresh_entry_impl(entry, force=force)
+                    else:
+                        result = self._refresh_entry_impl(entry, force=force)
+                elif (
                     synced.access_token != entry.access_token
                     or synced.refresh_token != entry.refresh_token
                 ):
-                    return synced
-                return self._refresh_entry_impl(synced, force=force)
-        return self._refresh_entry_impl(entry, force=force)
+                    result = synced
+                else:
+                    result = self._refresh_entry_impl(synced, force=force)
+            self._record_shared_write_through_status(result)
+            return result
+        result = self._refresh_entry_impl(entry, force=force)
+        self._record_shared_write_through_status(result)
+        return result
 
     def _single_use_refresh_lock_timeout(self) -> float:
         """Lock timeout for single-use-refresh-token providers.
@@ -2728,11 +2850,24 @@ def load_pool(provider: str) -> CredentialPool:
         )
         changed |= _normalize_pool_priorities(provider, entries)
 
+    if not provider.startswith(CUSTOM_POOL_PREFIX) and _singleton_is_root_sourced(
+        provider
+    ):
+        for entry in entries:
+            if entry.source == "device_code":
+                entry.extra["shared_root_source"] = True
+
     if changed:
         new_ids = {entry.id for entry in entries}
+        persisted_entries = _profile_owned_entries(entries)
         write_credential_pool(
             provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
+            [
+                entry.to_dict()
+                for entry in sorted(
+                    persisted_entries, key=lambda item: item.priority
+                )
+            ],
             removed_ids=disk_ids - new_ids,
         )
     return CredentialPool(provider, entries)

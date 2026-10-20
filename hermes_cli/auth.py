@@ -1515,7 +1515,12 @@ def read_credential_pool(
             existing = merged.get(gp_key)
             if isinstance(existing, list) and existing:
                 continue
-            merged[gp_key] = list(gp_entries)
+            merged[gp_key] = [
+                {**entry, "shared_root_source": True}
+                if isinstance(entry, dict)
+                else entry
+                for entry in gp_entries
+            ]
         return merged
 
     provider_entries = pool.get(provider_id)
@@ -1528,7 +1533,16 @@ def read_credential_pool(
     maybe_global_pool = global_store.get("credential_pool") if global_store else None
     global_pool = maybe_global_pool if isinstance(maybe_global_pool, dict) else {}
     global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    return (
+        [
+            {**entry, "shared_root_source": True}
+            if isinstance(entry, dict)
+            else entry
+            for entry in global_entries
+        ]
+        if isinstance(global_entries, list)
+        else []
+    )
 
 
 _POOL_STATUS_FIELDS = (
@@ -4477,7 +4491,7 @@ def _profile_has_own_xai_oauth_state(auth_store: Dict[str, Any]) -> bool:
     return isinstance(providers, dict) and isinstance(providers.get("xai-oauth"), dict)
 
 
-def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
+def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> bool:
     """Persist a rotated xAI OAuth ``state`` into the global-root auth.json.
 
     Best-effort write-through for the multi-profile rotation hazard (#43589):
@@ -4492,10 +4506,14 @@ def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
     failed write-through degrades to the pre-existing behavior (root stale),
     it must never break the profile's own successful save.
     """
-    global_path = _global_auth_file_path()
-    if global_path is None:
+    ungated_global_path = _global_auth_file_path()
+    if ungated_global_path is None:
         # Classic mode (profile == root); the profile save already hit root.
-        return
+        return True
+    global_path = _global_auth_file_path("xai-oauth")
+    if global_path is None:
+        logger.warning("xAI OAuth: shared root write-through denied by policy")
+        return False
     # Seat belt: under pytest, refuse to write the real user's
     # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
     # (mirrors the read-side guard in _load_global_auth_store). Uses the
@@ -4506,9 +4524,9 @@ def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
             real_root = Path(real_home_env) / ".hermes" / "auth.json"
             try:
                 if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return
+                    return False
             except Exception:
-                return
+                return False
     try:
         _persist_provider_state_to_store(
             "xai-oauth",
@@ -4516,8 +4534,10 @@ def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
             global_path,
             set_active=False,
         )
+        return True
     except Exception as exc:  # pragma: no cover - best effort
         logger.debug("xAI OAuth: write-through to global root failed: %s", exc)
+        return False
 
 
 def _save_xai_oauth_tokens(
@@ -4536,8 +4556,12 @@ def _save_xai_oauth_tokens(
         # grant through _load_provider_state's fallback. When such a profile
         # refreshes the (rotating) grant, we must write the rotated chain back
         # to root too, or root is left holding a revoked refresh token (#43589).
-        write_through_to_root = not _profile_has_own_xai_oauth_state(auth_store)
-        state = _load_provider_state(auth_store, "xai-oauth") or {}
+        state, source_path = _load_provider_state_with_source(auth_store, "xai-oauth")
+        state = state or {}
+        active_path = _auth_file_path()
+        root_sourced = source_path is not None and not _same_path(
+            source_path, active_path
+        )
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = auth_mode
@@ -4545,10 +4569,10 @@ def _save_xai_oauth_tokens(
             state["discovery"] = discovery
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
+        if root_sourced and _write_through_xai_oauth_to_global_root(state):
+            return
         _save_provider_state(auth_store, "xai-oauth", state)
         _save_auth_store(auth_store)
-        if write_through_to_root:
-            _write_through_xai_oauth_to_global_root(state)
 
 
 def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> bool:
@@ -6762,8 +6786,19 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
 def _credential_trust_status(provider_id: str) -> Dict[str, Any]:
     """Return non-secret provenance metadata for root credential inheritance."""
     status = describe_credential_trust(provider_id)
-    status["write_through_ok"] = None
     local_store = _load_auth_store()
+    inheritance_status = local_store.get("credential_inheritance_status")
+    provider_status = (
+        inheritance_status.get(provider_id)
+        if isinstance(inheritance_status, dict)
+        else None
+    )
+    status["write_through_ok"] = (
+        provider_status.get("write_through_ok")
+        if isinstance(provider_status, dict)
+        and isinstance(provider_status.get("write_through_ok"), bool)
+        else None
+    )
     providers = local_store.get("providers")
     pool = local_store.get("credential_pool")
     has_local = (

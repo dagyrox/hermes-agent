@@ -42,7 +42,7 @@ def profile_and_root(tmp_path, monkeypatch):
     root_path = tmp_path / "root" / "auth.json"
 
     monkeypatch.setattr(auth, "_auth_file_path", lambda: profile_path)
-    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda provider_id=None: root_path)
     # Keep the pytest write seat belt from matching our tmp root.
     monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
     return profile_path, root_path
@@ -75,9 +75,10 @@ def test_refresh_writes_through_to_root_when_profile_has_no_own_state(profile_an
     }
     auth._save_xai_oauth_tokens(rotated)
 
-    # Profile got the rotated chain (existing behavior).
+    # Root-owned state remains a reference; the profile must not materialize a
+    # local token shadow that can drift from later root rotations.
     profile = _read_store(profile_path)
-    assert profile["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "new-refresh"
+    assert not profile["providers"].get("xai-oauth")
 
     # AND the global root no longer holds the revoked refresh token (#43589).
     root = _read_store(root_path)
@@ -136,7 +137,7 @@ def test_write_through_is_noop_in_classic_mode(tmp_path, monkeypatch):
     profile_path = tmp_path / "auth.json"
     monkeypatch.setattr(auth, "_auth_file_path", lambda: profile_path)
     # Classic mode: _global_auth_file_path returns None.
-    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: None)
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda provider_id=None: None)
     _write_store(profile_path, {"version": 1, "providers": {}})
 
     # Should not raise and should persist to the single store.
