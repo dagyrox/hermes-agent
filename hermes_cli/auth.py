@@ -980,7 +980,7 @@ def _load_global_auth_store(provider_id: Optional[str] = None) -> Dict[str, Any]
     try:
         global_path = _global_auth_file_path(provider_id)
     except TypeError:
-        global_path = _global_auth_file_path()
+        return {}
     if global_path is None or not global_path.exists():
         return {}
     if os.environ.get("PYTEST_CURRENT_TEST"):
@@ -1288,15 +1288,15 @@ def _load_provider_state_with_source(
     try:
         global_path = _global_auth_file_path(provider_id)
     except TypeError:
-        # Backward compatibility for plugin/test doubles implementing the
-        # pre-policy no-argument helper contract.
-        global_path = _global_auth_file_path()
+        # A legacy test double/plugin cannot enforce the provider boundary.
+        # Fail closed instead of silently calling the ungated helper.
+        return None, None
     if global_path is None:
         return None, None
     try:
         global_store = _load_global_auth_store(provider_id)
     except TypeError:
-        global_store = _load_global_auth_store()
+        return None, None
     if global_store:
         global_providers = global_store.get("providers")
         if isinstance(global_providers, dict):
@@ -1308,16 +1308,36 @@ def _load_provider_state_with_source(
     return None, None
 
 
+def _set_inheritance_write_through_status(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+    ok: bool,
+) -> None:
+    """Record a non-secret inherited-write result in the profile store."""
+    statuses = auth_store.setdefault("credential_inheritance_status", {})
+    if not isinstance(statuses, dict):
+        statuses = {}
+        auth_store["credential_inheritance_status"] = statuses
+    statuses[provider_id] = {
+        "write_through_ok": bool(ok),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @contextmanager
-def _provider_state_transaction(provider_id: str):
+def _provider_state_transaction(
+    provider_id: str,
+    *,
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+):
     """Lock the active auth store and any global fallback source in order.
 
-    Profile-backed refresh paths must take the global auth-store lock before
-    any provider-specific shared-store lock. Re-reading the source after the
-    target lock is acquired prevents both stale refreshes and whole-file lost
-    updates without inverting the documented auth -> shared lock order.
+    Profile-backed refresh paths take the profile auth-store lock first, then
+    the root authority lock when the provider was inherited. Re-reading the
+    source after both are acquired prevents stale refreshes and whole-file
+    lost updates while preserving one deterministic lock order.
     """
-    with _auth_store_lock():
+    with _auth_store_lock(timeout_seconds=timeout_seconds):
         auth_store = _load_auth_store()
         state, source_path = _load_provider_state_with_source(
             auth_store,
@@ -1328,15 +1348,23 @@ def _provider_state_transaction(provider_id: str):
             yield auth_store, state, source_path
             return
 
-        with _auth_store_lock(target_path=source_path):
-            source_store = _load_auth_store(source_path)
-            source_providers = source_store.get("providers")
-            source_state = None
-            if isinstance(source_providers, dict):
-                raw_state = source_providers.get(provider_id)
-                if isinstance(raw_state, dict):
-                    source_state = dict(raw_state)
-            yield auth_store, source_state, source_path
+        try:
+            with _auth_store_lock(
+                timeout_seconds=timeout_seconds,
+                target_path=source_path,
+            ):
+                source_store = _load_auth_store(source_path)
+                source_providers = source_store.get("providers")
+                source_state = None
+                if isinstance(source_providers, dict):
+                    raw_state = source_providers.get(provider_id)
+                    if isinstance(raw_state, dict):
+                        source_state = dict(raw_state)
+                yield auth_store, source_state, source_path
+        except (OSError, TimeoutError):
+            _set_inheritance_write_through_status(auth_store, provider_id, False)
+            _save_auth_store(auth_store)
+            raise
 
 
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
@@ -3678,30 +3706,45 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
+def _store_codex_tokens_in_loaded_store(
+    auth_store: Dict[str, Any],
+    tokens: Dict[str, str],
+    last_refresh: str,
+    *,
+    label: Optional[str] = None,
+) -> None:
+    """Update one already-locked auth store with a complete Codex token chain."""
+    providers = auth_store.get("providers")
+    existing = providers.get("openai-codex") if isinstance(providers, dict) else None
+    state = dict(existing) if isinstance(existing, dict) else {}
+    previous_singleton_tokens = (
+        state.get("tokens") if isinstance(state.get("tokens"), dict) else None
+    )
+    state["tokens"] = tokens
+    state["last_refresh"] = last_refresh
+    state["auth_mode"] = "chatgpt"
+    if label and str(label).strip():
+        state["label"] = str(label).strip()
+    _save_provider_state(auth_store, "openai-codex", state)
+    _sync_codex_pool_entries(
+        auth_store,
+        tokens,
+        last_refresh,
+        previous_singleton_tokens=previous_singleton_tokens,
+    )
+
+
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _auth_store_lock():
         auth_store = _load_auth_store()
-        state = _load_provider_state(auth_store, "openai-codex") or {}
-        # Capture the previous singleton tokens BEFORE overwriting them.  The
-        # pool-sync step uses this to distinguish legacy singleton-aliases
-        # (which should be refreshed) from independent accounts that
-        # ``hermes auth add openai-codex`` created (which must not be
-        # overwritten — see #39236).
-        previous_singleton_tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else None
-        state["tokens"] = tokens
-        state["last_refresh"] = last_refresh
-        state["auth_mode"] = "chatgpt"
-        if label and str(label).strip():
-            state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
-        _sync_codex_pool_entries(
+        _store_codex_tokens_in_loaded_store(
             auth_store,
             tokens,
             last_refresh,
-            previous_singleton_tokens=previous_singleton_tokens,
+            label=label,
         )
         _save_auth_store(auth_store)
 
@@ -4049,10 +4092,28 @@ def resolve_codex_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
-        # Re-read under lock to avoid racing with other Hermes processes
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
-            data = _read_codex_tokens(_lock=False)
-            tokens = dict(data["tokens"])
+        # Serialize sync -> POST -> write-back on the authoritative store. A
+        # profile lock alone cannot protect a root-owned single-use grant from
+        # refreshes in another trusted profile.
+        with _provider_state_transaction(
+            "openai-codex",
+            timeout_seconds=max(
+                float(AUTH_LOCK_TIMEOUT_SECONDS),
+                refresh_timeout_seconds + 5.0,
+            ),
+        ) as (
+            profile_store,
+            state,
+            source_path,
+        ):
+            if not isinstance(state, dict) or not isinstance(state.get("tokens"), dict):
+                raise AuthError(
+                    "No Codex credentials stored. Run `hermes auth` to authenticate.",
+                    provider="openai-codex",
+                    code="codex_auth_missing",
+                    relogin_required=True,
+                )
+            tokens = dict(state["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
 
             should_refresh = bool(force_refresh)
@@ -4060,7 +4121,47 @@ def resolve_codex_runtime_credentials(
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
 
             if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                try:
+                    refreshed = refresh_codex_oauth_pure(
+                        str(tokens.get("access_token", "") or ""),
+                        str(tokens.get("refresh_token", "") or ""),
+                        timeout_seconds=refresh_timeout_seconds,
+                    )
+                    tokens["access_token"] = refreshed["access_token"]
+                    tokens["refresh_token"] = refreshed["refresh_token"]
+                except AuthError as exc:
+                    if not getattr(exc, "relogin_required", False):
+                        raise
+                    imported = _import_codex_cli_tokens()
+                    if not (
+                        imported
+                        and str(imported.get("access_token", "") or "").strip()
+                        and str(imported.get("refresh_token", "") or "").strip()
+                    ):
+                        raise
+                    tokens = dict(imported)
+                last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                active_path = _auth_file_path()
+                target_path = source_path or active_path
+                target_store = (
+                    profile_store
+                    if _same_path(target_path, active_path)
+                    else _load_auth_store(target_path)
+                )
+                _store_codex_tokens_in_loaded_store(
+                    target_store,
+                    tokens,
+                    last_refresh,
+                )
+                _save_auth_store(target_store, target_path=target_path)
+                if not _same_path(target_path, active_path):
+                    _set_inheritance_write_through_status(
+                        profile_store,
+                        "openai-codex",
+                        True,
+                    )
+                    _save_auth_store(profile_store)
+                data = {"tokens": tokens, "last_refresh": last_refresh}
                 access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (
@@ -4934,13 +5035,29 @@ def resolve_xai_oauth_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
     if should_refresh:
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
-            data = _read_xai_oauth_tokens(_lock=False)
-            tokens = dict(data["tokens"])
+        with _provider_state_transaction(
+            "xai-oauth",
+            timeout_seconds=max(
+                float(AUTH_LOCK_TIMEOUT_SECONDS),
+                refresh_timeout_seconds + 5.0,
+            ),
+        ) as (
+            profile_store,
+            state,
+            source_path,
+        ):
+            if not isinstance(state, dict) or not isinstance(state.get("tokens"), dict):
+                raise AuthError(
+                    "No xAI OAuth credentials stored. Run `hermes model` and select xAI OAuth.",
+                    provider="xai-oauth",
+                    code="xai_auth_missing",
+                    relogin_required=True,
+                )
+            tokens = dict(state["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
-            discovery = dict(data.get("discovery") or {})
+            discovery = dict(state.get("discovery") or {})
             token_endpoint = str(discovery.get("token_endpoint", "") or "").strip()
-            redirect_uri = str(data.get("redirect_uri", "") or "").strip()
+            redirect_uri = str(state.get("redirect_uri", "") or "").strip()
             effective_skew = (
                 int(refresh_skew_seconds)
                 if refresh_skew_seconds is not None
@@ -4952,13 +5069,52 @@ def resolve_xai_oauth_runtime_credentials(
             if should_refresh:
                 if not token_endpoint:
                     token_endpoint = _xai_oauth_discovery(refresh_timeout_seconds)["token_endpoint"]
+                active_path = _auth_file_path()
+                target_path = source_path or active_path
+                target_store = (
+                    profile_store
+                    if _same_path(target_path, active_path)
+                    else _load_auth_store(target_path)
+                )
                 try:
-                    tokens = _refresh_xai_oauth_tokens(
-                        tokens,
+                    refreshed = refresh_xai_oauth_pure(
+                        str(tokens.get("access_token", "") or ""),
+                        str(tokens.get("refresh_token", "") or ""),
                         token_endpoint=token_endpoint,
-                        redirect_uri=redirect_uri,
                         timeout_seconds=refresh_timeout_seconds,
                     )
+                    tokens["access_token"] = refreshed["access_token"]
+                    tokens["refresh_token"] = refreshed["refresh_token"]
+                    if refreshed.get("id_token"):
+                        tokens["id_token"] = refreshed["id_token"]
+                    if refreshed.get("expires_in") is not None:
+                        tokens["expires_in"] = refreshed["expires_in"]
+                    if refreshed.get("token_type"):
+                        tokens["token_type"] = refreshed["token_type"]
+                    updated_state = dict(state)
+                    updated_state["tokens"] = tokens
+                    updated_state["last_refresh"] = refreshed["last_refresh"]
+                    updated_state["auth_mode"] = str(
+                        state.get("auth_mode") or "oauth_device_code"
+                    )
+                    updated_state["discovery"] = {"token_endpoint": token_endpoint}
+                    if redirect_uri:
+                        updated_state["redirect_uri"] = redirect_uri
+                    _store_provider_state(
+                        target_store,
+                        "xai-oauth",
+                        updated_state,
+                        set_active=_same_path(target_path, active_path),
+                    )
+                    _save_auth_store(target_store, target_path=target_path)
+                    if not _same_path(target_path, active_path):
+                        _set_inheritance_write_through_status(
+                            profile_store,
+                            "xai-oauth",
+                            True,
+                        )
+                        _save_auth_store(profile_store)
+                    data = updated_state
                     access_token = str(tokens.get("access_token", "") or "").strip()
                 except AuthError as exc:
                     if _is_terminal_xai_oauth_refresh_error(exc):
@@ -4966,8 +5122,7 @@ def resolve_xai_oauth_runtime_credentials(
                         # Clear dead tokens from auth.json so subsequent sessions fail fast
                         # without a network retry. Mirrors credential_pool.py quarantine.
                         try:
-                            _q_store = _load_auth_store()
-                            _q_state = _load_provider_state(_q_store, "xai-oauth") or {}
+                            _q_state = dict(state)
                             _q_tokens = dict(_q_state.get("tokens") or {})
                             _q_tokens.pop("access_token", None)
                             _q_tokens.pop("refresh_token", None)
@@ -4980,8 +5135,13 @@ def resolve_xai_oauth_runtime_credentials(
                                 "relogin_required": True,
                                 "at": datetime.now(timezone.utc).isoformat(),
                             }
-                            _store_provider_state(_q_store, "xai-oauth", _q_state, set_active=False)
-                            _save_auth_store(_q_store)
+                            _store_provider_state(
+                                target_store,
+                                "xai-oauth",
+                                _q_state,
+                                set_active=False,
+                            )
+                            _save_auth_store(target_store, target_path=target_path)
                         except Exception as _save_exc:
                             logger.debug(
                                 "xAI OAuth: failed to persist quarantined state: %s", _save_exc,

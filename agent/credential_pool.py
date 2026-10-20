@@ -1443,7 +1443,10 @@ class CredentialPool:
                         last_error_reset_at=None,
                     )
                     self._replace_entry(synced, updated)
-                    self._persist()
+                    if not updated.extra.get("shared_root_source"):
+                        self._persist()
+                    else:
+                        updated.extra["write_through_ok"] = True
                     return updated
                 # Terminal error: auth.json has no newer tokens — the stored
                 # refresh_token is dead.  Clear it from auth.json so the next
@@ -1513,7 +1516,10 @@ class CredentialPool:
                         last_error_reset_at=None,
                     )
                     self._replace_entry(synced, updated)
-                    self._persist()
+                    if not updated.extra.get("shared_root_source"):
+                        self._persist()
+                    else:
+                        updated.extra["write_through_ok"] = True
                     return updated
                 # Terminal error: auth.json has no newer tokens — the stored
                 # refresh_token is dead.  Clear it from auth.json so the next
@@ -1643,7 +1649,11 @@ class CredentialPool:
             last_error_reset_at=None,
         )
         self._replace_entry(entry, updated)
-        self._persist()
+        # Root-sourced rows are runtime-only mirrors. Persisting the profile
+        # pool here would create a local shadow and invert the established
+        # profile -> root lock order while the root transaction is held.
+        if not updated.extra.get("shared_root_source"):
+            self._persist()
         # Sync refreshed tokens back to auth.json providers so that
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.

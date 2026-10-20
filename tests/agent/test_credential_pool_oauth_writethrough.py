@@ -109,6 +109,66 @@ def _multiprocess_refresh_worker(
     )
 
 
+def _multiprocess_runtime_refresh_worker(
+    root_home,
+    profile_name,
+    start_barrier,
+    finish_barrier,
+    consume_lock,
+    consumed,
+    post_count,
+    results,
+):
+    os.environ["HERMES_HOME"] = os.path.join(
+        root_home, "profiles", profile_name
+    )
+    os.environ["HERMES_PROFILE"] = profile_name
+    from hermes_constants import set_hermes_home_override
+
+    set_hermes_home_override(os.environ["HERMES_HOME"])
+
+    def fake_refresh(_access_token, refresh_token, **_kwargs):
+        with consume_lock:
+            if refresh_token in consumed:
+                raise A.AuthError(
+                    "refresh token reused",
+                    provider="openai-codex",
+                    code="refresh_token_reused",
+                    relogin_required=True,
+                )
+            consumed[refresh_token] = True
+            post_count.value += 1
+        return {
+            "access_token": _jwt_with_exp(int(time.time()) + 3600),
+            "refresh_token": "rotated-runtime-refresh",
+            "last_refresh": "2020-01-02T00:00:00Z",
+        }
+
+    A.refresh_codex_oauth_pure = fake_refresh
+    A._import_codex_cli_tokens = lambda: None
+    start_barrier.wait(timeout=10)
+    try:
+        resolved = A.resolve_codex_runtime_credentials(
+            refresh_if_expiring=True,
+            refresh_skew_seconds=0,
+        )
+        ok = bool(resolved.get("api_key"))
+    except Exception:
+        ok = False
+    finish_barrier.wait(timeout=10)
+    from pathlib import Path
+
+    profile_store = _read_store(
+        Path(root_home) / "profiles" / profile_name / "auth.json"
+    )
+    results.put(
+        bool(
+            ok
+            and not profile_store.get("providers", {}).get("openai-codex")
+        )
+    )
+
+
 @pytest.fixture
 def profile_and_root(tmp_path, monkeypatch):
     """Wire a profile auth store + a distinct global-root auth store on disk.
@@ -477,6 +537,78 @@ def test_inherited_codex_refresh_holds_root_lock_across_post(monkeypatch, tmp_pa
     assert profile["credential_inheritance_status"][provider]["write_through_ok"] is True
 
 
+def test_inherited_pool_refresh_does_not_invert_root_and_profile_locks(
+    monkeypatch, tmp_path
+):
+    provider = "openai-codex"
+    profile_path = tmp_path / "profiles" / "talos" / "auth.json"
+    root_path = tmp_path / "auth.json"
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "stale-access",
+                        "refresh_token": "stale-refresh",
+                    }
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(
+        A,
+        "_global_auth_file_path",
+        lambda provider_id=None: root_path,
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    stack = []
+    inversions = []
+    real_lock = A._auth_store_lock
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def tracking_lock(*args, **kwargs):
+        target = kwargs.get("target_path")
+        if target is None and root_path in stack:
+            inversions.append((tuple(stack), target))
+        stack.append(target)
+        try:
+            with real_lock(*args, **kwargs):
+                yield
+        finally:
+            stack.pop()
+
+    monkeypatch.setattr(A, "_auth_store_lock", tracking_lock)
+    monkeypatch.setattr(CP, "_auth_store_lock", tracking_lock)
+    monkeypatch.setattr(
+        A,
+        "refresh_codex_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2020-01-02T00:00:00Z",
+        },
+    )
+    entry = _entry(
+        provider,
+        id="shared-codex",
+        access_token="stale-access",
+        refresh_token="stale-refresh",
+    )
+    entry.extra["shared_root_source"] = True
+
+    refreshed = CredentialPool(provider, [entry])._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert inversions == []
+
+
 def test_failed_shared_write_through_is_recorded_without_local_shadow(
     monkeypatch, tmp_path
 ):
@@ -624,5 +756,86 @@ def test_two_profiles_racing_refresh_converge_under_root_lock(tmp_path):
     assert (
         root["providers"]["openai-codex"]["tokens"]["refresh_token"]
         == "rotated-refresh"
+    )
+
+
+def test_two_profiles_runtime_refresh_converges_under_root_lock(tmp_path):
+    """The singleton runtime path must serialize on the root authority too."""
+    from hermes_constants import get_default_hermes_root
+
+    root_home = get_default_hermes_root()
+    root_home.mkdir(parents=True, exist_ok=True)
+    profile_names = ("runtime-a", "runtime-b")
+    for profile_name in profile_names:
+        profile_home = root_home / "profiles" / profile_name
+        profile_home.mkdir(parents=True)
+        _write_store(profile_home / "auth.json", {"version": 1, "providers": {}})
+
+    (root_home / "config.yaml").write_text(
+        json.dumps(
+            {
+                "profiles": {
+                    "shared_credentials": {
+                        "enabled": True,
+                        "trusted_profiles": list(profile_names),
+                        "providers": ["openai-codex"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    expired_access = _jwt_with_exp(int(time.time()) - 3600)
+    _write_store(
+        root_home / "auth.json",
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": expired_access,
+                        "refresh_token": "initial-runtime-refresh",
+                    }
+                }
+            },
+        },
+    )
+
+    ctx = multiprocessing.get_context("fork")
+    manager = ctx.Manager()
+    start_barrier = ctx.Barrier(2)
+    finish_barrier = ctx.Barrier(2)
+    consume_lock = ctx.Lock()
+    consumed = manager.dict()
+    post_count = ctx.Value("i", 0)
+    results = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_multiprocess_runtime_refresh_worker,
+            args=(
+                str(root_home),
+                profile_name,
+                start_barrier,
+                finish_barrier,
+                consume_lock,
+                consumed,
+                post_count,
+                results,
+            ),
+        )
+        for profile_name in profile_names
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+
+    assert [process.exitcode for process in processes] == [0, 0]
+    assert [results.get(timeout=2) for _ in processes] == [True, True]
+    assert post_count.value == 1
+    root = _read_store(root_home / "auth.json")
+    assert (
+        root["providers"]["openai-codex"]["tokens"]["refresh_token"]
+        == "rotated-runtime-refresh"
     )
 
