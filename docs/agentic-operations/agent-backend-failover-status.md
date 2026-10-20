@@ -219,14 +219,58 @@ and compare-and-swap restart ownership.
 
 This is deliberately a clean, **unwired** checkpoint. `gateway/run.py` was not
 modified, so the disabled/default gateway behavior is byte-for-byte unchanged.
-The real default Slack `_run_agent` boundary still does not construct or drive
-this ledger; the Claude subscription path still lacks the turn-scoped
-gateway-owner MCP executor that must preserve the original approval callbacks;
-and the existing final-send producer does not yet bind its delivery-obligation
-transition to this coordinator acknowledgement. Those three pieces must land
-together with integration tests before B5 can be called implemented. This
-checkpoint therefore remains non-mergeable and must not be activated or
-represented as Issue #260 completion.
+The remaining B5 integration is four explicit, inseparable seams:
+
+1. `gateway/run.py:13758-13771,19814-19963` must construct and drive the ledger
+   at the real default Slack `_run_agent` turn boundary from one immutable
+   session/event/generation prompt, tool, media, and route snapshot.
+2. The Claude subscription leg needs a turn-scoped gateway-owner MCP executor
+   that preserves the original approval callbacks. Its approval/control replies
+   must bypass both active-turn guards and dispatch inline:
+   `gateway/platforms/base.py:4887-4944` and
+   `gateway/run.py:10965-11137`; it must not expose unrestricted native
+   Bash/Write or the default worker lifecycle prompt.
+3. The final platform producer must bind its send obligation and acknowledgement
+   to the ledger delivery claim around `gateway/run.py:14340-14380`, including
+   restart acceptance and the ambiguous-after-send crash boundary.
+4. Gateway lifecycle and transcript continuity must be reconciled explicitly.
+   `/stop` and `/new` at `gateway/run.py:11003-11030`, persistent lease loss and
+   stale-generation discard at `gateway/run.py:13772-13814`, and every equivalent
+   invalidation must cancel the ledger, revoke/terminate both the runtime child
+   and owner-MCP bridge, and fence late callbacks and delivery. The persistence
+   path at `gateway/run.py:14050-14380` must commit exactly one user row and one
+   assistant row and retain the effective backend for the following turn rather
+   than silently jumping to a cold primary.
+
+Those four seams must land together with integration tests before B5 can be
+called implemented. This checkpoint therefore remains non-mergeable and must
+not be activated or represented as Issue #260 completion.
+
+## B5 cycle-7 bounded ledger repair
+
+Talos card `t_c6524444` / run 538, coordinated by `t_45e68439`, closes two
+ledger defects from Athena review while deliberately leaving `gateway/run.py`
+untouched. `start_leg()` now requires the same frozen turn, rechecks every
+canonical bucket against the persisted row after owner/generation fencing, and
+returns a `FrozenLegDispatch` containing the exact persisted prompt, tool,
+media, and selected-leg JSON bytes and their bound digests. A post-plan nested
+mutation therefore fails before an attempt row is reserved, while an unchanged
+turn can dispatch only the bytes authorized by the ledger.
+
+`AttemptObservation` now enforces the replayable availability allowlist in its
+public constructor, so callers cannot self-certify refusal, partial output,
+tool activity, pending approval, timeout, cancellation, or arbitrary reasons as
+availability failures. `format_error` was removed because it is a deterministic
+request-format failure, not backend availability evidence. The legitimate
+allowlisted availability reasons remain replayable only before any blocking
+evidence. This bounded repair does not wire the four integration seams above and
+does not close B5.
+
+Fresh verification for run 538 passed 144 tests across the coordinator, CLI
+routing, worker, and MCP bridge files; both independent cycle-7 defect probes
+closed; the pinned run-499 acceptance remained 4/4; ruff and diff checks passed;
+and the Windows-footgun scan found no violations across 812 files. A diff from
+the pinned base confirms `gateway/run.py` is unchanged.
 
 ## Claude CLI provenance caveat
 

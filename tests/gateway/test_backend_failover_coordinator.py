@@ -98,10 +98,57 @@ def test_frozen_turn_detaches_nested_mutable_input_before_digest_and_persist(led
         ledger.plan(turn, owner="gateway:other")
 
 
+def test_start_leg_rejects_post_plan_nested_snapshot_mutation(ledger):
+    turn = _turn()
+    planned = ledger.plan(turn, owner="gateway:100")
+    turn.prompt["history"][0]["content"] = "rewritten after plan"
+    turn.tools[0]["function"]["name"] = "write_file"
+    turn.media[0]["sha256"] = "different"
+
+    with pytest.raises(ReplayDenied, match="snapshot diverged before dispatch"):
+        ledger.start_leg(
+            planned.coordinator_id,
+            0,
+            turn=turn,
+            owner="gateway:100",
+            generation=7,
+        )
+
+    assert ledger.debug_attempts(planned.coordinator_id) == []
+
+
+def test_start_leg_returns_the_exact_persisted_dispatch_bytes(ledger):
+    turn = _turn()
+    original_prompt = '{"history":[{"content":"hello","role":"user"}],"system":"fixed"}'
+    original_tools = '[{"function":{"name":"terminal"}}]'
+    original_media = '[{"path":"/tmp/image.png","sha256":"abc"}]'
+    original_leg = '{"kind":"api","model":"gpt-6.1-sol","provider":"openai-codex"}'
+    planned = ledger.plan(turn, owner="gateway:100")
+
+    dispatch = ledger.start_leg(
+        planned.coordinator_id,
+        0,
+        turn=turn,
+        owner="gateway:100",
+        generation=7,
+    )
+
+    assert dispatch.prompt_json == original_prompt
+    assert dispatch.tools_json == original_tools
+    assert dispatch.media_json == original_media
+    assert dispatch.leg_json == original_leg
+    assert dispatch.prompt_digest == turn.prompt_digest
+    assert dispatch.tool_digest == turn.tool_digest
+    assert dispatch.media_digest == turn.media_digest
+    assert dispatch.chain_digest == turn.chain_digest
+
+
 def test_only_pre_tool_pre_output_availability_failure_can_advance(ledger):
     turn = _turn()
     planned = ledger.plan(turn, owner="gateway:100")
-    ledger.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=7)
+    ledger.start_leg(
+        planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=7
+    )
     outcome = ledger.finish_leg(
         planned.coordinator_id,
         0,
@@ -150,8 +197,11 @@ def test_only_pre_tool_pre_output_availability_failure_can_advance(ledger):
     ],
 )
 def test_every_unsafe_failure_denies_replay(ledger, observation):
-    planned = ledger.plan(_turn(), owner="gateway:100")
-    ledger.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=7)
+    turn = _turn()
+    planned = ledger.plan(turn, owner="gateway:100")
+    ledger.start_leg(
+        planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=7
+    )
     outcome = ledger.finish_leg(
         planned.coordinator_id,
         0,
@@ -168,8 +218,11 @@ def test_every_unsafe_failure_denies_replay(ledger, observation):
 def test_restart_with_started_attempt_requires_manual_reconciliation(tmp_path):
     path = tmp_path / "failover.db"
     first = GatewayFailoverLedger(path)
-    planned = first.plan(_turn(), owner="gateway:100")
-    first.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=7)
+    turn = _turn()
+    planned = first.plan(turn, owner="gateway:100")
+    first.start_leg(
+        planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=7
+    )
 
     restarted = GatewayFailoverLedger(path)
     recovered = restarted.recover(
@@ -190,8 +243,11 @@ def test_restart_with_started_attempt_requires_manual_reconciliation(tmp_path):
 def test_failed_restart_claim_persists_reconciliation_before_raising(tmp_path):
     path = tmp_path / "failover.db"
     first = GatewayFailoverLedger(path)
-    planned = first.plan(_turn(), owner="gateway:100")
-    first.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=7)
+    turn = _turn()
+    planned = first.plan(turn, owner="gateway:100")
+    first.start_leg(
+        planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=7
+    )
 
     restarted = GatewayFailoverLedger(path)
     with pytest.raises(ReplayDenied, match="unfinished attempt"):
@@ -208,12 +264,17 @@ def test_failed_restart_claim_persists_reconciliation_before_raising(tmp_path):
 
 
 def test_generation_and_owner_fence_every_transition(ledger):
-    planned = ledger.plan(_turn(), owner="gateway:100")
+    turn = _turn()
+    planned = ledger.plan(turn, owner="gateway:100")
 
     with pytest.raises(OwnershipLost, match="generation"):
-        ledger.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=8)
+        ledger.start_leg(
+            planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=8
+        )
     with pytest.raises(OwnershipLost, match="owner"):
-        ledger.start_leg(planned.coordinator_id, 0, owner="gateway:200", generation=7)
+        ledger.start_leg(
+            planned.coordinator_id, 0, turn=turn, owner="gateway:200", generation=7
+        )
     with pytest.raises(OwnershipLost, match="owner"):
         ledger.recover(planned.coordinator_id, owner="gateway:200", generation=7)
     with pytest.raises(OwnershipLost, match="generation"):
@@ -228,12 +289,17 @@ def test_generation_and_owner_fence_every_transition(ledger):
 
     ledger.cancel(planned.coordinator_id, owner="gateway:100", generation=7)
     with pytest.raises(ReplayDenied, match="cancelled"):
-        ledger.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=7)
+        ledger.start_leg(
+            planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=7
+        )
 
 
 def test_cancelled_turn_rejects_late_finish(ledger):
-    planned = ledger.plan(_turn(), owner="gateway:100")
-    ledger.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=7)
+    turn = _turn()
+    planned = ledger.plan(turn, owner="gateway:100")
+    ledger.start_leg(
+        planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=7
+    )
     ledger.cancel(planned.coordinator_id, owner="gateway:100", generation=7)
 
     with pytest.raises(ReplayDenied, match="running state"):
@@ -263,11 +329,55 @@ def test_availability_factory_cannot_self_certify_blocked_failures(reason):
         AttemptObservation.availability_failure(reason)
 
 
+@pytest.mark.parametrize(
+    ("reason", "evidence"),
+    [
+        ("refusal", {}),
+        ("partial_output", {"partial_output": True}),
+        ("tool_activity", {"tool_activity": True}),
+        ("pending_approval", {"pending_approval": True}),
+        ("timeout", {"timed_out": True}),
+        ("cancellation", {"cancelled": True}),
+        ("format_error", {}),
+    ],
+)
+def test_public_constructor_cannot_self_certify_nonavailability_reason(
+    reason, evidence
+):
+    with pytest.raises(ValueError, match="not a replayable availability failure"):
+        AttemptObservation(
+            outcome="failure",
+            reason=reason,
+            is_availability_failure=True,
+            **evidence,
+        )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "auth",
+        "auth_permanent",
+        "billing",
+        "model_not_found",
+        "overloaded",
+        "rate_limit",
+        "server_error",
+        "upstream_rate_limit",
+    ],
+)
+def test_legitimate_availability_reasons_remain_replayable(reason):
+    assert AttemptObservation.availability_failure(reason).replayable is True
+
+
 def test_final_delivery_can_be_claimed_exactly_once_across_restart(tmp_path):
     path = tmp_path / "failover.db"
     first = GatewayFailoverLedger(path)
-    planned = first.plan(_turn(), owner="gateway:100")
-    first.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=7)
+    turn = _turn()
+    planned = first.plan(turn, owner="gateway:100")
+    first.start_leg(
+        planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=7
+    )
     first.finish_leg(
         planned.coordinator_id,
         0,
@@ -301,8 +411,11 @@ def test_final_delivery_can_be_claimed_exactly_once_across_restart(tmp_path):
 def test_restart_before_delivery_accepts_completed_output(tmp_path):
     path = tmp_path / "failover.db"
     first = GatewayFailoverLedger(path)
-    planned = first.plan(_turn(), owner="gateway:100")
-    first.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=7)
+    turn = _turn()
+    planned = first.plan(turn, owner="gateway:100")
+    first.start_leg(
+        planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=7
+    )
     first.finish_leg(
         planned.coordinator_id,
         0,
@@ -329,8 +442,11 @@ def test_restart_before_delivery_accepts_completed_output(tmp_path):
 
 
 def test_confirmed_delivery_is_terminal_and_not_claimable_again(ledger):
-    planned = ledger.plan(_turn(), owner="gateway:100")
-    ledger.start_leg(planned.coordinator_id, 0, owner="gateway:100", generation=7)
+    turn = _turn()
+    planned = ledger.plan(turn, owner="gateway:100")
+    ledger.start_leg(
+        planned.coordinator_id, 0, turn=turn, owner="gateway:100", generation=7
+    )
     ledger.finish_leg(
         planned.coordinator_id,
         0,
