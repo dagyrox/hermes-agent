@@ -195,6 +195,39 @@ reconciliation contract, and exactly-once delivery acceptance are not
 implemented here. No credential mutation, activation, merge, deploy, restart,
 or provider call was performed.
 
+## B5 coordinator-state checkpoint run 531
+
+Talos card `t_c6524444`, coordinated by `t_45e68439`, adds an isolated durable
+gateway failover state machine in `gateway/backend_failover.py` with behavioral
+coverage in `tests/gateway/test_backend_failover_coordinator.py`. The ledger
+freezes and persists the same session, conversation, event generation, prompt,
+tool schema, media, and route snapshots; fences transitions by owner and
+generation; allows advancement only after an explicitly classified pre-tool and
+pre-output availability failure; records one attempt per leg; and denies replay
+after refusal, partial output, tool activity, pending approval, timeout,
+cancellation, an unclassified failure, or an unfinished attempt. Restart tests
+cover unfinished-attempt reconciliation, accepting a completed response before
+delivery, and converting a crash after the one-time delivery claim into an
+ambiguous/manual-reconciliation state instead of silently redelivering.
+The final focused run passed 127 tests across the coordinator, CLI routing,
+worker, and MCP bridge files; the pinned run-499 acceptance probe passed 4/4,
+and the Windows footgun scan passed all 812 scanned files. Independent review
+also drove fail-closed fixes for nested post-freeze mutation, terminal-state
+overwrite, durable reconciliation before exceptions, event-generation
+exclusivity, malformed-success rejection, availability-reason allowlisting,
+and compare-and-swap restart ownership.
+
+This is deliberately a clean, **unwired** checkpoint. `gateway/run.py` was not
+modified, so the disabled/default gateway behavior is byte-for-byte unchanged.
+The real default Slack `_run_agent` boundary still does not construct or drive
+this ledger; the Claude subscription path still lacks the turn-scoped
+gateway-owner MCP executor that must preserve the original approval callbacks;
+and the existing final-send producer does not yet bind its delivery-obligation
+transition to this coordinator acknowledgement. Those three pieces must land
+together with integration tests before B5 can be called implemented. This
+checkpoint therefore remains non-mergeable and must not be activated or
+represented as Issue #260 completion.
+
 ## Claude CLI provenance caveat
 
 A prior run reported that the installed Claude CLI changed despite the original restriction against updating the active binary. Athena's pinned-head review observed version/package `2.1.304`, executable mtime `2026-10-19T22:54:36Z`, and package mtime `2026-10-19T22:54:28Z`; the older `2.1.81` observation was stale. The provenance and operational impact require independent review. Do not repeat an install/update as part of checkpoint review.
