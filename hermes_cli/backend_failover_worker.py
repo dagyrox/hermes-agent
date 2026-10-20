@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from hermes_cli.backend_failover import (
     BackendLeg,
@@ -63,9 +63,9 @@ _PROFILE_TOOLS = ("skills_list", "skill_view")
 _ORCHESTRATOR_TOOLS = ("kanban_list", "kanban_create", "kanban_link")
 _CLAUDE_TOOLSETS = {
     "read_only": frozenset({"file", "kanban", "skills", "vision", "web"}),
-    "orchestrator": frozenset({"delegation", "file", "kanban", "skills", "vision", "web"}),
+    "orchestrator": frozenset({"file", "kanban", "skills", "vision", "web"}),
     "full": frozenset({
-        "file", "kanban", "skills", "vision", "web",
+        "code_execution", "file", "kanban", "skills", "terminal", "vision", "web",
     }),
 }
 _CLAUDE_CONTEXT_CHAR_LIMIT = 600_000
@@ -101,13 +101,53 @@ def _load_chain(profile: str, raw_chain: str | None = None) -> tuple[BackendLeg,
     return load_profile_chain(profile, os.environ.get("HERMES_HOME"))
 
 
+def _validate_dispatch_context(
+    args: argparse.Namespace,
+    *,
+    profile_resolver: Callable[[str], str] | None = None,
+) -> Path:
+    """Resolve and verify the dispatcher-owned assignee identity without writes."""
+
+    resolver = profile_resolver
+    if resolver is None:
+        from hermes_cli.profiles import resolve_profile_env
+
+        resolver = resolve_profile_env
+    if os.environ.get("HERMES_KANBAN_TASK") != args.task:
+        raise RuntimeError("task argument does not match dispatcher-owned task")
+    if os.environ.get("HERMES_PROFILE") != args.profile:
+        raise RuntimeError("profile argument does not match dispatcher-owned profile")
+    run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not run_id.isdigit():
+        raise RuntimeError("dispatcher-owned run identity is missing or invalid")
+    configured_home = (os.environ.get("HERMES_HOME") or "").strip()
+    if not configured_home:
+        raise RuntimeError("dispatcher-owned profile home is missing")
+
+    expected = Path(resolver(args.profile)).expanduser()
+    if not expected.is_dir():
+        raise RuntimeError(f"assignee profile home does not exist: {expected}")
+    actual = Path(configured_home).expanduser()
+    if not actual.is_dir():
+        raise RuntimeError(f"dispatcher profile home does not exist: {actual}")
+    if actual.resolve() != expected.resolve():
+        raise RuntimeError("dispatcher profile home does not match the assignee profile")
+    soul_path = expected / "SOUL.md"
+    try:
+        soul = soul_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"assignee profile identity is missing: {soul_path}") from exc
+    if not soul:
+        raise RuntimeError(f"assignee profile identity is empty: {soul_path}")
+    return expected.resolve()
+
+
 def _task_status(task_id: str) -> str:
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_db_connect import connect
 
     raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
     expected = int(raw_run_id) if raw_run_id.isdigit() else None
-    with connect(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
+    with kb.connect_closing(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
         task = kb.get_task(conn, task_id)
         if task is None:
             return "missing"
@@ -118,11 +158,10 @@ def _task_status(task_id: str) -> str:
 
 def _comment(task_id: str, body: str) -> bool:
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_db_connect import connect
 
     raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
     expected = int(raw_run_id) if raw_run_id.isdigit() else None
-    with connect(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
+    with kb.connect_closing(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
         task = kb.get_task(conn, task_id)
         if task is None or task.status != "running":
             return False
@@ -134,11 +173,10 @@ def _comment(task_id: str, body: str) -> bool:
 
 def _block_task(task_id: str, reason: str) -> bool:
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_db_connect import connect
 
     raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
     expected = int(raw_run_id) if raw_run_id.isdigit() else None
-    with connect(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
+    with kb.connect_closing(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
         return kb.block_task(
             conn,
             task_id,
@@ -197,7 +235,7 @@ def _claude_cli_compatible(model: str, env: dict[str, str]) -> bool:
     )
 
 
-def _leg_available(leg: BackendLeg) -> bool:
+def _leg_available(leg: BackendLeg, profile_home: Path | None = None) -> bool:
     """Preflight local auth/runtime availability without making a model call."""
     if leg.kind == "claude_code":
         if not shutil.which("claude"):
@@ -222,12 +260,31 @@ def _leg_available(leg: BackendLeg) -> bool:
             return False
 
     try:
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            is_multiplex_active,
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        resolved = resolve_runtime_provider(
-            requested=leg.provider,
-            target_model=leg.model,
-        )
+        if profile_home is None:
+            raise RuntimeError("API availability requires a validated assignee profile home")
+        previous_multiplex = is_multiplex_active()
+        home_token = set_hermes_home_override(profile_home)
+        scope_token = set_secret_scope(build_profile_secret_scope(profile_home))
+        set_multiplex_active(True)
+        try:
+            resolved = resolve_runtime_provider(
+                requested=leg.provider,
+                target_model=leg.model,
+            )
+        finally:
+            set_multiplex_active(previous_multiplex)
+            reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
         return bool(resolved.get("base_url") and resolved.get("api_key"))
     except Exception:
         return False
@@ -247,13 +304,35 @@ def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[s
     return tuple(sorted(missing))
 
 
+def _effective_context_chars(
+    task_id: str,
+    *,
+    declared_chars: int,
+    system_prompt_path: Path | None,
+) -> int:
+    """Measure the durable handoff plus loaded prompt, not only title/body."""
+
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing(board=os.environ.get("HERMES_KANBAN_BOARD")) as conn:
+        worker_context = kb.build_worker_context(conn, task_id)
+    system_chars = 0
+    if system_prompt_path is not None:
+        system_chars = len(system_prompt_path.read_text(encoding="utf-8"))
+    task_prompt_chars = len(f"work kanban task {task_id}")
+    return max(
+        int(declared_chars or 0),
+        len(worker_context) + system_chars + task_prompt_chars,
+    )
+
+
 def _terminate_child_tree(proc: subprocess.Popen[str]) -> None:
     """Boundedly stop a supervised runtime and any MCP/tool descendants."""
     if proc.poll() is not None:
         return
     try:
         if os.name != "nt":
-            os.killpg(proc.pid, signal.SIGTERM)
+            os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only branch
         else:
             proc.terminate()
         proc.wait(timeout=5)
@@ -262,7 +341,7 @@ def _terminate_child_tree(proc: subprocess.Popen[str]) -> None:
         pass
     try:
         if os.name != "nt":
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only branch
         else:
             proc.kill()
         proc.wait(timeout=5)
@@ -339,6 +418,7 @@ def _leg_command(
             "-p",
             args.profile,
             "--cli",
+            "--accept-hooks",
             "-m",
             leg.model,
             "--provider",
@@ -348,6 +428,9 @@ def _leg_command(
             cmd.extend(["--reasoning-effort", leg.reasoning_effort])
         for skill in getattr(args, "skill", ()):
             cmd.extend(["--skills", skill])
+        required_toolsets = list(getattr(args, "required_toolset", ()) or ())
+        if required_toolsets:
+            cmd.extend(["--toolsets", ",".join(required_toolsets)])
         # Quiet mode propagates classified pre-tool provider failures as exit
         # 75 so the supervisor can advance rather than treating CLI exit 0 as
         # a successful task execution.
@@ -362,15 +445,16 @@ def _leg_command(
     if "web" in set(getattr(args, "required_toolset", ()) or ()):
         builtins.extend(["WebFetch", "WebSearch"])
     if leg.capability_mode == "full":
-        # Restricted-mode file tools are confined to the workspace. Bash is
-        # intentionally absent: it could bypass the task-scoped MCP fence by
-        # invoking the Hermes CLI or opening the board database directly.
-        builtins.extend(["Edit", "Write"])
+        # Claude's restricted sandbox confines file and shell execution to the
+        # assigned workspace. The child environment omits Kanban identity and
+        # credentials; lifecycle mutation remains available only through the
+        # task-fenced MCP server.
+        builtins.extend(["Edit", "Write", "Bash"])
     allowed = ["Read", "Glob", "Grep"]
     if "web" in set(getattr(args, "required_toolset", ()) or ()):
         allowed.extend(["WebFetch", "WebSearch"])
     if leg.capability_mode == "full":
-        allowed.extend(["Edit", "Write"])
+        allowed.extend(["Edit", "Write", "Bash"])
     allowed.extend(f"mcp__hermes-tools__{name}" for name in _LIFECYCLE_TOOLS)
     allowed.extend(f"mcp__hermes-tools__{name}" for name in _PROFILE_TOOLS)
     if leg.capability_mode == "orchestrator":
@@ -595,7 +679,13 @@ def _run_leg(
         ):
             return 0
         return EXIT_ELIGIBLE
-    if not _leg_available(leg):
+    profile_home = getattr(args, "profile_home", None)
+    available = (
+        _leg_available(leg, profile_home)
+        if profile_home is not None
+        else _leg_available(leg)
+    )
+    if not available:
         return EXIT_ELIGIBLE
     if not _comment(
         args.task,
@@ -641,10 +731,8 @@ def _run_leg(
 
 def run(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
-    if os.environ.get("HERMES_KANBAN_TASK") not in {None, "", args.task}:
-        raise RuntimeError("task argument does not match dispatcher-owned task")
-    if os.environ.get("HERMES_PROFILE") not in {None, "", args.profile}:
-        raise RuntimeError("profile argument does not match dispatcher-owned profile")
+    profile_home = _validate_dispatch_context(args)
+    args.profile_home = profile_home
     legs = (
         _load_chain(args.profile, args.chain_json)
         if args.chain_json
@@ -682,7 +770,6 @@ def run(argv: list[str] | None = None) -> int:
             return prior_returncode
     resume_index = len(attempts)
 
-    profile_home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     needs_claude = any(leg.kind == "claude_code" for leg in legs)
     mcp_path = _mcp_config(profile_home, args.task, args.profile) if needs_claude else None
     system_path = (
@@ -690,6 +777,12 @@ def run(argv: list[str] | None = None) -> int:
         if needs_claude
         else None
     )
+    if needs_claude:
+        args.required_context_chars = _effective_context_chars(
+            args.task,
+            declared_chars=args.required_context_chars,
+            system_prompt_path=system_path,
+        )
     deadline = (
         time.monotonic() + args.timeout_seconds
         if args.timeout_seconds > 0

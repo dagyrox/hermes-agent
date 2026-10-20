@@ -63,9 +63,15 @@ Independent review identified four unresolved blocker classes. This publication 
 
 The work packet describes event-driven continuation through persisted Kanban transitions. The current checkpoint does not demonstrate that full coordinator wake path. Slack is only a notification surface; no Slack subscription or message proves Kanban continuation, acknowledgement, or next-leg execution. This Slack-versus-Kanban integration remains uncovered end to end.
 
+## Bounded repair run 498
+
+Talos repair card `t_d298814c` separated dispatcher-owned route configuration from assignee-owned tool configuration, preserved `--accept-hooks` and the exact `--toolsets` pin on supervised API children, and made missing or mismatched task/run/profile/SOUL identity fail closed before scratch MCP or prompt artifacts are created. API availability and `backend-status` now resolve against an isolated assignee-profile secret scope rather than inherited supervisor credentials. The Windows-footgun checker annotations cover both new guarded process-group calls and the inherited guarded dispatcher ownership call.
+
+These repairs address B1, B2, B3's profile-only/supervisor-only credential cases, and B6's static checker. B3's shared-root credential inheritance modes remain coordinated with open PR #13 and are not claimed here. B4 now gives the Claude `full` route restricted workspace shell execution, measures the durable worker handoff plus loaded system prompt, and rejects the unimplemented `delegate_task` surface rather than advertising it; API capability evidence and live image/orchestration acceptance remain unresolved. B5 remains unresolved because the shipping Slack/default gateway path still uses legacy in-process fallback rather than the cross-runtime supervisor, and no persisted coordinator acknowledgement acceptance run exists. This remains an incomplete checkpoint, not a merge or activation candidate.
+
 ## Claude CLI provenance caveat
 
-A prior run reported that the installed Claude CLI changed despite the original restriction against updating the active binary. The latest Talos report observed version `2.1.81` and package/binary modification times associated with run 490, but did not perform another update. The provenance and operational impact require independent review. Do not repeat an install/update as part of checkpoint review.
+A prior run reported that the installed Claude CLI changed despite the original restriction against updating the active binary. Athena's pinned-head review observed version/package `2.1.304`, executable mtime `2026-10-19T22:54:36Z`, and package mtime `2026-10-19T22:54:28Z`; the older `2.1.81` observation was stale. The provenance and operational impact require independent review. Do not repeat an install/update as part of checkpoint review.
 
 ## Required next owner and gates
 

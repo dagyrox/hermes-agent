@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -114,13 +115,64 @@ def test_api_leg_command_pins_provider_model_and_disables_nested_chain(monkeypat
     from hermes_cli import backend_failover_worker as worker
 
     monkeypatch.setattr(worker, "_resolve_hermes_argv", lambda: ["/opt/hermes"])
-    args = argparse.Namespace(profile="talos", task="t_probe", timeout_seconds=600)
+    args = argparse.Namespace(
+        profile="talos",
+        task="t_probe",
+        timeout_seconds=600,
+        required_toolset=["terminal", "file"],
+    )
     cmd, env = worker._leg_command(_leg(), args, {}, None, None)
 
-    assert cmd[:6] == ["/opt/hermes", "-p", "talos", "--cli", "-m", "gpt-6.1-sol"]
+    assert cmd[:5] == ["/opt/hermes", "-p", "talos", "--cli", "--accept-hooks"]
+    assert cmd[cmd.index("-m") + 1] == "gpt-6.1-sol"
     assert cmd[cmd.index("--provider") + 1] == "openai-codex"
+    assert "--accept-hooks" in cmd
+    assert cmd[cmd.index("--toolsets") + 1] == "terminal,file"
     assert cmd[-4:] == ["chat", "-q", "work kanban task t_probe", "-Q"]
     assert env["HERMES_BACKEND_FAILOVER_CHILD"] == "1"
+
+
+def test_dispatch_context_requires_existing_matching_profile_without_creating_identity(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import backend_failover_worker as worker
+
+    missing_home = tmp_path / "profiles" / "talos"
+    monkeypatch.setenv("HERMES_HOME", str(missing_home))
+    monkeypatch.setenv("HERMES_PROFILE", "talos")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+
+    with pytest.raises(RuntimeError, match="does not exist"):
+        worker._validate_dispatch_context(
+            argparse.Namespace(profile="talos", task="t_probe"),
+            profile_resolver=lambda _profile: str(missing_home),
+        )
+
+    assert not missing_home.exists()
+
+
+def test_dispatch_context_rejects_mismatched_home_before_artifacts(tmp_path, monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    expected = tmp_path / "profiles" / "talos"
+    wrong = tmp_path / "profiles" / "dispatcher"
+    expected.mkdir(parents=True)
+    wrong.mkdir(parents=True)
+    (expected / "SOUL.md").write_text("Talos", encoding="utf-8")
+    (wrong / "SOUL.md").write_text("Dispatcher", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(wrong))
+    monkeypatch.setenv("HERMES_PROFILE", "talos")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        worker._validate_dispatch_context(
+            argparse.Namespace(profile="talos", task="t_probe"),
+            profile_resolver=lambda _profile: str(expected),
+        )
+
+    assert not (wrong / "cache").exists()
 
 
 def test_task_specific_capability_gate_rejects_unsupported_claude_surface():
@@ -203,6 +255,31 @@ def test_backend_child_environments_do_not_inherit_unrelated_secrets():
     assert not ({"AWS_ACCESS_KEY_ID", "DATABASE_URL", "GITHUB_PAT", "OPENAI_API_KEY"} & api.keys())
 
 
+def test_api_availability_uses_profile_secret_not_supervisor_environment(tmp_path, monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    (profile / ".env").write_text("DEEPSEEK_API_KEY=profile-only\n", encoding="utf-8")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    assert worker._leg_available(
+        _leg(provider="deepseek", model="deepseek-flash"), profile
+    )
+
+
+def test_api_availability_rejects_supervisor_only_secret(tmp_path, monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "supervisor-only")
+
+    assert not worker._leg_available(
+        _leg(provider="deepseek", model="deepseek-flash"), profile
+    )
+
+
 def test_claude_review_leg_cannot_mutate_workspace(tmp_path):
     from hermes_cli import backend_failover_worker as worker
     from hermes_cli.backend_failover import BackendLeg
@@ -220,7 +297,7 @@ def test_claude_review_leg_cannot_mutate_workspace(tmp_path):
     assert not {"Edit", "Write", "Bash"}.intersection(allowed)
 
 
-def test_claude_full_leg_has_exact_workspace_write_surface_without_shell(tmp_path):
+def test_claude_full_leg_has_restricted_workspace_execution_surface(tmp_path):
     from hermes_cli import backend_failover_worker as worker
     from hermes_cli.backend_failover import BackendLeg
 
@@ -233,14 +310,15 @@ def test_claude_full_leg_has_exact_workspace_write_surface_without_shell(tmp_pat
         tmp_path / "system.md",
     )
     tools = cmd[cmd.index("--tools") + 1]
-    assert tools == "Read,Glob,Grep,Edit,Write"
+    assert tools == "Read,Glob,Grep,Edit,Write,Bash"
     allowed = cmd[cmd.index("--allowedTools") + 1 : cmd.index("--")]
-    assert "Bash" not in allowed
+    assert "Bash" in allowed
+    assert "--restricted" in cmd
     assert cmd[cmd.index("--permission-mode") + 1] == "auto"
     assert cmd[cmd.index("--permission-prompts") + 1] == "none"
 
 
-def test_task_specific_capability_gate_skips_claude_when_execution_is_required():
+def test_task_specific_capability_gate_accepts_restricted_claude_execution():
     from hermes_cli import backend_failover_worker as worker
 
     args = argparse.Namespace(
@@ -250,7 +328,66 @@ def test_task_specific_capability_gate_skips_claude_when_execution_is_required()
     missing = worker._capability_mismatches(
         _leg(kind="claude_code", provider=None, capability_mode="full"), args
     )
-    assert missing == ("toolset:code_execution", "toolset:terminal")
+    assert missing == ()
+
+
+def test_claude_orchestrator_rejects_unavailable_delegate_task():
+    from hermes_cli import backend_failover_worker as worker
+
+    args = argparse.Namespace(required_toolset=["delegation"], required_context_chars=1)
+    assert worker._capability_mismatches(
+        _leg(kind="claude_code", provider=None, capability_mode="orchestrator"),
+        args,
+    ) == ("toolset:delegation",)
+
+
+def test_effective_context_size_includes_durable_handoff_and_system_prompt(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import backend_failover_worker as worker
+
+    system_prompt = tmp_path / "system.md"
+    system_prompt.write_text("system-prompt", encoding="utf-8")
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.connect_closing",
+        lambda **_kwargs: _Conn(),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.build_worker_context",
+        lambda _conn, _task: "parent-handoff-and-comments",
+    )
+
+    measured = worker._effective_context_chars(
+        "t_probe", declared_chars=1, system_prompt_path=system_prompt
+    )
+    assert measured > len("parent-handoff-and-comments")
+
+
+def test_workspace_execution_path_runs_real_edit_and_test(tmp_path):
+    from hermes_cli import backend_failover_worker as worker
+
+    result = worker._run_child(
+        [
+            "bash",
+            "-lc",
+            "printf 'ok\\n' > artifact.txt && test \"$(cat artifact.txt)\" = ok",
+        ],
+        cwd=str(tmp_path),
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0
+    assert (tmp_path / "artifact.txt").read_text(encoding="utf-8") == "ok\n"
 
 
 @pytest.mark.parametrize(
@@ -484,6 +621,7 @@ def test_worker_stops_without_replay_when_child_reports_ambiguous(monkeypatch):
     monkeypatch.setattr(worker, "_run_leg", lambda leg, *_args, **_kwargs: attempted.append(leg.model) or EXIT_AMBIGUOUS)
     monkeypatch.setattr(worker, "_task_status", lambda _task: "running")
     monkeypatch.setattr(worker, "_block_task", lambda task, reason: blocked.append((task, reason)))
+    monkeypatch.setattr(worker, "_validate_dispatch_context", lambda _args: Path("/tmp"))
 
     rc = worker.run(["--profile", "talos", "--task", "t_probe", "--timeout-seconds", "60"])
     assert rc == EXIT_AMBIGUOUS
@@ -503,6 +641,7 @@ def test_worker_exhaustion_blocks_with_all_three_attempts(monkeypatch):
     monkeypatch.setattr(worker, "_task_status", lambda _task: "running")
     monkeypatch.setattr(worker, "_comment", lambda *_args: True)
     monkeypatch.setattr(worker, "_block_task", lambda task, reason: blocked.append((task, reason)))
+    monkeypatch.setattr(worker, "_validate_dispatch_context", lambda _args: Path("/tmp"))
 
     rc = worker.run(["--profile", "talos", "--task", "t_probe", "--timeout-seconds", "60"])
     assert rc == EXIT_ELIGIBLE
@@ -562,6 +701,7 @@ def test_worker_refusal_blocks_without_restart_or_fallback(monkeypatch):
     monkeypatch.setattr(
         worker, "_block_task", lambda task, reason: blocked.append((task, reason))
     )
+    monkeypatch.setattr(worker, "_validate_dispatch_context", lambda _args: Path("/tmp"))
 
     rc = worker.run(
         ["--profile", "talos", "--task", "t_probe", "--timeout-seconds", "60"]
@@ -581,5 +721,9 @@ def test_dispatcher_selects_supervisor_only_for_enabled_role(monkeypatch):
         if profile == "talos"
         else (),
     )
-    assert kb._backend_failover_worker_argv(task, "talos", "/profiles/talos") is not None
-    assert kb._backend_failover_worker_argv(task, "athena", "/profiles/athena") is None
+    assert kb._backend_failover_worker_argv(
+        task, "talos", "/dispatcher", "/profiles/talos"
+    ) is not None
+    assert kb._backend_failover_worker_argv(
+        task, "athena", "/dispatcher", "/profiles/athena"
+    ) is None

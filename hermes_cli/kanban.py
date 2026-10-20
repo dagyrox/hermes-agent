@@ -1493,55 +1493,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _backend_leg_available(profile: str, leg: Any) -> bool:
     """Best-effort, secret-free readiness probe for backend-status."""
-    if leg.kind == "claude_code":
-        import shutil
-        import subprocess
-
-        from hermes_cli.backend_failover_worker import _claude_cli_compatible
-
-        binary = shutil.which("claude")
-        if not binary:
-            return False
-        probe_env = dict(os.environ)
-        for key in (
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_CUSTOM_HEADERS",
-        ):
-            probe_env.pop(key, None)
-        if not _claude_cli_compatible(leg.model, probe_env):
-            return False
-        try:
-            check = subprocess.run(
-                [binary, "auth", "status", "--json"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                env=probe_env,
-            )
-            if check.returncode != 0:
-                return False
-            payload = json.loads(check.stdout or "{}")
-            return bool(payload.get("loggedIn") or payload.get("logged_in"))
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-            return False
-
     try:
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from hermes_cli.profiles import resolve_profile_env
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from pathlib import Path
 
-        token = set_hermes_home_override(resolve_profile_env(profile))
-        try:
-            resolved = resolve_runtime_provider(
-                requested=leg.provider,
-                target_model=leg.model,
-            )
-        finally:
-            reset_hermes_home_override(token)
-        return bool(resolved.get("base_url") and resolved.get("api_key"))
+        from hermes_cli.backend_failover_worker import _leg_available
+        from hermes_cli.profiles import resolve_profile_env
+
+        return _leg_available(leg, Path(resolve_profile_env(profile)))
     except Exception:
         return False
 

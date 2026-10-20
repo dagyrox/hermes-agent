@@ -8741,7 +8741,8 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 def _backend_failover_worker_argv(
     task: Task,
     profile: str,
-    hermes_home: Optional[str],
+    dispatcher_home: Optional[str],
+    assignee_home: Optional[str],
 ) -> Optional[list[str]]:
     """Return the bounded cross-runtime supervisor argv when activated.
 
@@ -8759,8 +8760,12 @@ def _backend_failover_worker_argv(
         return None
     from hermes_cli.backend_failover import load_profile_chain, worker_argv
 
-    chain = load_profile_chain(profile, hermes_home)
-    required_toolsets = _resolve_worker_cli_toolsets(hermes_home)
+    chain = load_profile_chain(profile, dispatcher_home)
+    if chain and not assignee_home:
+        raise RuntimeError(
+            f"backend failover assignee profile {profile!r} does not exist"
+        )
+    required_toolsets = _resolve_worker_cli_toolsets(assignee_home)
     return worker_argv(task, profile, chain, required_toolsets) if chain else None
 
 
@@ -8809,13 +8814,13 @@ def _default_spawn(
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        assignee_hermes_home = resolve_profile_env(profile_arg)
     except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+        # Preserve the historical direct-worker test/deferred-resolution path,
+        # but never permit a supervised cross-runtime route to inherit it.
+        assignee_hermes_home = None
+    if assignee_hermes_home:
+        env["HERMES_HOME"] = assignee_hermes_home
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -8883,7 +8888,7 @@ def _default_spawn(
     # above, and each child leg gets one attempt.  Profiles without an active
     # chain continue through the historical direct Hermes worker path.
     supervisor_cmd = _backend_failover_worker_argv(
-        task, profile_arg, dispatcher_hermes_home
+        task, profile_arg, dispatcher_hermes_home, assignee_hermes_home
     )
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1

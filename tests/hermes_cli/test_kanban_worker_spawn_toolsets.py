@@ -197,3 +197,44 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_supervised_spawn_uses_dispatcher_routes_and_assignee_tools(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    (profile / "SOUL.md").write_text("Elias", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("agent_backend_failover: {}\n", encoding="utf-8")
+    profile.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - terminal\n    - file\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.backend_failover import BackendLeg
+
+    seen = {}
+    chain = (
+        BackendLeg("api", "gpt-6.1-sol", "openai-codex"),
+        BackendLeg("claude_code", "claude-sonnet-5-5"),
+        BackendLeg("api", "deepseek-flash", "deepseek"),
+    )
+
+    def fake_load(profile_name, home):
+        seen["route_home"] = home
+        return chain
+
+    monkeypatch.setattr("hermes_cli.backend_failover.load_profile_chain", fake_load)
+    argv = kb._backend_failover_worker_argv(
+        _make_task(kb, assignee="elias"),
+        "elias",
+        str(root),
+        str(profile),
+    )
+
+    assert seen["route_home"] == str(root)
+    assert argv is not None
+    values = [argv[i + 1] for i, value in enumerate(argv[:-1]) if value == "--required-toolset"]
+    assert "terminal" in values
+    assert "file" in values
