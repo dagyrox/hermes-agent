@@ -408,6 +408,10 @@ class ModelCapabilities:
     context_window: int = 200000
     max_output_tokens: int = 8192
     model_family: str = ""
+    # Defaults keep legacy display/routing callers stable, but security-sensitive
+    # admission gates must distinguish catalog observations from these guesses.
+    context_window_observed: bool = False
+    max_output_tokens_observed: bool = False
 
 
 def _get_provider_models(provider: str) -> Optional[Dict[str, Any]]:
@@ -491,10 +495,20 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
         limit = {}
 
     ctx = limit.get("context")
-    context_window = int(ctx) if isinstance(ctx, (int, float)) and ctx > 0 else 200000
+    if isinstance(ctx, int) and not isinstance(ctx, bool) and ctx > 0:
+        context_window_observed = True
+        context_window = int(ctx)
+    else:
+        context_window_observed = False
+        context_window = 200000
 
     out = limit.get("output")
-    max_output_tokens = int(out) if isinstance(out, (int, float)) and out > 0 else 8192
+    if isinstance(out, int) and not isinstance(out, bool) and out > 0:
+        max_output_tokens_observed = True
+        max_output_tokens = int(out)
+    else:
+        max_output_tokens_observed = False
+        max_output_tokens = 8192
 
     model_family = entry.get("family", "") or ""
 
@@ -505,6 +519,8 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
         context_window=context_window,
         max_output_tokens=max_output_tokens,
         model_family=model_family,
+        context_window_observed=context_window_observed,
+        max_output_tokens_observed=max_output_tokens_observed,
     )
 
 

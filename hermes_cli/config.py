@@ -934,6 +934,14 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # Dispatcher-owned cross-runtime failover. Disabled by default: ordinary
+    # Hermes provider/model fallback remains unchanged unless an operator
+    # supplies validated per-role chains. Secrets never belong in this block.
+    "agent_backend_failover": {
+        "enabled": False,
+        "max_attempts_per_leg": 1,
+        "roles": {},
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
@@ -7583,6 +7591,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
+        failover_config = expanded.get("agent_backend_failover")
+        if failover_config is not None:
+            if not isinstance(failover_config, dict):
+                raise ValueError("agent_backend_failover must be a mapping")
+            from hermes_cli.backend_failover import validate_backend_failover_config
+
+            validate_backend_failover_config(failover_config)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``

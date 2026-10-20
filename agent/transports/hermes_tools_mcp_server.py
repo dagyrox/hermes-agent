@@ -148,6 +148,47 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_link",
 )
 
+_TASK_SCOPED_TOOLS = frozenset({
+    "kanban_show",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_comment",
+    "kanban_heartbeat",
+})
+
+
+def _configured_exposed_tools() -> tuple[str, ...]:
+    """Return a validated process-local subset for an external runtime."""
+    raw = os.environ.get("HERMES_MCP_EXPOSED_TOOLS", "").strip()
+    if not raw:
+        return EXPOSED_TOOLS
+    requested = tuple(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
+    unknown = set(requested) - set(EXPOSED_TOOLS)
+    if unknown:
+        raise RuntimeError(
+            "unknown Hermes MCP tools requested: " + ", ".join(sorted(unknown))
+        )
+    return requested
+
+
+def _scope_task_arguments(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    """Fence lifecycle writes to the dispatcher-assigned Kanban task."""
+    assigned = os.environ.get("HERMES_MCP_ASSIGNED_TASK", "").strip()
+    if not assigned or tool_name not in _TASK_SCOPED_TOOLS:
+        return arguments, None
+    requested = str(arguments.get("task_id") or assigned)
+    if requested != assigned:
+        return arguments, "MCP lifecycle tool is scoped to the assigned Kanban task"
+    scoped = {**arguments, "task_id": assigned}
+    # The board selection is dispatcher-owned through HERMES_KANBAN_DB/BOARD.
+    # Letting an external runtime override it would make a same-id task on a
+    # foreign board writable despite the task-id fence above.
+    scoped.pop("board", None)
+    return scoped, None
+
 
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached. Lazy imports
@@ -187,7 +228,8 @@ def _build_server() -> Any:
 
     exposed_count = 0
 
-    for name in EXPOSED_TOOLS:
+    exposed_tools = _configured_exposed_tools()
+    for name in exposed_tools:
         spec = all_defs.get(name)
         if spec is None:
             logger.debug(
@@ -211,6 +253,9 @@ def _build_server() -> Any:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
+                    args, scope_error = _scope_task_arguments(tool_name, args)
+                    if scope_error:
+                        return json.dumps({"error": scope_error, "tool": tool_name})
                     return handle_function_call(tool_name, args or {})
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
@@ -240,7 +285,7 @@ def _build_server() -> Any:
     logger.info(
         "hermes-tools MCP server registered %d/%d tools",
         exposed_count,
-        len(EXPOSED_TOOLS),
+        len(exposed_tools),
     )
     return mcp
 

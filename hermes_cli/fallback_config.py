@@ -77,6 +77,12 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     The returned list always contains fresh dict copies.
     """
 
+    # A dispatcher-owned backend supervisor is already traversing the exact
+    # canonical chain. Nested in-process fallback would skip external-runtime
+    # legs, duplicate attempts, and make provenance nondeterministic.
+    if os.environ.get("HERMES_BACKEND_FAILOVER_CHILD") == "1":
+        return []
+
     config = config or {}
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()

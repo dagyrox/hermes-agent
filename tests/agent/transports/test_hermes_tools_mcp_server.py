@@ -12,6 +12,8 @@ import inspect
 from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
+    _configured_exposed_tools,
+    _scope_task_arguments,
     _signature_from_schema,
 )
 
@@ -215,6 +217,25 @@ class TestModuleSurface:
             assert orch_tool in EXPOSED_TOOLS, (
                 f"{orch_tool!r} missing from codex callback"
             )
+
+
+class TestWorkerScope:
+    def test_env_allowlist_reduces_exposed_tools(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_MCP_EXPOSED_TOOLS", "kanban_show,kanban_complete"
+        )
+        assert _configured_exposed_tools() == ("kanban_show", "kanban_complete")
+
+    def test_assigned_task_is_injected_and_cross_task_denied(self, monkeypatch):
+        monkeypatch.setenv("HERMES_MCP_ASSIGNED_TASK", "t_owned")
+        scoped, error = _scope_task_arguments(
+            "kanban_show", {"board": "foreign-board"}
+        )
+        assert scoped["task_id"] == "t_owned"
+        assert "board" not in scoped
+        assert error is None
+        _, error = _scope_task_arguments("kanban_show", {"task_id": "t_other"})
+        assert error == "MCP lifecycle tool is scoped to the assigned Kanban task"
 
 
 class TestMain:
