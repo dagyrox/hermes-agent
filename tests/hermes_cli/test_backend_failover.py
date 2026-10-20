@@ -164,20 +164,17 @@ def test_disabled_staged_routes_are_validated():
         validate_backend_failover_config(cfg)
 
 
-def test_capability_parity_fails_closed_when_runtime_contract_is_narrowed(monkeypatch):
+def test_config_validation_does_not_self_certify_runtime_capabilities():
     from hermes_cli import backend_failover as failover
 
-    monkeypatch.setattr(
-        failover,
-        "_API_CAPABILITIES",
-        getattr(failover, "_API_CAPABILITIES") - {"image_input"},
-    )
-    with pytest.raises(failover.ConfigError, match="image_input"):
-        failover.resolve_role_chain(_chain(
+    chain = failover.resolve_role_chain(_chain(
             {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
             {"kind": "claude_code", "model": "claude-sonnet-5-5"},
             {"kind": "api", "provider": "deepseek", "model": "deepseek-flash"},
         ), "talos")
+
+    assert len(chain) == 3
+    assert not hasattr(failover, "_API_CAPABILITIES")
 
 
 def test_supervisor_uses_each_leg_once_and_never_adds_a_fourth():

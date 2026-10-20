@@ -263,16 +263,21 @@ def test_dispatch_context_does_not_create_missing_board(tmp_path, monkeypatch):
     assert not missing_db.exists()
 
 
-def test_task_specific_capability_gate_rejects_unsupported_claude_surface():
+def test_task_specific_capability_gate_rejects_unsupported_claude_surface(monkeypatch):
     from hermes_cli import backend_failover_worker as worker
 
+    monkeypatch.setattr(
+        worker,
+        "_resolved_required_tool_schemas",
+        lambda _toolsets: ({"read_file", "browser_navigate", "image_gen"}, 100),
+    )
     args = argparse.Namespace(
         required_toolset=["file", "browser", "image_gen"],
         required_context_chars=1000,
     )
     capability_mismatches = getattr(worker, "_capability_mismatches")
     missing = capability_mismatches(_leg(kind="claude_code", provider=None), args)
-    assert missing == ("toolset:browser", "toolset:image_gen")
+    assert missing == ("tool:browser_navigate", "tool:image_gen")
     assert capability_mismatches(_leg(), args) == ()
 
 
@@ -468,7 +473,60 @@ def test_claude_orchestrator_rejects_unavailable_delegate_task():
     assert worker._capability_mismatches(
         _leg(kind="claude_code", provider=None, capability_mode="orchestrator"),
         args,
-    ) == ("toolset:delegation",)
+    ) == ("tool:delegate_task",)
+
+
+def test_claude_native_image_read_does_not_claim_vision_tool_parity(monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _toolsets: ({"vision_analyze"}, 100))
+    args = argparse.Namespace(
+        required_toolset=["vision"],
+        required_context_chars=1,
+        requires_native_image=False,
+    )
+
+    assert worker._capability_mismatches(
+        _leg(kind="claude_code", provider=None, capability_mode="full"), args
+    ) == ("tool:vision_analyze",)
+
+
+def test_claude_leg_rejects_untransported_native_image_payload(monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _toolsets: (set(), 0))
+    args = argparse.Namespace(
+        required_toolset=[],
+        required_context_chars=1,
+        requires_native_image=True,
+    )
+
+    assert worker._capability_mismatches(
+        _leg(kind="claude_code", provider=None, capability_mode="full"), args
+    ) == ("native_image_input",)
+
+
+def test_api_gate_fails_closed_when_profile_tool_schemas_cannot_be_resolved(monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _toolsets: (None, 0))
+    monkeypatch.setattr(
+        "agent.models_dev.get_model_capabilities",
+        lambda _provider, _model: SimpleNamespace(
+            supports_tools=True,
+            supports_vision=True,
+            supports_reasoning=True,
+            context_window=1000,
+            max_output_tokens=10,
+        ),
+    )
+    args = argparse.Namespace(
+        required_toolset=["file"],
+        required_context_chars=1,
+        requires_native_image=False,
+    )
+
+    assert worker._capability_mismatches(_leg(), args) == ("tool_schema_evidence",)
 
 
 def test_effective_context_size_includes_durable_handoff_and_system_prompt(
@@ -495,10 +553,18 @@ def test_effective_context_size_includes_durable_handoff_and_system_prompt(
         lambda _conn, _task: "parent-handoff-and-comments",
     )
 
-    measured = worker._effective_context_chars(
-        "t_probe", declared_chars=1, system_prompt_path=system_prompt
+    monkeypatch.setattr(
+        worker,
+        "_resolved_required_tool_schemas",
+        lambda _toolsets: ({"read_file"}, 1234),
     )
-    assert measured > len("parent-handoff-and-comments")
+    measured = worker._effective_context_chars(
+        "t_probe",
+        declared_chars=1,
+        system_prompt_path=system_prompt,
+        required_toolsets=["file"],
+    )
+    assert measured >= len("parent-handoff-and-comments") + len("system-prompt") + 1234
 
 
 def test_workspace_execution_path_runs_real_edit_and_test(tmp_path):

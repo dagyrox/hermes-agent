@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 from pathlib import Path
@@ -62,14 +63,18 @@ _LIFECYCLE_TOOLS = (
 )
 _PROFILE_TOOLS = ("skills_list", "skill_view")
 _ORCHESTRATOR_TOOLS = ("kanban_list", "kanban_create", "kanban_link")
-_CLAUDE_TOOLSETS = {
-    "read_only": frozenset({"file", "kanban", "skills", "vision", "web"}),
-    "orchestrator": frozenset({"file", "kanban", "skills", "vision", "web"}),
-    "full": frozenset({
-        "code_execution", "file", "kanban", "skills", "terminal", "vision", "web",
-    }),
-}
 _CLAUDE_CONTEXT_CHAR_LIMIT = 600_000
+_CLAUDE_NATIVE_TOOL_EQUIVALENTS = frozenset({
+    "execute_code",
+    "patch",
+    "process",
+    "read_file",
+    "search_files",
+    "terminal",
+    "web_extract",
+    "web_search",
+    "write_file",
+})
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -352,8 +357,56 @@ def _leg_available(leg: BackendLeg, profile_home: Path | None = None) -> bool:
         return False
 
 
+def _resolved_required_tool_schemas(
+    required_toolsets: list[str] | tuple[str, ...],
+) -> tuple[set[str] | None, int]:
+    """Resolve the profile-visible schemas actually offered to an API child.
+
+    A toolset name is configuration, not execution evidence.  The registry's
+    requirement checks and dynamic schema assembly are the authoritative view.
+    Resolution errors fail closed instead of silently treating an allowlist as
+    proof that a backend can execute it.
+    """
+
+    if not required_toolsets:
+        return set(), 0
+    try:
+        get_tool_definitions = importlib.import_module("model_tools").get_tool_definitions
+        definitions = get_tool_definitions(
+            enabled_toolsets=list(required_toolsets),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        names = {
+            str(tool.get("function", {}).get("name") or "")
+            for tool in definitions
+            if isinstance(tool, dict)
+        }
+        names.discard("")
+        return names, len(json.dumps(definitions, sort_keys=True, separators=(",", ":")))
+    except Exception:
+        return None, 0
+
+
+def _claude_bridged_tool_names(leg: BackendLeg) -> set[str]:
+    names = {*_PROFILE_TOOLS, *_LIFECYCLE_TOOLS}
+    if leg.capability_mode == "orchestrator":
+        names.update(_ORCHESTRATOR_TOOLS)
+    if leg.capability_mode == "full":
+        names.update(_CLAUDE_NATIVE_TOOL_EQUIVALENTS)
+    else:
+        names.update({"read_file", "search_files", "web_extract", "web_search"})
+    return names
+
+
 def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[str, ...]:
     """Compare this task's effective tool/context contract to one route leg."""
+    required_toolsets = [
+        str(name) for name in (getattr(args, "required_toolset", ()) or ())
+    ]
+    required_tools, _schema_chars = _resolved_required_tool_schemas(required_toolsets)
+    if required_tools is None:
+        return ("tool_schema_evidence",)
     if leg.kind == "api":
         from agent.models_dev import get_model_capabilities
 
@@ -361,8 +414,7 @@ def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[s
         if capabilities is None:
             return ("capability_evidence",)
         missing: set[str] = set()
-        required = set(getattr(args, "required_toolset", ()) or ())
-        if required and not capabilities.supports_tools:
+        if required_tools and not capabilities.supports_tools:
             missing.add("tools")
         if (
             bool(getattr(args, "requires_native_image", False))
@@ -377,9 +429,13 @@ def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[s
         if input_tokens + int(capabilities.max_output_tokens) > int(capabilities.context_window):
             missing.add("context_window")
         return tuple(sorted(missing))
-    required = set(getattr(args, "required_toolset", ()) or ())
-    supported = _CLAUDE_TOOLSETS[leg.capability_mode]
-    missing = {f"toolset:{name}" for name in required - supported}
+    supported = _claude_bridged_tool_names(leg)
+    missing = {f"tool:{name}" for name in required_tools - supported}
+    if bool(getattr(args, "requires_native_image", False)):
+        # The Kanban Claude path does not currently transfer native media parts.
+        # Claude's image-capable Read tool is not equivalent to receiving the
+        # frozen turn's image payload.
+        missing.add("native_image_input")
     if int(getattr(args, "required_context_chars", 0) or 0) > _CLAUDE_CONTEXT_CHAR_LIMIT:
         missing.add("context_window")
     # Reasoning mode is frozen and validated at config load. Lifecycle is the
@@ -392,6 +448,7 @@ def _effective_context_chars(
     *,
     declared_chars: int,
     system_prompt_path: Path | None,
+    required_toolsets: list[str] | tuple[str, ...] = (),
 ) -> int:
     """Measure the durable handoff plus loaded prompt, not only title/body."""
 
@@ -402,10 +459,11 @@ def _effective_context_chars(
     system_chars = 0
     if system_prompt_path is not None:
         system_chars = len(system_prompt_path.read_text(encoding="utf-8"))
+    _tool_names, schema_chars = _resolved_required_tool_schemas(required_toolsets)
     task_prompt_chars = len(f"work kanban task {task_id}")
     return max(
         int(declared_chars or 0),
-        len(worker_context) + system_chars + task_prompt_chars,
+        len(worker_context) + system_chars + task_prompt_chars + schema_chars,
     )
 
 
@@ -865,6 +923,7 @@ def run(argv: list[str] | None = None) -> int:
             args.task,
             declared_chars=args.required_context_chars,
             system_prompt_path=system_path,
+            required_toolsets=list(getattr(args, "required_toolset", ()) or ()),
         )
     deadline = (
         time.monotonic() + args.timeout_seconds

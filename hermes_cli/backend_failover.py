@@ -46,20 +46,6 @@ _CANONICAL_ROUTES = {
     "talos": (("api", "openai-codex", "gpt-6.1-sol"), ("claude_code", None, "claude-sonnet-5-5"), ("api", "deepseek", "deepseek-flash")),
     "apollo": (("claude_code", None, "claude-sonnet-5-5"), ("api", "openai-codex", "gpt-6.1-sol"), ("api", "deepseek", "deepseek-flash")),
 }
-_REQUIRED_CAPABILITIES = {
-    "read_only": frozenset({"tools:read", "image_input", "long_context", "reasoning", "lifecycle"}),
-    "orchestrator": frozenset({
-        "tools:read", "image_input", "long_context", "reasoning", "lifecycle", "orchestration",
-    }),
-    "full": frozenset({
-        "tools:read", "tools:write", "image_input", "long_context", "reasoning",
-        "lifecycle",
-    }),
-}
-_API_CAPABILITIES = frozenset({
-    "tools:read", "tools:write", "tools:execute", "image_input", "long_context",
-    "reasoning", "lifecycle", "orchestration",
-})
 _TOP_LEVEL_KEYS = frozenset({"enabled", "max_attempts_per_leg", "roles"})
 _LEG_KEYS = frozenset({"kind", "provider", "model", "reasoning_effort", "capability_mode"})
 
@@ -82,22 +68,6 @@ class SupervisorOutcome:
     returncode: int
     attempted: int
     exhausted: bool
-
-
-def _validate_leg_capabilities(role: str, index: int, leg: BackendLeg) -> None:
-    """Refuse a route whose runtime cannot preserve its declared task contract."""
-    if leg.kind == "api":
-        available = _API_CAPABILITIES
-    else:
-        # Claude modes use restricted workspace file tools, image-capable Read,
-        # auto-sandboxed Bash for full mode, and the lifecycle MCP surface.
-        available = _REQUIRED_CAPABILITIES[leg.capability_mode]
-    missing = _REQUIRED_CAPABILITIES[leg.capability_mode] - available
-    if missing:
-        raise ConfigError(
-            f"agent_backend_failover.roles.{role}[{index}] lacks required capabilities: "
-            f"{', '.join(sorted(missing))}"
-        )
 
 
 def _has_tool_activity(messages: Any) -> bool:
@@ -202,7 +172,6 @@ def resolve_role_chain(config: dict[str, Any] | None, profile: str) -> tuple[Bac
                     f"{profile_key} Claude Code leg must use {required_mode} capability mode"
                 )
         leg = BackendLeg(kind, model, provider, effort, capability_mode)
-        _validate_leg_capabilities(profile_key, index, leg)
         chain.append(leg)
 
     final = chain[-1]

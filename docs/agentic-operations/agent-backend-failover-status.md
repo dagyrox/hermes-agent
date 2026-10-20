@@ -94,6 +94,39 @@ bridge, and exactly-once delivery acceptance are not implemented in this
 checkpoint. No activation, credentials, provider call, merge, deploy, or
 restart was performed.
 
+## Bounded repair run 504
+
+Talos continued from clean exact head `a7321d9bef8d81843221115c3afdf1ff384b50aa`
+under Hyperion coordinator card `t_45e68439` / run 503. This slice removes the
+configuration-time blanket API/Claude capability self-certification. Runtime
+eligibility now resolves the profile-visible tool schemas through the actual
+tool registry, includes their serialized bytes in the context budget, compares
+exact tool names with the installed Claude adapter/MCP surface, rejects unknown
+schema evidence, and distinguishes native image payloads from the
+`vision_analyze` tool. The Kanban Claude path now explicitly rejects native
+image payloads because it does not transport those parts.
+
+A finite Claude Code subscription acceptance was executed with installed CLI
+`2.1.304`, model `claude-sonnet-5-5`, `--restricted`, permission mode `auto`,
+and only `Read,Glob,Grep,Edit,Write,Bash`. In an isolated `/tmp` workspace the
+actual Claude runtime edited `module.py`, ran `python -m pytest -q
+test_module.py` with `1 passed`, then attempted to overwrite a sibling sentinel.
+The auto-mode classifier denied that outside-workspace Bash operation and an
+independent readback confirmed the sentinel remained `unchanged`. The run
+reported no web tool use and USD 0.0336137 list-basis usage. This is evidence
+for restricted native edit/test execution and one denial boundary only; it is
+not proof of gateway owner-tool/approval parity.
+
+Fresh repository verification for this slice includes 73 focused tests passing
+across the failover config/worker files and Athena's run-499 executable
+acceptance remaining 4/4 green. B3 remains dependent on open, unstable PR #13
+at `2949cbbe24c7d07c0367712a6ad453a1a1c2168f`; no credential store or PR13
+worktree was modified. B5 remains unimplemented: the real Slack/default
+`_run_agent` boundary still lacks the gateway-owned durable turn coordinator,
+owner-executor MCP bridge, cancellation/reconciliation, and exactly-once final
+delivery contract. This checkpoint must not be activated or represented as
+Issue #260 complete.
+
 ## Claude CLI provenance caveat
 
 A prior run reported that the installed Claude CLI changed despite the original restriction against updating the active binary. Athena's pinned-head review observed version/package `2.1.304`, executable mtime `2026-10-19T22:54:36Z`, and package mtime `2026-10-19T22:54:28Z`; the older `2.1.81` observation was stale. The provenance and operational impact require independent review. Do not repeat an install/update as part of checkpoint review.
