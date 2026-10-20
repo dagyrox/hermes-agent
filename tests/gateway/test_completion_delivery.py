@@ -8,6 +8,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 
 import asyncio
 import json
+import os
 import queue
 from collections import OrderedDict
 from types import SimpleNamespace
@@ -445,8 +446,11 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
         output_buffer="important terminal output\n",
         notify_on_complete=True,
     )
+    session.pid = os.getpid()
+    session.host_start_time = ProcessRegistry._safe_host_start_time(session.pid)
+    session.host_boot_id = ProcessRegistry._safe_host_boot_id()
     session.process = MagicMock()
-    session.process.pid = 4242
+    session.process.pid = session.pid
     registry._running[session.id] = session
     monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_a, **_kw: None)
     monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
@@ -559,8 +563,11 @@ def test_bulk_kill_does_not_consume_discarded_completion_output(monkeypatch):
         output_buffer="output bulk cleanup does not return\n",
         notify_on_complete=True,
     )
+    session.pid = os.getpid()
+    session.host_start_time = ProcessRegistry._safe_host_start_time(session.pid)
+    session.host_boot_id = ProcessRegistry._safe_host_boot_id()
     session.process = MagicMock()
-    session.process.pid = 4243
+    session.process.pid = session.pid
     registry._running[session.id] = session
     monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_a, **_kw: None)
     monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)

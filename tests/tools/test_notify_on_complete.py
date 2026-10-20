@@ -48,6 +48,20 @@ def _make_session(
     return s
 
 
+def _current_host_identity():
+    """Return the complete identity tuple required for safe host-PID control."""
+    pid = os.getpid()
+    host_start_time = ProcessRegistry._safe_host_start_time(pid)
+    host_boot_id = ProcessRegistry._safe_host_boot_id()
+    assert host_start_time is not None
+    assert host_boot_id
+    return {
+        "pid": pid,
+        "host_start_time": host_start_time,
+        "host_boot_id": host_boot_id,
+    }
+
+
 # =========================================================================
 # ProcessSession field
 # =========================================================================
@@ -142,8 +156,11 @@ class TestCompletionQueue:
 
     def test_kill_process_sets_completion_reason_and_source(self, registry):
         s = _make_session(notify_on_complete=True, output="stopping")
+        identity = _current_host_identity()
         s.process = MagicMock()
-        s.process.pid = 4242
+        s.process.pid = identity["pid"]
+        s.host_start_time = identity["host_start_time"]
+        s.host_boot_id = identity["host_boot_id"]
         registry._running[s.id] = s
 
         class FakeProcess:
@@ -236,7 +253,7 @@ class TestCheckpointNotify:
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
             "command": "sleep 999",
-            "pid": os.getpid(),
+            **_current_host_identity(),
             "task_id": "t1",
             "notify_on_complete": True,
         }]))
@@ -251,7 +268,7 @@ class TestCheckpointNotify:
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
             "command": "sleep 999",
-            "pid": os.getpid(),
+            **_current_host_identity(),
             "task_id": "t1",
             "session_key": "sk1",
             "watcher_platform": "telegram",
@@ -276,7 +293,7 @@ class TestCheckpointNotify:
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
             "command": "sleep 999",
-            "pid": os.getpid(),
+            **_current_host_identity(),
             "task_id": "t1",
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
