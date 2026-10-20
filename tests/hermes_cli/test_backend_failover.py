@@ -110,6 +110,16 @@ def test_excluded_lane_without_route_remains_unaffected():
     assert resolve_role_chain(cfg, "sentinel") == ()
 
 
+def _no_attempt_progress():
+    return {
+        "observed": True,
+        "tool_activity": False,
+        "assistant_output": False,
+        "approval_activity": False,
+        "uncertain": False,
+    }
+
+
 def test_failure_exit_classification_refuses_policy_hopping_and_replay():
     from hermes_cli.backend_failover import (
         EXIT_AMBIGUOUS,
@@ -118,17 +128,83 @@ def test_failure_exit_classification_refuses_policy_hopping_and_replay():
         classify_failed_result,
     )
 
-    assert classify_failed_result({"failed": True, "failure_reason": "auth", "should_fallback": True}) == EXIT_ELIGIBLE
-    assert classify_failed_result({"failed": True, "failure_reason": "format_error", "should_fallback": True}) == EXIT_ELIGIBLE
+    assert classify_failed_result({
+        "failed": True,
+        "failure_reason": "auth",
+        "should_fallback": True,
+        "current_attempt_progress": _no_attempt_progress(),
+    }) == EXIT_ELIGIBLE
+    assert classify_failed_result({
+        "failed": True,
+        "failure_reason": "format_error",
+        "should_fallback": True,
+        "current_attempt_progress": _no_attempt_progress(),
+    }) == EXIT_ELIGIBLE
     assert classify_failed_result({"failed": True, "failure_reason": "rate_limit"}) != EXIT_ELIGIBLE
     assert classify_failed_result({
         "failed": True, "should_fallback": True,
         "failure_reason": "auth",
-        "messages": [{"role": "assistant", "tool_calls": [{"id": "call_1"}]}],
+        "current_attempt_progress": {
+            **_no_attempt_progress(),
+            "tool_activity": True,
+        },
     }) == EXIT_AMBIGUOUS
     assert classify_failed_result({
         "failed": True, "failure_reason": "content_policy_blocked", "should_fallback": True
     }) == EXIT_REFUSAL
+
+
+def test_failure_exit_classification_requires_affirmative_current_attempt_evidence():
+    from hermes_cli.backend_failover import EXIT_AMBIGUOUS, classify_failed_result
+
+    base = {
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "should_fallback": True,
+    }
+    assert classify_failed_result(base) == EXIT_AMBIGUOUS
+    for progress_key in ("tool_activity", "assistant_output", "approval_activity", "uncertain"):
+        progress = _no_attempt_progress()
+        progress[progress_key] = True
+        assert classify_failed_result({
+            **base,
+            "current_attempt_progress": progress,
+        }) == EXIT_AMBIGUOUS
+
+
+def test_partial_assistant_output_dominates_eligible_api_failure():
+    from hermes_cli.backend_failover import EXIT_AMBIGUOUS, classify_failed_result
+
+    result = {
+        "failed": True,
+        "failure_reason": "rate_limit",
+        "should_fallback": True,
+        "messages": [{"role": "assistant", "content": "partial answer"}],
+        "current_attempt_progress": {
+            **_no_attempt_progress(),
+            "assistant_output": True,
+        },
+    }
+    assert classify_failed_result(result) == EXIT_AMBIGUOUS
+
+
+def test_current_attempt_progress_excludes_history_and_detects_live_output():
+    from hermes_cli.backend_failover import build_current_attempt_progress
+
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "tool_calls": [{"id": "old-call"}]},
+        {"role": "tool", "tool_call_id": "old-call", "content": "done"},
+        {"role": "user", "content": "current"},
+    ]
+    assert build_current_attempt_progress(messages, 3, streamed_text="") == _no_attempt_progress()
+
+    messages.append({"role": "assistant", "content": "partial"})
+    assert build_current_attempt_progress(
+        messages,
+        3,
+        streamed_text="",
+    )["assistant_output"] is True
 
 
 def test_canonical_role_route_is_frozen():

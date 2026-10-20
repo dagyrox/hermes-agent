@@ -936,6 +936,52 @@ def test_structured_claude_availability_failure_is_eligible_before_tool_use():
     assert worker._classify_claude_failure(1, transcript, "") == EXIT_ELIGIBLE
 
 
+def test_claude_partial_output_and_refusal_dominate_trailing_availability_error():
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli.backend_failover import EXIT_AMBIGUOUS, EXIT_REFUSAL
+
+    partial_then_429 = "\n".join((
+        json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "partial answer"}]},
+        }),
+        json.dumps({"type": "result", "is_error": True, "error": "rate_limit_error"}),
+    ))
+    assert worker._classify_claude_failure(1, partial_then_429, "") == EXIT_AMBIGUOUS
+
+    trailing_429 = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "error": "rate_limit_error",
+    })
+    assert worker._classify_claude_failure(
+        1,
+        trailing_429,
+        "Safety refusal: cannot assist with that request",
+    ) == EXIT_REFUSAL
+
+
+def test_claude_malformed_or_unknown_stream_fails_closed_before_trailing_error():
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli.backend_failover import EXIT_AMBIGUOUS
+
+    trailing_429 = json.dumps({
+        "type": "result",
+        "is_error": True,
+        "error": "rate_limit_error",
+    })
+    assert worker._classify_claude_failure(
+        1,
+        f"not-json\n{trailing_429}",
+        "",
+    ) == EXIT_AMBIGUOUS
+    assert worker._classify_claude_failure(
+        1,
+        f'{json.dumps({"type": "future_event", "payload": "unknown"})}\n{trailing_429}',
+        "",
+    ) == EXIT_AMBIGUOUS
+
+
 def test_worker_stops_without_replay_when_child_reports_ambiguous(monkeypatch):
     from hermes_cli import backend_failover_worker as worker
     from hermes_cli.backend_failover import EXIT_AMBIGUOUS

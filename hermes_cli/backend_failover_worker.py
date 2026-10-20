@@ -806,18 +806,51 @@ def _write_ledger(path: Path | None, payload: dict[str, Any]) -> None:
 def _classify_claude_failure(returncode: int, stdout: str, stderr: str) -> int:
     if returncode == 0:
         return 0
+    # Refusal is authoritative even when the transport emits a later capacity
+    # error or the stream itself is malformed.
+    if _CLAUDE_REFUSAL.search(stderr):
+        return EXIT_REFUSAL
+
     events: list[dict[str, Any]] = []
+    malformed = False
+    known_event_types = {
+        "system",
+        "assistant",
+        "user",
+        "result",
+        "rate_limit_event",
+    }
     for line in stdout.splitlines():
+        if not line.strip():
+            continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            malformed = True
             continue
-        if isinstance(event, dict):
-            events.append(event)
-    if any('"type":"tool_use"' in json.dumps(event, separators=(",", ":")) for event in events):
-        return EXIT_AMBIGUOUS
+        if not isinstance(event, dict):
+            malformed = True
+            continue
+        event_type = event.get("type")
+        if event_type not in known_event_types:
+            malformed = True
+        events.append(event)
+
     if any(int(event.get("safety_stops", 0) or 0) > 0 for event in events):
         return EXIT_REFUSAL
+    if any(event.get("permission_denials") for event in events):
+        return EXIT_REFUSAL
+
+    # Assistant/user events represent current-attempt output, tool activity, or
+    # approval/tool results. They dominate a later availability event. Inspect
+    # the whole object so nested tool_use records cannot evade the gate.
+    if any(event.get("type") in {"assistant", "user"} for event in events):
+        return EXIT_AMBIGUOUS
+    if any('"type":"tool_use"' in json.dumps(event, separators=(",", ":")) for event in events):
+        return EXIT_AMBIGUOUS
+    if malformed or not events:
+        return EXIT_AMBIGUOUS
+
     eligible_errors = {
         "authentication_error",
         "billing_error",
@@ -833,8 +866,6 @@ def _classify_claude_failure(returncode: int, stdout: str, stderr: str) -> int:
         status = event.get("api_error_status")
         if isinstance(status, int) and status in eligible_statuses:
             return EXIT_ELIGIBLE
-    if _CLAUDE_REFUSAL.search(stderr):
-        return EXIT_REFUSAL
     # Claude Code has no stable machine-readable taxonomy guaranteeing that a
     # remaining nonzero process exit happened before tool execution. Unknown
     # failures therefore stop for reconciliation rather than being guessed.

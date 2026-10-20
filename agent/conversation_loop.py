@@ -944,6 +944,16 @@ def run_conversation(
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
 
+    def _current_failover_attempt_progress() -> Dict[str, bool]:
+        """Capture replay evidence at the live turn boundary, not full history."""
+        from hermes_cli.backend_failover import build_current_attempt_progress
+
+        return build_current_attempt_progress(
+            messages,
+            current_turn_user_idx,
+            streamed_text=getattr(agent, "_current_streamed_assistant_text", "") or "",
+        )
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -2223,6 +2233,7 @@ def run_conversation(
                             "failed": True,  # Mark as failure for filtering
                             "failure_reason": "format_error",
                             "should_fallback": True,
+                            "current_attempt_progress": _current_failover_attempt_progress(),
                         }
                     
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
@@ -4696,6 +4707,7 @@ def run_conversation(
                             "error": _nonretryable_summary,
                             "failure_reason": classified.reason.value,
                             "should_fallback": bool(classified.should_fallback),
+                            "current_attempt_progress": _current_failover_attempt_progress(),
                             "billing_block": _ce_block,
                         }
                     return {
@@ -4707,6 +4719,7 @@ def run_conversation(
                         "error": _nonretryable_summary,
                         "failure_reason": classified.reason.value,
                         "should_fallback": bool(classified.should_fallback),
+                        "current_attempt_progress": _current_failover_attempt_progress(),
                     }
 
                 if retry_count >= max_retries:
@@ -4908,6 +4921,7 @@ def run_conversation(
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
                         "should_fallback": bool(classified.should_fallback),
+                        "current_attempt_progress": _current_failover_attempt_progress(),
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,

@@ -87,19 +87,100 @@ def _has_tool_activity(messages: Any) -> bool:
     return False
 
 
+def build_current_attempt_progress(
+    messages: Any,
+    current_turn_user_idx: int,
+    *,
+    streamed_text: str = "",
+) -> dict[str, bool]:
+    """Summarize only work observed after the current turn's user boundary."""
+
+    progress = {
+        "observed": False,
+        "tool_activity": False,
+        "assistant_output": False,
+        "approval_activity": False,
+        "uncertain": True,
+    }
+    if (
+        not isinstance(messages, list)
+        or not isinstance(current_turn_user_idx, int)
+        or current_turn_user_idx < 0
+        or current_turn_user_idx >= len(messages)
+        or not isinstance(messages[current_turn_user_idx], dict)
+        or messages[current_turn_user_idx].get("role") != "user"
+    ):
+        return progress
+
+    current_messages = messages[current_turn_user_idx + 1:]
+    if any(not isinstance(message, dict) for message in current_messages):
+        return progress
+
+    progress["observed"] = True
+    progress["uncertain"] = False
+    progress["tool_activity"] = _has_tool_activity(current_messages)
+    progress["assistant_output"] = bool(str(streamed_text or "").strip())
+    for message in current_messages:
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            progress["assistant_output"] = True
+        elif isinstance(content, list) and any(
+            not isinstance(part, dict)
+            or part.get("type") != "text"
+            or bool(str(part.get("text") or "").strip())
+            for part in content
+        ):
+            progress["assistant_output"] = True
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    progress["uncertain"] = True
+                    continue
+                function = tool_call.get("function")
+                name = function.get("name") if isinstance(function, dict) else ""
+                if "approval" in str(name).lower():
+                    progress["approval_activity"] = True
+    return progress
+
+
+def _current_attempt_is_replay_safe(result: dict[str, Any]) -> bool:
+    """Require affirmative, current-attempt proof that no work was emitted.
+
+    The full ``messages`` array can contain durable history from earlier turns,
+    so replay eligibility must not infer absence or presence of progress from it.
+    Conversation execution supplies this bounded evidence for the current turn.
+    Missing, malformed, or future evidence fails closed.
+    """
+
+    progress = result.get("current_attempt_progress")
+    if not isinstance(progress, dict) or progress.get("observed") is not True:
+        return False
+    required_flags = (
+        "tool_activity",
+        "assistant_output",
+        "approval_activity",
+        "uncertain",
+    )
+    return all(progress.get(flag) is False for flag in required_flags)
+
+
 def classify_failed_result(result: dict[str, Any]) -> int:
     """Map one failed Hermes turn to the cross-runtime supervisor protocol.
 
-    Any observed tool activity is conservatively ambiguous.  Replaying the task
-    on another runtime could duplicate an external write, so the supervisor must
-    stop for reconciliation rather than guessing whether the tool was read-only.
+    Refusal always dominates transport eligibility. Any current-attempt output,
+    tool/approval activity, or uncertainty is conservatively non-replayable.
+    Only an affirmative zero-progress observation may advance an availability
+    failure to the next backend.
     """
 
-    if _has_tool_activity(result.get("messages")):
-        return EXIT_AMBIGUOUS
     reason = str(result.get("failure_reason") or "").strip().lower()
     if reason in _REFUSAL_REASONS:
         return EXIT_REFUSAL
+    if not _current_attempt_is_replay_safe(result):
+        return EXIT_AMBIGUOUS
     if result.get("should_fallback") is True and reason in _ELIGIBLE_REASONS:
         return EXIT_ELIGIBLE
     return 1
