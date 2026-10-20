@@ -223,6 +223,12 @@ def _task_status(task_id: str) -> str:
         task = kb.get_task(conn, task_id)
         if task is None:
             return "missing"
+        # Successful lifecycle writes clear current_run_id atomically with the
+        # terminal transition. Observe that terminal state before applying the
+        # stale-run guard, otherwise this supervisor misclassifies its own
+        # completed child as "superseded" and reports a protocol failure.
+        if task.status in TERMINAL_STATUSES:
+            return task.status
         if expected is not None and task.current_run_id != expected:
             return "superseded"
         return task.status
