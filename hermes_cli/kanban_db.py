@@ -8806,6 +8806,21 @@ def _backend_failover_worker_argv(
         task.id,
         board=board,
     )
+    # Ordinary workers can discover task-body media during CLI startup. The
+    # supervised path transports only immutable attachment evidence, so reject
+    # any body reference outside that snapshot before starting the supervisor.
+    from agent.image_routing import extract_image_refs
+
+    body_paths, body_urls = extract_image_refs(str(getattr(task, "body", "") or ""))
+    admitted_paths = {str(Path(path).resolve()) for path in native_image_paths}
+    unrepresented_paths = {
+        str(Path(path).resolve()) for path in body_paths
+    } - admitted_paths
+    if unrepresented_paths or body_urls:
+        raise RuntimeError(
+            "backend failover task-body media is not represented by the immutable "
+            "attachment snapshot"
+        )
     return worker_argv(
         task,
         profile,

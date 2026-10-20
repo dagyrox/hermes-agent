@@ -545,6 +545,8 @@ def test_api_gate_fails_closed_when_profile_tool_schemas_cannot_be_resolved(monk
         ({"context": 128_000, "output": "4096"}, "max_output_tokens_observed"),
         ({"context": 128_000.0, "output": 4096}, "context_window_observed"),
         ({"context": 128_000, "output": 4096.0}, "max_output_tokens_observed"),
+        ({"context": True, "output": 4096}, "context_window_observed"),
+        ({"context": 128_000, "output": True}, "max_output_tokens_observed"),
     ],
 )
 def test_api_gate_rejects_missing_or_invalid_catalog_limits(
@@ -579,6 +581,49 @@ def test_api_gate_rejects_missing_or_invalid_catalog_limits(
     assert worker._capability_mismatches(_leg(), args) == (
         "context_limit_evidence",
     )
+
+
+def test_multi_image_parity_denial_happens_before_availability_or_child_spawn(monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    monkeypatch.setattr(
+        "agent.models_dev.get_model_capabilities",
+        lambda *_args: SimpleNamespace(
+            supports_tools=True,
+            supports_vision=True,
+            supports_reasoning=True,
+            context_window=128_000,
+            max_output_tokens=4096,
+            context_window_observed=True,
+            max_output_tokens_observed=True,
+        ),
+    )
+    monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _toolsets: (set(), 2))
+    monkeypatch.setattr(worker, "_comment", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        worker,
+        "_leg_available",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("availability reached after multi-image parity denial")
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_run_child",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("child spawned after multi-image parity denial")
+        ),
+    )
+    args = argparse.Namespace(
+        task="t_probe",
+        required_toolset=[],
+        required_context_chars=1,
+        requires_native_image=True,
+        native_image_path=["/tmp/a.png", "/tmp/b.png"],
+        timeout_seconds=1,
+    )
+
+    assert worker._run_leg(_leg(), 0, args, None, None) == worker.EXIT_ELIGIBLE
 
 
 def test_effective_context_size_counts_native_media_and_envelope(tmp_path, monkeypatch):

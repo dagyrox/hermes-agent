@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -369,3 +371,125 @@ def test_supervised_spawn_derives_native_image_and_reaches_parity_gate(
     assert worker._capability_mismatches(chain[0], args) == ()
     api_cmd, _env = worker._leg_command(chain[0], args, {}, None, None)
     assert api_cmd[api_cmd.index("--image") + 1] == str(image.resolve())
+
+
+def test_supervised_spawn_denies_attachment_plus_unrepresented_task_body_image(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.backend_failover import BackendLeg
+
+    attachment = tmp_path / "attachment.png"
+    attachment.write_bytes(b"\x89PNG\r\n\x1a\nattachment")
+    body_image = tmp_path / "body.png"
+    body_image.write_bytes(b"\x89PNG\r\n\x1a\nbody")
+    task = replace(
+        _make_task(kb, assignee="elias"),
+        body=f"Compare the admitted attachment with {body_image}",
+    )
+    chain = (
+        BackendLeg("api", "gpt-6.1-sol", "openai-codex"),
+        BackendLeg("claude_code", "claude-sonnet-5-5"),
+        BackendLeg("api", "deepseek-flash", "deepseek"),
+    )
+    monkeypatch.setattr("hermes_cli.backend_failover.load_profile_chain", lambda *_args: chain)
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: [])
+    monkeypatch.setattr(
+        kb,
+        "_native_image_attachment_evidence",
+        lambda *_args, **_kwargs: ([str(attachment.resolve())], attachment.stat().st_size),
+    )
+
+    with pytest.raises(RuntimeError, match="task-body media"):
+        kb._backend_failover_worker_argv(
+            task, "elias", str(tmp_path), str(tmp_path / "profile")
+        )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Inspect {image}",
+        "Inspect https://example.com/unrepresented.png",
+    ],
+)
+def test_supervised_spawn_denies_task_body_only_media(monkeypatch, tmp_path, body):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.backend_failover import BackendLeg
+
+    image = tmp_path / "body-only.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nbody")
+    task = replace(
+        _make_task(kb, assignee="elias"),
+        body=body.format(image=image),
+    )
+    chain = (
+        BackendLeg("api", "gpt-6.1-sol", "openai-codex"),
+        BackendLeg("claude_code", "claude-sonnet-5-5"),
+        BackendLeg("api", "deepseek-flash", "deepseek"),
+    )
+    monkeypatch.setattr("hermes_cli.backend_failover.load_profile_chain", lambda *_args: chain)
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: [])
+    monkeypatch.setattr(
+        kb, "_native_image_attachment_evidence", lambda *_args, **_kwargs: ([], 0)
+    )
+
+    with pytest.raises(RuntimeError, match="task-body media"):
+        kb._backend_failover_worker_argv(
+            task, "elias", str(tmp_path), str(tmp_path / "profile")
+        )
+
+
+def test_failover_child_real_cli_route_delivers_exactly_one_admitted_image(
+    monkeypatch, tmp_path
+):
+    from agent.image_routing import build_native_content_parts
+    from cli import _collect_kanban_body_images, _collect_query_images
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import kanban_db as kb
+    from hermes_cli._parser import build_top_level_parser
+    from hermes_cli.backend_failover import BackendLeg
+
+    admitted = tmp_path / "admitted.png"
+    admitted.write_bytes(b"\x89PNG\r\n\x1a\nadmitted")
+    body_image = tmp_path / "unrepresented-body.png"
+    body_image.write_bytes(b"\x89PNG\r\n\x1a\nbody")
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db(db_path)
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="frozen media",
+            body=f"This mutable body also names {body_image}",
+            assignee="elias",
+        )
+    args = __import__("argparse").Namespace(
+        profile="elias",
+        task=task_id,
+        timeout_seconds=60,
+        skill=[],
+        required_toolset=[],
+        required_context_chars=1,
+        requires_native_image=True,
+        native_image_bytes=admitted.stat().st_size,
+        native_image_path=[str(admitted.resolve())],
+    )
+    monkeypatch.setattr(worker, "_resolve_hermes_argv", lambda: ["hermes"])
+    command, child_env = worker._leg_command(
+        BackendLeg("api", "gpt-6.1-sol", "openai-codex"), args, {}, None, None
+    )
+    parser, _subparsers, _chat = build_top_level_parser()
+    parsed = parser.parse_args(command[3:])
+    monkeypatch.setenv("HERMES_BACKEND_FAILOVER_CHILD", child_env["HERMES_BACKEND_FAILOVER_CHILD"])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+
+    message, images = _collect_query_images(parsed.query, parsed.image)
+    images, urls = _collect_kanban_body_images(images)
+    parts, skipped = build_native_content_parts(
+        message, [str(path) for path in images], image_urls=urls or None
+    )
+
+    assert skipped == []
+    assert images == [Path(admitted.resolve())]
+    assert len([part for part in parts if part.get("type") == "image_url"]) == 1

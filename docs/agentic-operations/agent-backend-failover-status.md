@@ -162,6 +162,39 @@ contract, and exactly-once delivery acceptance are still unimplemented. No
 credential/store mutation, activation, merge, deploy, restart, or PR #13 write
 was performed.
 
+## Bounded B4-2 repair run 523
+
+Talos repaired Athena's round-3 task-body media bypass under card
+`t_05713247`, coordinated by `t_45e68439`. This repair chooses the approved
+low-blast-radius option: failover children do not independently enrich media
+from the mutable task body. The supervisor remains the sole owner of the
+native-media snapshot admitted from durable attachment rows.
+
+The boundary is enforced in both processes. Before starting the supervisor,
+the dispatcher scans the task body with the same production image-reference
+extractor used by the CLI and rejects every URL or local path not represented
+by the admitted attachment snapshot. The API child sees
+`HERMES_BACKEND_FAILOVER_CHILD=1` and therefore preserves only its explicit
+`--image`; ordinary non-failover Kanban workers retain historical task-body
+enrichment. Thus attachment plus second body media and task-body-only media
+fail closed before route availability or child execution, while one admitted
+attachment produces exactly one native image part. Multiple admitted images
+continue to fail the worker parity gate before availability or leg spawn.
+
+Tracked coverage now crosses worker command construction, the real CLI parser,
+single-query image collection, and native-content construction. It also adds
+the missing boolean context-limit and output-limit cases to strict observed
+limit evidence. B4-1 implicit-Kanban schema parity and B4-3 request budgeting
+remain unchanged.
+
+This is still a disabled review candidate, not Issue #260 completion or
+activation authority. B3 remains dependency-blocked on open PR #13. B5 remains
+separate and merge-blocking: the shipping Slack/default gateway coordinator,
+durable transition acknowledgement, owner-executor bridge, cancellation and
+reconciliation contract, and exactly-once delivery acceptance are not
+implemented here. No credential mutation, activation, merge, deploy, restart,
+or provider call was performed.
+
 ## Claude CLI provenance caveat
 
 A prior run reported that the installed Claude CLI changed despite the original restriction against updating the active binary. Athena's pinned-head review observed version/package `2.1.304`, executable mtime `2026-10-19T22:54:36Z`, and package mtime `2026-10-19T22:54:28Z`; the older `2.1.81` observation was stale. The provenance and operational impact require independent review. Do not repeat an install/update as part of checkpoint review.
