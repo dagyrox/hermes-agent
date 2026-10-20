@@ -39,7 +39,6 @@ _REPLAYABLE_AVAILABILITY_REASONS = frozenset(
         "auth",
         "auth_permanent",
         "billing",
-        "format_error",
         "model_not_found",
         "overloaded",
         "rate_limit",
@@ -140,6 +139,13 @@ class AttemptObservation:
     def __post_init__(self) -> None:
         if self.outcome not in {"success", "failure", "refusal"}:
             raise ValueError(f"unsupported attempt outcome {self.outcome!r}")
+        if (
+            self.is_availability_failure
+            and self.reason not in _REPLAYABLE_AVAILABILITY_REASONS
+        ):
+            raise ValueError(
+                f"{self.reason!r} is not a replayable availability failure"
+            )
         adverse = (
             self.is_availability_failure
             or self.is_refusal
@@ -227,6 +233,20 @@ class AttemptOutcome:
     state: str
     reason: str
     replayable: bool
+
+
+@dataclass(frozen=True)
+class FrozenLegDispatch:
+    """Exact canonical bytes authorized for one persisted route attempt."""
+
+    prompt_json: str
+    tools_json: str
+    media_json: str
+    leg_json: str
+    prompt_digest: str
+    tool_digest: str
+    media_digest: str
+    chain_digest: str
 
 
 class GatewayFailoverLedger:
@@ -445,17 +465,37 @@ class GatewayFailoverLedger:
         coordinator_id: str,
         leg_index: int,
         *,
+        turn: FrozenTurn | None = None,
         owner: str,
         generation: int,
-    ) -> None:
+    ) -> FrozenLegDispatch:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._row(conn, coordinator_id)
             self._fence(row, owner=owner, generation=generation)
+            if turn is None:
+                raise ReplayDenied("frozen turn is required at dispatch")
+            live_values = {
+                "prompt_json": _canonical_json(turn.prompt),
+                "tools_json": _canonical_json(turn.tools),
+                "media_json": _canonical_json(turn.media),
+                "legs_json": _canonical_json(turn.legs),
+                "prompt_digest": turn.prompt_digest,
+                "tool_digest": turn.tool_digest,
+                "media_digest": turn.media_digest,
+                "chain_digest": turn.chain_digest,
+            }
+            if turn.coordinator_id != coordinator_id or any(
+                row[key] != value for key, value in live_values.items()
+            ):
+                raise ReplayDenied("frozen turn snapshot diverged before dispatch")
             if row["state"] == "cancelled":
                 raise ReplayDenied("coordinator was cancelled")
             if row["state"] != "planned" or int(row["current_leg"]) != int(leg_index):
                 raise ReplayDenied("leg is not reserved for this coordinator")
+            legs = json.loads(row["legs_json"])
+            if leg_index < 0 or leg_index >= len(legs):
+                raise ReplayDenied("route leg is outside the frozen chain")
             try:
                 conn.execute(
                     """INSERT INTO gateway_failover_attempts
@@ -469,6 +509,16 @@ class GatewayFailoverLedger:
                 "UPDATE gateway_failover_turns SET state='running', updated_at=? "
                 "WHERE coordinator_id=?",
                 (time.time(), coordinator_id),
+            )
+            return FrozenLegDispatch(
+                prompt_json=row["prompt_json"],
+                tools_json=row["tools_json"],
+                media_json=row["media_json"],
+                leg_json=_canonical_json(legs[leg_index]),
+                prompt_digest=row["prompt_digest"],
+                tool_digest=row["tool_digest"],
+                media_digest=row["media_digest"],
+                chain_digest=row["chain_digest"],
             )
 
     def finish_leg(
