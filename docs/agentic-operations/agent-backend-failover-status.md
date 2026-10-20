@@ -69,6 +69,31 @@ Talos repair card `t_d298814c` separated dispatcher-owned route configuration fr
 
 These repairs address B1, B2, B3's profile-only/supervisor-only credential cases, and B6's static checker. B3's shared-root credential inheritance modes remain coordinated with open PR #13 and are not claimed here. B4 now gives the Claude `full` route restricted workspace shell execution, measures the durable worker handoff plus loaded system prompt, and rejects the unimplemented `delegate_task` surface rather than advertising it; API capability evidence and live image/orchestration acceptance remain unresolved. B5 remains unresolved because the shipping Slack/default gateway path still uses legacy in-process fallback rather than the cross-runtime supervisor, and no persisted coordinator acknowledgement acceptance run exists. This remains an incomplete checkpoint, not a merge or activation candidate.
 
+## Bounded repair run 500
+
+Athena's run-499 architecture decision resolves the internal B3/B4/B5 design
+gate and supersedes the packet where it excluded ordinary Slack/default turns
+or allowed mid-turn replay. The approved shipping seam is now recorded at the
+top of the packet.
+
+This run binds supervisor startup to the existing board in SQLite read-only
+mode before constructing any ledger, MCP config, or system prompt. Validation
+now requires the live task, current active run, normalized assignee/profile,
+claim lock, and persisted workspace to match dispatcher identity; a missing DB
+is not created. It also replaces blanket API eligibility with fail-closed
+model capability evidence for tools, native image input, and combined
+input/output context budget. Athena's four executable probes now pass, and the
+canonical worker suite contains equivalent behavioral regressions.
+
+This is still an incomplete checkpoint. B3's shared-root matrix remains
+dependent on reviewed PR #13 integration. B4 still lacks actual Claude
+restricted-sandbox edit/test and denial evidence plus real schema/transport
+intersection for every configured tool. B5's gateway-owned Slack/default turn
+coordinator, durable transition/acknowledgement record, owner-executor tool
+bridge, and exactly-once delivery acceptance are not implemented in this
+checkpoint. No activation, credentials, provider call, merge, deploy, or
+restart was performed.
+
 ## Claude CLI provenance caveat
 
 A prior run reported that the installed Claude CLI changed despite the original restriction against updating the active binary. Athena's pinned-head review observed version/package `2.1.304`, executable mtime `2026-10-19T22:54:36Z`, and package mtime `2026-10-19T22:54:28Z`; the older `2.1.81` observation was stale. The provenance and operational impact require independent review. Do not repeat an install/update as part of checkpoint review.

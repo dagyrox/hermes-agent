@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--skill", action="append", default=[])
     parser.add_argument("--required-toolset", action="append", default=[])
     parser.add_argument("--required-context-chars", type=int, default=0)
+    parser.add_argument("--requires-native-image", action="store_true")
     parser.add_argument("--chain-json")
     return parser.parse_args(argv)
 
@@ -139,6 +141,66 @@ def _validate_dispatch_context(
         raise RuntimeError(f"assignee profile identity is missing: {soul_path}") from exc
     if not soul:
         raise RuntimeError(f"assignee profile identity is empty: {soul_path}")
+
+    # Environment identity is only a claim.  Bind it to the dispatcher's
+    # existing board row before creating a ledger, MCP config, or prompt file.
+    # Open SQLite read-only so a typo cannot manufacture a fresh empty board or
+    # run schema migrations as a side effect of validation.
+    db_raw = (os.environ.get("HERMES_KANBAN_DB") or "").strip()
+    if not db_raw:
+        raise RuntimeError("dispatcher-owned board database is missing")
+    db_path = Path(db_raw).expanduser()
+    if not db_path.is_file():
+        raise RuntimeError(f"dispatcher-owned board database does not exist: {db_path}")
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    workspace = (os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
+    if not claim_lock:
+        raise RuntimeError("dispatcher-owned claim identity is missing")
+    if not workspace:
+        raise RuntimeError("dispatcher-owned workspace identity is missing")
+
+    from hermes_cli.profiles import normalize_profile_name
+
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            task = conn.execute(
+                "SELECT id, assignee, status, workspace_path, claim_lock, current_run_id "
+                "FROM tasks WHERE id = ?",
+                (args.task,),
+            ).fetchone()
+            run = conn.execute(
+                "SELECT id, task_id, profile, status, claim_lock FROM task_runs WHERE id = ?",
+                (int(run_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise RuntimeError("dispatcher-owned board database could not be validated") from exc
+
+    if task is None:
+        raise RuntimeError("dispatcher-owned task does not exist")
+    if task["status"] != "running":
+        raise RuntimeError("dispatcher-owned task is not running")
+    if task["current_run_id"] != int(run_id) or run is None:
+        raise RuntimeError("dispatcher-owned run does not match the live task")
+    if run["task_id"] != args.task or run["status"] != "running":
+        raise RuntimeError("dispatcher-owned run is not active for this task")
+    expected_profile = normalize_profile_name(args.profile)
+    if normalize_profile_name(task["assignee"] or "") != expected_profile:
+        raise RuntimeError("dispatcher-owned task assignee does not match the profile")
+    if normalize_profile_name(run["profile"] or "") != expected_profile:
+        raise RuntimeError("dispatcher-owned run profile does not match the assignee")
+    if task["claim_lock"] != claim_lock or run["claim_lock"] != claim_lock:
+        raise RuntimeError("dispatcher-owned claim does not match the live task/run")
+    persisted_workspace = str(task["workspace_path"] or "").strip()
+    if not persisted_workspace or (
+        Path(persisted_workspace).expanduser().resolve()
+        != Path(workspace).expanduser().resolve()
+    ):
+        raise RuntimeError("dispatcher-owned workspace does not match the live task")
     return expected.resolve()
 
 
@@ -293,7 +355,28 @@ def _leg_available(leg: BackendLeg, profile_home: Path | None = None) -> bool:
 def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[str, ...]:
     """Compare this task's effective tool/context contract to one route leg."""
     if leg.kind == "api":
-        return ()
+        from agent.models_dev import get_model_capabilities
+
+        capabilities = get_model_capabilities(leg.provider or "", leg.model)
+        if capabilities is None:
+            return ("capability_evidence",)
+        missing: set[str] = set()
+        required = set(getattr(args, "required_toolset", ()) or ())
+        if required and not capabilities.supports_tools:
+            missing.add("tools")
+        if (
+            bool(getattr(args, "requires_native_image", False))
+            and not capabilities.supports_vision
+        ):
+            missing.add("native_image_input")
+        # required_context_chars covers the frozen effective request buckets.
+        # Reserve the model's maximum output budget as providers enforce the
+        # combined input+output window.  Four chars/token is deliberately rough
+        # and conservative; exact transport construction remains authoritative.
+        input_tokens = (int(getattr(args, "required_context_chars", 0) or 0) + 3) // 4
+        if input_tokens + int(capabilities.max_output_tokens) > int(capabilities.context_window):
+            missing.add("context_window")
+        return tuple(sorted(missing))
     required = set(getattr(args, "required_toolset", ()) or ())
     supported = _CLAUDE_TOOLSETS[leg.capability_mode]
     missing = {f"toolset:{name}" for name in required - supported}

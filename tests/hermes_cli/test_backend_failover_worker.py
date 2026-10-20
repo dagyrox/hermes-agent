@@ -175,6 +175,94 @@ def test_dispatch_context_rejects_mismatched_home_before_artifacts(tmp_path, mon
     assert not (wrong / "cache").exists()
 
 
+def _claimed_dispatch_context(tmp_path, monkeypatch, *, assignee="talos"):
+    from hermes_cli import kanban_db as kb
+
+    profile = tmp_path / "profiles" / assignee
+    profile.mkdir(parents=True)
+    (profile / "SOUL.md").write_text("Assignee identity", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="probe",
+            assignee=assignee,
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        task = kb.claim_task(conn, task_id, claimer="probe-lock")
+    assert task is not None and task.current_run_id is not None
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_PROFILE", assignee)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "probe-lock")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    return profile, workspace, db_path, task
+
+
+def test_dispatch_context_requires_live_owned_task_run_and_workspace(tmp_path, monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    profile, _workspace, _db_path, task = _claimed_dispatch_context(tmp_path, monkeypatch)
+
+    assert worker._validate_dispatch_context(
+        argparse.Namespace(profile="talos", task=task.id),
+        profile_resolver=lambda _profile: str(profile),
+    ) == profile.resolve()
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value", "error"),
+    [
+        ("HERMES_KANBAN_RUN_ID", "999999", "run"),
+        ("HERMES_KANBAN_CLAIM_LOCK", "other-lock", "claim"),
+        ("HERMES_KANBAN_WORKSPACE", "/tmp/other-workspace", "workspace"),
+    ],
+)
+def test_dispatch_context_rejects_unowned_database_identity_before_artifacts(
+    tmp_path, monkeypatch, env_name, value, error
+):
+    from hermes_cli import backend_failover_worker as worker
+
+    profile, _workspace, _db_path, task = _claimed_dispatch_context(tmp_path, monkeypatch)
+    monkeypatch.setenv(env_name, value)
+
+    with pytest.raises(RuntimeError, match=error):
+        worker._validate_dispatch_context(
+            argparse.Namespace(profile="talos", task=task.id),
+            profile_resolver=lambda _profile: str(profile),
+        )
+
+    assert not (profile / "cache").exists()
+
+
+def test_dispatch_context_does_not_create_missing_board(tmp_path, monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    profile = tmp_path / "profiles" / "talos"
+    profile.mkdir(parents=True)
+    (profile / "SOUL.md").write_text("Talos", encoding="utf-8")
+    missing_db = tmp_path / "missing.db"
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_PROFILE", "talos")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(missing_db))
+
+    with pytest.raises(RuntimeError, match="board database"):
+        worker._validate_dispatch_context(
+            argparse.Namespace(profile="talos", task="t_missing"),
+            profile_resolver=lambda _profile: str(profile),
+        )
+
+    assert not missing_db.exists()
+
+
 def test_task_specific_capability_gate_rejects_unsupported_claude_surface():
     from hermes_cli import backend_failover_worker as worker
 
@@ -195,6 +283,48 @@ def test_task_specific_capability_gate_rejects_oversized_context():
     assert getattr(worker, "_capability_mismatches")(
         _leg(kind="claude_code", provider=None), args
     ) == ("context_window",)
+
+
+def test_api_capability_gate_uses_model_evidence_for_context_and_images(monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    capabilities = SimpleNamespace(
+        supports_tools=True,
+        supports_vision=False,
+        supports_reasoning=True,
+        context_window=100,
+        max_output_tokens=20,
+    )
+    monkeypatch.setattr(
+        "agent.models_dev.get_model_capabilities",
+        lambda _provider, _model: capabilities,
+    )
+    args = argparse.Namespace(
+        required_toolset=["file"],
+        required_context_chars=401,
+        requires_native_image=True,
+    )
+
+    assert worker._capability_mismatches(_leg(), args) == (
+        "context_window",
+        "native_image_input",
+    )
+
+
+def test_api_capability_gate_fails_closed_without_model_evidence(monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    monkeypatch.setattr(
+        "agent.models_dev.get_model_capabilities",
+        lambda _provider, _model: None,
+    )
+    args = argparse.Namespace(
+        required_toolset=["file"],
+        required_context_chars=1,
+        requires_native_image=False,
+    )
+
+    assert worker._capability_mismatches(_leg(), args) == ("capability_evidence",)
 
 
 def test_claude_leg_command_uses_subscription_cli_and_scrubs_api_credentials(tmp_path):
