@@ -638,6 +638,8 @@ def _content_policy_blocked_result(
         "completed": False,
         "failed": True,
         "error": f"content_policy_blocked: {error_detail}",
+        "failure_reason": "safety_refusal",
+        "should_fallback": False,
     }
 
 
@@ -2218,7 +2220,9 @@ def run_conversation(
                             "completed": False,
                             "api_calls": api_call_count,
                             "error": _final_response,
-                            "failed": True  # Mark as failure for filtering
+                            "failed": True,  # Mark as failure for filtering
+                            "failure_reason": "format_error",
+                            "should_fallback": True,
                         }
                     
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
@@ -4691,6 +4695,7 @@ def run_conversation(
                             "failed": True,
                             "error": _nonretryable_summary,
                             "failure_reason": classified.reason.value,
+                            "should_fallback": bool(classified.should_fallback),
                             "billing_block": _ce_block,
                         }
                     return {
@@ -4700,6 +4705,8 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        "failure_reason": classified.reason.value,
+                        "should_fallback": bool(classified.should_fallback),
                     }
 
                 if retry_count >= max_retries:
@@ -4900,6 +4907,7 @@ def run_conversation(
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
+                        "should_fallback": bool(classified.should_fallback),
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,

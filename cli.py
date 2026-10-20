@@ -16570,7 +16570,20 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
+                            if os.environ.get("HERMES_BACKEND_FAILOVER_CHILD") == "1":
+                                # The dispatcher-owned cross-runtime supervisor
+                                # needs a stronger contract than generic 0/1:
+                                # only pre-tool availability failures are
+                                # eligible, while refusals and potentially
+                                # side-effecting attempts stop without replay.
+                                try:
+                                    from hermes_cli.backend_failover import (
+                                        classify_failed_result as _classify_failed_result,
+                                    )
+                                    _exit_code = _classify_failed_result(result)
+                                except Exception:
+                                    _exit_code = 1
+                            elif os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"
                             ) in ("rate_limit", "billing"):
                                 try:

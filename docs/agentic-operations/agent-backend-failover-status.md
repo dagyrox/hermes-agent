@@ -1,0 +1,81 @@
+# Agent Routing & Automatic Failover — draft checkpoint status
+
+Project: Agent Routing & Automatic Failover
+Primary repository: `dagyrox/hermes-agent`
+Consumer repository: `dagyrox/or7-platform`, Issue #260
+Acting lane: Talos
+Original implementation card/run: `t_3cb377f6` / run 495 (blocked)
+Checkpoint publication card/run: `t_b679d087` / run 496
+Work packet: `docs/agentic-operations/agent-backend-failover.md`
+Branch: `talos/agent-backend-failover`
+
+## Checkpoint classification
+
+This is an incomplete, reviewable draft checkpoint. It preserves the current implementation and tests for independent review; it is not approval or completion of Issue #260. No runtime activation, service restart, deployment, merge, or full-chain activation has been performed or verified.
+
+The canonical configuration remains disabled by default. The five frozen chains each contain exactly three distinct-provider legs and end in DeepSeek Flash, but a configured route is not evidence that its credentials, capability parity, worker invocation, or end-to-end continuation are correct.
+
+## Preserved implementation inventory
+
+Modified tracked files:
+
+- `agent/conversation_loop.py`
+- `agent/transports/hermes_tools_mcp_server.py`
+- `cli.py`
+- `hermes_cli/config.py`
+- `hermes_cli/fallback_config.py`
+- `hermes_cli/kanban.py`
+- `hermes_cli/kanban_db.py`
+- `tests/agent/transports/test_hermes_tools_mcp_server.py`
+
+New checkpoint files:
+
+- `docs/agentic-operations/agent-backend-failover.md`
+- `docs/agentic-operations/agent-backend-failover-status.md`
+- `docs/agentic-operations/backend-failover.canonical.yaml`
+- `hermes_cli/backend_failover.py`
+- `hermes_cli/backend_failover_worker.py`
+- `hermes_cli/backend_smoke.py`
+- `tests/hermes_cli/test_backend_failover.py`
+- `tests/hermes_cli/test_backend_failover_worker.py`
+
+## Evidence reported by the preceding Talos run
+
+The following results are self-reported by Talos run 495 and remain pending an independent rerun on the published commit:
+
+- Focused failover/MCP suite: **75 passed, 0 failed**.
+- Bounded regression matrix: **369 passed, 0 failed** across 17 failover/auth/cooldown/gateway/Kanban files; this matrix preceded the final two small repairs, while the focused suite was rerun afterward.
+- Read-only provider smokes: Claude Code Opus 5.5 **PASS**, Claude Code Sonnet 5.5 **PASS**, and Codex Sol 6.1 **PASS**.
+- Codex Luna 6 was unavailable with an observed HTTP 401 authentication rejection.
+- DeepSeek Flash was unavailable because the assignee profile had no usable `DEEPSEEK_API_KEY`.
+- The smoke subprocesses reportedly excluded parent Kanban lifecycle identity after the isolation repair.
+
+These observations do not constitute a verified three-leg failover run. No complete primary → fallback1 → fallback2 chain, exact-head hosted CI result, or independent acceptance review exists at this checkpoint.
+
+## Unresolved merge blockers
+
+Independent review identified four unresolved blocker classes. This publication card intentionally does not repair them:
+
+1. **Assignee-specific toolsets and API child hooks.** Worker argv must resolve required toolsets from the assignee profile rather than the dispatcher home, and API children must preserve `--accept-hooks` plus pinned `--toolsets`.
+2. **Fail-closed assignee profile identity.** Missing or mismatched profile identity must fail closed before constructing Claude SOUL/MCP state; dispatcher-home or generic `~/.hermes` fallback must not silently substitute another identity. Tests need an explicit injectable resolver rather than production fallback behavior.
+3. **Profile-scoped credential status/execution parity.** API availability/status resolution currently risks using supervisor/dispatcher credentials while execution belongs to the assignee profile. Status and execution must use the same profile-scoped credential source, or the child must authoritatively classify pre-tool auth failure.
+4. **Evidence-derived capabilities.** API and cross-runtime route capabilities, especially image input, must be derived from actual backend/profile evidence rather than a blanket declaration before parity checks can be trusted.
+
+The work packet describes event-driven continuation through persisted Kanban transitions. The current checkpoint does not demonstrate that full coordinator wake path. Slack is only a notification surface; no Slack subscription or message proves Kanban continuation, acknowledgement, or next-leg execution. This Slack-versus-Kanban integration remains uncovered end to end.
+
+## Claude CLI provenance caveat
+
+A prior run reported that the installed Claude CLI changed despite the original restriction against updating the active binary. The latest Talos report observed version `2.1.81` and package/binary modification times associated with run 490, but did not perform another update. The provenance and operational impact require independent review. Do not repeat an install/update as part of checkpoint review.
+
+## Required next owner and gates
+
+Athena should review the immutable draft PR head against this status and the work packet, then route bounded repairs back to Talos. Before activation or merge, the final candidate still requires:
+
+- repairs for all four blocker classes;
+- independent reruns of focused and regression verification on the repaired exact head;
+- profile-isolated live evidence for each intended backend, including resolution of or an explicit operator decision for Luna authentication and DeepSeek credential availability;
+- a controlled, side-effect-safe full-chain failover exercise;
+- exact-head hosted CI and independent architecture/security review;
+- explicit human approval before runtime activation, deployment, or restart.
+
+Issue #260 remains incomplete. The original implementation card remains blocked pending independent review and bounded repair.

@@ -8738,6 +8738,32 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _backend_failover_worker_argv(
+    task: Task,
+    profile: str,
+    hermes_home: Optional[str],
+) -> Optional[list[str]]:
+    """Return the bounded cross-runtime supervisor argv when activated.
+
+    Per-task model/provider overrides remain authoritative and intentionally
+    bypass canonical role routing. Invalid activated config raises so the
+    dispatcher records a spawn failure instead of silently degrading to an
+    unreviewed route.
+    """
+
+    if (
+        getattr(task, "model_override", None)
+        or getattr(task, "provider_override", None)
+        or getattr(task, "goal_mode", False)
+    ):
+        return None
+    from hermes_cli.backend_failover import load_profile_chain, worker_argv
+
+    chain = load_profile_chain(profile, hermes_home)
+    required_toolsets = _resolve_worker_cli_toolsets(hermes_home)
+    return worker_argv(task, profile, chain, required_toolsets) if chain else None
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8766,6 +8792,11 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    # The long-lived dispatcher's config owns the single authoritative
+    # role→chain map. Capture its home before HERMES_HOME is rewritten to the
+    # assignee profile for the actual worker process.
+    from hermes_constants import get_hermes_home
+    dispatcher_hermes_home = str(get_hermes_home())
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -8847,6 +8878,14 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # Cross-runtime chains are supervised by a tiny dispatcher-owned wrapper.
+    # It inherits the exact same task/run/board/workspace identity assembled
+    # above, and each child leg gets one attempt.  Profiles without an active
+    # chain continue through the historical direct Hermes worker path.
+    supervisor_cmd = _backend_failover_worker_argv(
+        task, profile_arg, dispatcher_hermes_home
+    )
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -8855,7 +8894,7 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = [
+    cmd = supervisor_cmd or [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
         "--cli",
@@ -8870,11 +8909,11 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
+    if supervisor_cmd is None and task.skills:
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
+    if supervisor_cmd is None and task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
@@ -8882,14 +8921,15 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
-    if task.goal_mode:
+    if supervisor_cmd is None:
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if worker_toolsets:
+            cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+        cmd.extend([
+            "chat",
+            "-q", prompt,
+        ])
+    if supervisor_cmd is None and task.goal_mode:
         # Goal-mode workers must take the fully-quiet single-query path:
         # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
         # cli.py's quiet branch. Without -Q the worker gets exactly one
