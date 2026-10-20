@@ -7,6 +7,7 @@ import pytest
 from agent.transports.gateway_claude_turn import (
     InMemorySessionStore,
     ProjectionError,
+    project_bounded_history,
     project_hermes_history,
 )
 from agent.transports.gateway_owner_mcp import FrozenOwnerMcpFacade, decode_mcp_tool_name
@@ -79,7 +80,8 @@ def test_mcp_facade_rejects_non_owner_encoded_names(name):
         decode_mcp_tool_name(name)
 
 
-def test_roleful_projector_preserves_tool_use_result_and_current_user_is_not_seeded():
+@pytest.mark.asyncio
+async def test_roleful_projector_preserves_tool_use_result_and_current_user_is_not_seeded():
     history = [
         {"role": "user", "content": "previous user"},
         {
@@ -122,11 +124,14 @@ def test_roleful_projector_preserves_tool_use_result_and_current_user_is_not_see
     assert entries[2]["parentUuid"] == entries[1]["uuid"]
 
     store = InMemorySessionStore()
-    store.append("claude-session", entries)
-    loaded = store.load("claude-session")
+    key = {"project_key": "gateway", "session_id": "claude-session"}
+    await store.append(key, entries)
+    loaded = await store.load(key)
     assert loaded == entries
+    assert loaded is not None
     loaded[0]["message"]["content"] = "mutated"
-    assert store.load("claude-session") == entries
+    assert await store.load(key) == entries
+    assert await store.load({**key, "session_id": "missing"}) is None
 
 
 def test_projector_rejects_orphan_tool_result_and_malformed_arguments():
@@ -150,4 +155,25 @@ def test_projector_rejects_orphan_tool_result_and_malformed_arguments():
                 }
             ],
             session_id="s",
+        )
+
+
+def test_bounded_projector_fails_closed_without_truncating_role_chains():
+    history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+    ]
+    with pytest.raises(ProjectionError, match="2 messages"):
+        project_bounded_history(
+            history,
+            session_id="s",
+            max_messages=1,
+            max_bytes=10_000,
+        )
+    with pytest.raises(ProjectionError, match="bytes"):
+        project_bounded_history(
+            history,
+            session_id="s",
+            max_messages=2,
+            max_bytes=1,
         )

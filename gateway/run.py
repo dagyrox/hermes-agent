@@ -18823,6 +18823,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``."""
+        bridges = self.__dict__.get("_owner_tool_bridges")
+        binding = bridges.pop(session_key, None) if bridges is not None else None
+        if binding is not None:
+            _bound_generation, bridge = binding
+            try:
+                bridge.revoke(reason or "run_generation_invalidated")
+            except Exception:
+                logger.warning(
+                    "Failed to revoke owner tool bridge for %s",
+                    session_key,
+                    exc_info=True,
+                )
         generation = self._begin_session_run_generation(session_key)
         if reason:
             logger.info(
@@ -18832,6 +18844,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reason,
             )
         return generation
+
+    def _register_owner_tool_bridge(
+        self,
+        session_key: str,
+        generation: int,
+        bridge: Any,
+    ) -> None:
+        """Bind one request-scoped bridge to the currently owned gateway run."""
+        if not session_key or not self._is_session_run_current(session_key, generation):
+            bridge.revoke("stale_generation")
+            raise RuntimeError("cannot register owner bridge for a stale gateway run")
+        bridges = self.__dict__.setdefault("_owner_tool_bridges", {})
+        prior = bridges.get(session_key)
+        if prior is not None and prior[1] is not bridge:
+            prior[1].revoke("owner_replaced")
+        bridges[session_key] = (int(generation), bridge)
+
+    def _unregister_owner_tool_bridge(
+        self,
+        session_key: str,
+        generation: int,
+        bridge: Any,
+    ) -> None:
+        """Drop only this turn's bridge; a delayed finally cannot clear a successor."""
+        bridges = self.__dict__.get("_owner_tool_bridges")
+        if not bridges:
+            return
+        current = bridges.get(session_key)
+        if current == (int(generation), bridge):
+            bridges.pop(session_key, None)
 
     def _is_session_run_current(self, session_key: str, generation: int) -> bool:
         """Return True when ``generation`` is still current for ``session_key``."""
@@ -22066,7 +22108,173 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                # Freeze the exact owner prompt/tool surface before the primary
+                # provider runs. A later cross-runtime leg may consume this
+                # snapshot, but may never rebuild or widen it after failure.
+                _owner_failover_dispatch = None
+                _owner_failover_chain = ()
+                try:
+                    from dataclasses import asdict
+                    from gateway.backend_failover import FrozenLegDispatch, FrozenTurn
+                    from hermes_cli.backend_failover import resolve_role_chain
+
+                    _owner_failover_chain = resolve_role_chain(
+                        user_config.get("agent_backend_failover") or {},
+                        self._active_profile_name(),
+                    )
+                    if _owner_failover_chain:
+                        _legs = [asdict(leg) for leg in _owner_failover_chain]
+                        _frozen_turn = FrozenTurn.create(
+                            session_key=session_key,
+                            session_id=session_id,
+                            event_id=f"{session_key}:{run_generation}",
+                            generation=int(run_generation or 0),
+                            prompt={
+                                "system": getattr(agent, "_cached_system_prompt", None)
+                                or agent._build_system_prompt(),
+                                "history": agent_history,
+                                "current": _api_run_message,
+                            },
+                            tools=getattr(agent, "tools", None) or [],
+                            media=(),
+                            legs=_legs,
+                        )
+                        _owner_failover_dispatch = FrozenLegDispatch(
+                            prompt_json=json.dumps(
+                                _frozen_turn.prompt,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                            ),
+                            tools_json=json.dumps(
+                                _frozen_turn.tools,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                            ),
+                            media_json=json.dumps(
+                                _frozen_turn.media,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                            ),
+                            leg_json=json.dumps(
+                                _legs[1] if len(_legs) > 1 else _legs[0],
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                            ),
+                            prompt_digest=_frozen_turn.prompt_digest,
+                            tool_digest=_frozen_turn.tool_digest,
+                            media_digest=_frozen_turn.media_digest,
+                            chain_digest=_frozen_turn.chain_digest,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Unable to freeze gateway owner failover dispatch",
+                        exc_info=True,
+                    )
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                # One exercised shipping vertical: when the configured primary
+                # API leg fails before any tool activity and the next canonical
+                # leg is Claude Code, execute that leg through the request-scoped
+                # owner bridge. The surrounding gateway path remains the sole
+                # transcript/final-delivery owner.
+                if _owner_failover_dispatch is not None:
+                    try:
+                        from hermes_cli.backend_failover import (
+                            EXIT_ELIGIBLE,
+                            classify_failed_result,
+                        )
+
+                        _chain = _owner_failover_chain
+                        _primary_provider = str(
+                            (turn_route.get("runtime") or {}).get("provider") or ""
+                        ).lower()
+                        _primary_matches = bool(
+                            _chain
+                            and _chain[0].kind == "api"
+                            and _chain[0].model == turn_route.get("model")
+                            and _chain[0].provider == _primary_provider
+                        )
+                        if (
+                            _primary_matches
+                            and len(_chain) > 1
+                            and _chain[1].kind == "claude_code"
+                            and classify_failed_result(result) == EXIT_ELIGIBLE
+                        ):
+                            from agent.transports.gateway_claude_sdk import (
+                                ClaudeSubscriptionTurn,
+                                run_claude_subscription_turn,
+                            )
+                            from gateway.owner_tool_bridge import OwnerToolBridge, OwnerTurnExecution
+
+                            _execution = OwnerTurnExecution(
+                                agent=agent,
+                                messages=list(result.get("messages") or []),
+                                dispatch=_owner_failover_dispatch,
+                                effective_task_id=session_id,
+                                turn_id=f"{session_key}:{run_generation}",
+                                coordinator_id=_frozen_turn.coordinator_id,
+                                attempt_id=f"{_frozen_turn.coordinator_id}:1",
+                                generation=int(run_generation or 0),
+                                snapshot_digest=_owner_failover_dispatch.prompt_digest,
+                                identity=(platform_key, str(source.user_id), session_key),
+                            )
+                            _bridge = OwnerToolBridge.open(
+                                _owner_failover_dispatch,
+                                _execution,
+                            )
+                            self._register_owner_tool_bridge(
+                                session_key,
+                                int(run_generation or 0),
+                                _bridge,
+                            )
+                            try:
+                                _claude_final = run_claude_subscription_turn(
+                                    ClaudeSubscriptionTurn(
+                                        model=_chain[1].model,
+                                        prompt=_api_run_message
+                                        if isinstance(_api_run_message, str)
+                                        else message,
+                                        history=agent_history,
+                                        system_prompt=json.loads(
+                                            _owner_failover_dispatch.prompt_json
+                                        )["system"],
+                                        cwd=os.getcwd(),
+                                    ),
+                                    _owner_failover_dispatch,
+                                    _bridge,
+                                    is_cancelled=lambda: not _run_still_current()
+                                    or bool(
+                                        getattr(agent, "_interrupt_requested", False)
+                                    ),
+                                )
+                            finally:
+                                self._unregister_owner_tool_bridge(
+                                    session_key,
+                                    int(run_generation or 0),
+                                    _bridge,
+                                )
+                                _bridge.close()
+                            _messages = list(result.get("messages") or [])
+                            _messages.append(
+                                {"role": "assistant", "content": _claude_final}
+                            )
+                            result = {
+                                **result,
+                                "final_response": _claude_final,
+                                "messages": _messages,
+                                "failed": False,
+                                "partial": False,
+                                "completed": True,
+                                "error": None,
+                                "failure_reason": None,
+                                "should_fallback": False,
+                                "backend_failover_leg": "claude_code",
+                            }
+                    except Exception:
+                        logger.exception("Gateway Claude subscription failover leg failed")
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

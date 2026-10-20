@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import subprocess
@@ -214,5 +215,58 @@ print(json.dumps(response, sort_keys=True))
         "content": json.dumps({"ok": True, "owner": "gateway-task"}),
         "is_error": False,
     }
+    assert len(agent.calls) == 1
+    bridge.close()
+
+
+def test_real_mcp_stdio_child_lists_frozen_schema_and_calls_owner(tmp_path):
+    agent = _OwnerAgent()
+    bridge = OwnerToolBridge.open(_dispatch(), _execution(agent), runtime_root=tmp_path)
+    observed = {}
+    failure = []
+
+    async def child_main():
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m",
+                "agent.transports.gateway_owner_mcp",
+                str(bridge.config_path),
+            ],
+            cwd=str(Path(__file__).resolve().parents[2]),
+        )
+        async with stdio_client(params) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                observed["listed"] = await session.list_tools()
+                observed["called"] = await session.call_tool(
+                    "mcp__gateway-owner__todo", {"merge": True}
+                )
+
+    def child_worker():
+        try:
+            asyncio.run(child_main())
+        except BaseException as exc:
+            failure.append(exc)
+
+    child = threading.Thread(target=child_worker, daemon=True)
+    child.start()
+    while child.is_alive():
+        bridge.drain_one(timeout=0.05)
+    child.join(timeout=1.0)
+
+    assert not failure
+    assert [tool.name for tool in observed["listed"].tools] == [
+        "mcp__gateway-owner__todo"
+    ]
+    assert observed["listed"].tools[0].inputSchema == {
+        "type": "object",
+        "properties": {"merge": {"type": "boolean"}},
+        "additionalProperties": False,
+    }
+    assert observed["called"].isError is False
     assert len(agent.calls) == 1
     bridge.close()

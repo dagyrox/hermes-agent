@@ -7,8 +7,9 @@ non-authoritative; Hermes' SessionDB and failover ledger remain the commit log.
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 import uuid
 
 
@@ -17,20 +18,42 @@ class ProjectionError(ValueError):
 
 
 class InMemorySessionStore:
-    """Minimal request-local SessionStore boundary used by the Agent SDK adapter."""
+    """Request-local Claude ``SessionStore``; Hermes remains authoritative.
+
+    The Claude SDK protocol is asynchronous and keys entries by
+    ``(project_key, session_id, optional subpath)``.  Only ``append`` and
+    ``load`` are implemented intentionally: listing, deletion, and durable
+    resume would imply authority this disposable per-request adapter does not
+    own.
+    """
 
     def __init__(self) -> None:
-        self._entries: dict[str, list[dict[str, Any]]] = {}
+        self._sessions: dict[tuple[str, str, str | None], list[dict[str, Any]]] = {}
 
-    def append(self, key: str, entries: Iterable[Mapping[str, Any]]) -> None:
-        if not key:
-            raise ValueError("session store key is required")
-        bucket = self._entries.setdefault(key, [])
-        bucket.extend(deepcopy([dict(entry) for entry in entries]))
+    @staticmethod
+    def _key(key: Mapping[str, Any]) -> tuple[str, str, str | None]:
+        project_key = key.get("project_key")
+        session_id = key.get("session_id")
+        subpath = key.get("subpath")
+        if not isinstance(project_key, str) or not project_key:
+            raise ValueError("session store key requires project_key")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session store key requires session_id")
+        if subpath is not None and (not isinstance(subpath, str) or not subpath):
+            raise ValueError("session store subpath must be a non-empty string")
+        return project_key, session_id, subpath
 
-    def load(self, key: str) -> list[dict[str, Any]]:
-        return deepcopy(self._entries.get(key, []))
+    async def append(
+        self,
+        key: Mapping[str, Any],
+        entries: Sequence[Mapping[str, Any]],
+    ) -> None:
+        copied = deepcopy([dict(entry) for entry in entries])
+        self._sessions.setdefault(self._key(key), []).extend(copied)
 
+    async def load(self, key: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+        entries = self._sessions.get(self._key(key))
+        return None if entries is None else deepcopy(entries)
 
 def _text_blocks(content: Any) -> list[dict[str, Any]]:
     if content is None or content == "":
@@ -54,7 +77,7 @@ def _text_blocks(content: Any) -> list[dict[str, Any]]:
 
 
 def project_hermes_history(
-    history: Iterable[Mapping[str, Any]], *, session_id: str
+    history: Iterable[Mapping[str, Any]], *, session_id: str, cwd: str = ""
 ) -> list[dict[str, Any]]:
     """Project previous Hermes roles into linked Claude transcript entries.
 
@@ -129,15 +152,61 @@ def project_hermes_history(
             raise ProjectionError(f"unsupported Hermes history role {role!r}")
 
         entry_uuid = str(uuid.uuid4())
+        message: dict[str, Any] = {"role": projected_role, "content": content}
+        if projected_role == "assistant":
+            message.update(
+                {
+                    "id": f"msg_{entry_uuid.replace('-', '')}",
+                    "type": "message",
+                    "model": "hermes-history-projection",
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                }
+            )
         entries.append(
             {
                 "type": projected_role,
                 "uuid": entry_uuid,
                 "parentUuid": parent_uuid,
                 "sessionId": session_id,
-                "message": {"role": projected_role, "content": content},
+                "isSidechain": False,
+                "userType": "external",
+                "cwd": cwd,
+                "version": "hermes-agent",
+                "gitBranch": "",
+                "timestamp": datetime.now(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "message": message,
             }
         )
         parent_uuid = entry_uuid
 
+    return entries
+
+
+def project_bounded_history(
+    history: Iterable[Mapping[str, Any]],
+    *,
+    session_id: str,
+    max_messages: int,
+    max_bytes: int,
+    cwd: str = "",
+) -> list[dict[str, Any]]:
+    """Project history and fail closed when the request-local bounds are exceeded."""
+    if max_messages < 0 or max_bytes < 0:
+        raise ValueError("history projection bounds must be non-negative")
+    entries = project_hermes_history(history, session_id=session_id, cwd=cwd)
+    if len(entries) > max_messages:
+        raise ProjectionError(
+            f"Hermes history has {len(entries)} messages; limit is {max_messages}"
+        )
+    encoded = json.dumps(entries, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    if len(encoded) > max_bytes:
+        raise ProjectionError(
+            f"Hermes history projection is {len(encoded)} bytes; limit is {max_bytes}"
+        )
     return entries

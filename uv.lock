@@ -674,6 +674,25 @@ wheels = [
 ]
 
 [[package]]
+name = "claude-agent-sdk"
+version = "0.2.169"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "jsonschema" },
+    { name = "mcp" },
+    { name = "sniffio" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7e/1a/6bfa215914bfd27d46291a42235f9b12aea46ec2b03de62c0511a2dcc6a9/claude_agent_sdk-0.2.169.tar.gz", hash = "sha256:7f98bca9e905c25f9d0ff95037a8779c72345ea965ad27bc70aa84ff4c1d5380", size = 393318, upload-time = "2026-10-20T21:37:36.398Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/31/df/6bd981da835d580de8112e7f1fe43474b002866dfabf3124e1e644b48c46/claude_agent_sdk-0.2.169-py3-none-macosx_11_0_arm64.whl", hash = "sha256:0a9a3751641324afe6160d4d0bce3bc642b3ef22eb511f2932e1ad95a2ab362d", size = 115179160, upload-time = "2026-10-20T21:37:42.875Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/fa/d5294572ef47c2801d50317380f870e8839741c33b9aedbadb0167242072/claude_agent_sdk-0.2.169-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:33776fc9b06131375634a1eaa2abc308fd404345198fd6684676656b81573c4c", size = 120844060, upload-time = "2026-10-20T21:37:48.779Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/7a/de429ad94e95f8fe2d840a312c93454b6a6dcca4bbb6208183271c862441/claude_agent_sdk-0.2.169-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:fcb0d31ba341a325f0a431e9a00ce84b5f132450e75869dfd1bb612ff5ff0731", size = 124929395, upload-time = "2026-10-20T21:37:55.354Z" },
+    { url = "https://files.pythonhosted.org/packages/26/08/f32c35f4f89ddbf6b13a53d14a2f868c0ef1fe4a031420e26ef8a2cec3f5/claude_agent_sdk-0.2.169-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:298c1b6cce775150895164c38207e2051eb57c27fbeb099a49ff5087980536a1", size = 125273984, upload-time = "2026-10-20T21:38:01.628Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/e9/a08f90d03adc482298aaa0f190b6c9d9097057a5786e7264724244fc512a/claude_agent_sdk-0.2.169-py3-none-win_amd64.whl", hash = "sha256:8bb28acf416488c633fa5fdbc3e3f13a612f29472cb78e067f918ca8bedc09d9", size = 128717685, upload-time = "2026-10-20T21:38:08.709Z" },
+]
+
+[[package]]
 name = "click"
 version = "8.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1579,6 +1598,9 @@ azure-identity = [
 bedrock = [
     { name = "boto3" },
 ]
+claude-subscription = [
+    { name = "claude-agent-sdk" },
+]
 cli = [
     { name = "simple-term-menu" },
 ]
@@ -1749,6 +1771,7 @@ requires-dist = [
     { name = "boto3", marker = "extra == 'bedrock'", specifier = "==1.42.89" },
     { name = "brotlicffi", marker = "extra == 'messaging'", specifier = "==1.2.0.1" },
     { name = "certifi", specifier = "==2026.5.20" },
+    { name = "claude-agent-sdk", marker = "extra == 'claude-subscription'", specifier = "==0.2.169" },
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'", specifier = "==0.9.29" },
     { name = "croniter", specifier = "==6.0.0" },
     { name = "cryptography", specifier = "==46.0.7" },
@@ -1855,7 +1878,7 @@ requires-dist = [
     { name = "websockets", specifier = "==15.0.1" },
     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = "==1.2.4" },
 ]
-provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "cli", "tts-premium", "voice", "honcho", "supermemory", "mem0", "vision", "pty", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
+provides-extras = ["anthropic", "claude-subscription", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "cli", "tts-premium", "voice", "honcho", "supermemory", "mem0", "vision", "pty", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "mistral", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
 
 [[package]]
 name = "hf-xet"
