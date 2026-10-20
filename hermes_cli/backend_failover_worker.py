@@ -64,6 +64,9 @@ _LIFECYCLE_TOOLS = (
 _PROFILE_TOOLS = ("skills_list", "skill_view")
 _ORCHESTRATOR_TOOLS = ("kanban_list", "kanban_create", "kanban_link")
 _CLAUDE_CONTEXT_CHAR_LIMIT = 600_000
+_REQUEST_ENVELOPE_CHARS = 512
+_NATIVE_IMAGE_ENVELOPE_CHARS = 256
+_EMPTY_TOOLSET_PIN = "__backend_failover_no_explicit_tools__"
 _CLAUDE_NATIVE_TOOL_EQUIVALENTS = frozenset({
     "execute_code",
     "patch",
@@ -86,6 +89,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--required-toolset", action="append", default=[])
     parser.add_argument("--required-context-chars", type=int, default=0)
     parser.add_argument("--requires-native-image", action="store_true")
+    parser.add_argument("--native-image-bytes", type=int, default=0)
+    parser.add_argument("--native-image-path", action="append", default=[])
     parser.add_argument("--chain-json")
     return parser.parse_args(argv)
 
@@ -368,8 +373,6 @@ def _resolved_required_tool_schemas(
     proof that a backend can execute it.
     """
 
-    if not required_toolsets:
-        return set(), 0
     try:
         get_tool_definitions = importlib.import_module("model_tools").get_tool_definitions
         definitions = get_tool_definitions(
@@ -414,6 +417,17 @@ def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[s
         if capabilities is None:
             return ("capability_evidence",)
         missing: set[str] = set()
+        if not (
+            getattr(capabilities, "context_window_observed", False)
+            and getattr(capabilities, "max_output_tokens_observed", False)
+            and isinstance(capabilities.context_window, int)
+            and not isinstance(capabilities.context_window, bool)
+            and capabilities.context_window > 0
+            and isinstance(capabilities.max_output_tokens, int)
+            and not isinstance(capabilities.max_output_tokens, bool)
+            and capabilities.max_output_tokens > 0
+        ):
+            missing.add("context_limit_evidence")
         if required_tools and not capabilities.supports_tools:
             missing.add("tools")
         if (
@@ -421,6 +435,10 @@ def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[s
             and not capabilities.supports_vision
         ):
             missing.add("native_image_input")
+        if bool(getattr(args, "requires_native_image", False)) and len(
+            getattr(args, "native_image_path", ()) or ()
+        ) != 1:
+            missing.add("native_image_transport")
         # required_context_chars covers the frozen effective request buckets.
         # Reserve the model's maximum output budget as providers enforce the
         # combined input+output window.  Four chars/token is deliberately rough
@@ -439,7 +457,7 @@ def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[s
     if int(getattr(args, "required_context_chars", 0) or 0) > _CLAUDE_CONTEXT_CHAR_LIMIT:
         missing.add("context_window")
     # Reasoning mode is frozen and validated at config load. Lifecycle is the
-    # strict MCP surface; image input is supplied by Claude's image-capable Read.
+    # strict MCP surface; native image payloads remain ineligible on this path.
     return tuple(sorted(missing))
 
 
@@ -449,6 +467,7 @@ def _effective_context_chars(
     declared_chars: int,
     system_prompt_path: Path | None,
     required_toolsets: list[str] | tuple[str, ...] = (),
+    native_image_bytes: int = 0,
 ) -> int:
     """Measure the durable handoff plus loaded prompt, not only title/body."""
 
@@ -461,9 +480,22 @@ def _effective_context_chars(
         system_chars = len(system_prompt_path.read_text(encoding="utf-8"))
     _tool_names, schema_chars = _resolved_required_tool_schemas(required_toolsets)
     task_prompt_chars = len(f"work kanban task {task_id}")
+    image_bytes = max(0, int(native_image_bytes or 0))
+    # CLI/API transports serialize native image bytes into a base64 request
+    # part. Count that expansion plus fixed message/envelope framing.
+    native_media_chars = (
+        4 * ((image_bytes + 2) // 3) + _NATIVE_IMAGE_ENVELOPE_CHARS
+        if image_bytes
+        else 0
+    )
     return max(
         int(declared_chars or 0),
-        len(worker_context) + system_chars + task_prompt_chars + schema_chars,
+        len(worker_context)
+        + system_chars
+        + task_prompt_chars
+        + schema_chars
+        + native_media_chars
+        + _REQUEST_ENVELOPE_CHARS,
     )
 
 
@@ -570,12 +602,18 @@ def _leg_command(
         for skill in getattr(args, "skill", ()):
             cmd.extend(["--skills", skill])
         required_toolsets = list(getattr(args, "required_toolset", ()) or ())
-        if required_toolsets:
-            cmd.extend(["--toolsets", ",".join(required_toolsets)])
+        cmd.extend([
+            "--toolsets",
+            ",".join(required_toolsets) if required_toolsets else _EMPTY_TOOLSET_PIN,
+        ])
+        native_images = list(getattr(args, "native_image_path", ()) or ())
         # Quiet mode propagates classified pre-tool provider failures as exit
         # 75 so the supervisor can advance rather than treating CLI exit 0 as
         # a successful task execution.
-        cmd.extend(["chat", "-q", prompt, "-Q"])
+        cmd.extend(["chat", "-q", prompt])
+        if len(native_images) == 1:
+            cmd.extend(["--image", native_images[0]])
+        cmd.append("-Q")
         env = _api_environment(base_env)
         env["HERMES_BACKEND_FAILOVER_CHILD"] = "1"
         return cmd, env
@@ -924,6 +962,7 @@ def run(argv: list[str] | None = None) -> int:
             declared_chars=args.required_context_chars,
             system_prompt_path=system_path,
             required_toolsets=list(getattr(args, "required_toolset", ()) or ()),
+            native_image_bytes=int(getattr(args, "native_image_bytes", 0) or 0),
         )
     deadline = (
         time.monotonic() + args.timeout_seconds
@@ -951,6 +990,8 @@ def run(argv: list[str] | None = None) -> int:
                 "skills": list(getattr(args, "skill", ()) or ()),
                 "transcript_source": "kanban_card_parent_handoffs_and_comments",
                 "approval_state": "preserved_on_kanban_task",
+                "requires_native_image": bool(args.requires_native_image),
+                "native_image_bytes": max(0, int(args.native_image_bytes or 0)),
             },
         }
         attempts.append(record)

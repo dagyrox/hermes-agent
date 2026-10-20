@@ -237,6 +237,10 @@ def worker_argv(
     profile: str,
     chain: Sequence[BackendLeg] | None = None,
     required_toolsets: Sequence[str] | None = None,
+    *,
+    requires_native_image: bool = False,
+    native_image_bytes: int = 0,
+    native_image_paths: Sequence[str] = (),
 ) -> list[str]:
     configured_timeout = getattr(task, "max_runtime_seconds", None)
     timeout = max(0, int(configured_timeout)) if configured_timeout is not None else 0
@@ -258,6 +262,11 @@ def worker_argv(
         ])
     for toolset in required_toolsets or ():
         argv.extend(["--required-toolset", str(toolset)])
+    if requires_native_image:
+        argv.append("--requires-native-image")
+        argv.extend(["--native-image-bytes", str(max(0, int(native_image_bytes)))])
+        for path in native_image_paths:
+            argv.extend(["--native-image-path", str(path)])
     context_chars = len(str(getattr(task, "title", "") or "")) + len(
         str(getattr(task, "body", "") or "")
     )

@@ -8728,7 +8728,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
+        return toolsets
     except Exception as exc:
         _log.debug(
             "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
@@ -8738,11 +8738,41 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _native_image_attachment_evidence(
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> tuple[list[str], int]:
+    """Return immutable image paths and verified bytes from the durable task."""
+
+    paths: list[str] = []
+    total_bytes = 0
+    with connect_closing(board=board) as conn:
+        for attachment in list_attachments(conn, task_id):
+            if not str(attachment.content_type or "").lower().startswith("image/"):
+                continue
+            path = Path(attachment.stored_path)
+            if not path.is_file():
+                raise RuntimeError(
+                    f"backend failover image attachment is unavailable: {attachment.filename}"
+                )
+            actual_size = path.stat().st_size
+            if attachment.size > 0 and attachment.size != actual_size:
+                raise RuntimeError(
+                    f"backend failover image attachment size changed: {attachment.filename}"
+                )
+            paths.append(str(path.resolve()))
+            total_bytes += actual_size
+    return paths, total_bytes
+
+
 def _backend_failover_worker_argv(
     task: Task,
     profile: str,
     dispatcher_home: Optional[str],
     assignee_home: Optional[str],
+    *,
+    board: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Return the bounded cross-runtime supervisor argv when activated.
 
@@ -8765,8 +8795,26 @@ def _backend_failover_worker_argv(
         raise RuntimeError(
             f"backend failover assignee profile {profile!r} does not exist"
         )
+    if not chain:
+        return None
     required_toolsets = _resolve_worker_cli_toolsets(assignee_home)
-    return worker_argv(task, profile, chain, required_toolsets) if chain else None
+    if required_toolsets is None:
+        raise RuntimeError(
+            f"backend failover could not resolve CLI toolsets for assignee {profile!r}"
+        )
+    native_image_paths, native_image_bytes = _native_image_attachment_evidence(
+        task.id,
+        board=board,
+    )
+    return worker_argv(
+        task,
+        profile,
+        chain,
+        required_toolsets,
+        requires_native_image=bool(native_image_paths),
+        native_image_bytes=native_image_bytes,
+        native_image_paths=native_image_paths,
+    )
 
 
 def _default_spawn(
@@ -8888,7 +8936,11 @@ def _default_spawn(
     # above, and each child leg gets one attempt.  Profiles without an active
     # chain continue through the historical direct Hermes worker path.
     supervisor_cmd = _backend_failover_worker_argv(
-        task, profile_arg, dispatcher_hermes_home, assignee_hermes_home
+        task,
+        profile_arg,
+        dispatcher_hermes_home,
+        assignee_hermes_home,
+        board=board,
     )
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1

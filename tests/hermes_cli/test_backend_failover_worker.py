@@ -299,6 +299,8 @@ def test_api_capability_gate_uses_model_evidence_for_context_and_images(monkeypa
         supports_reasoning=True,
         context_window=100,
         max_output_tokens=20,
+        context_window_observed=True,
+        max_output_tokens_observed=True,
     )
     monkeypatch.setattr(
         "agent.models_dev.get_model_capabilities",
@@ -308,6 +310,7 @@ def test_api_capability_gate_uses_model_evidence_for_context_and_images(monkeypa
         required_toolset=["file"],
         required_context_chars=401,
         requires_native_image=True,
+        native_image_path=["/tmp/fixture.png"],
     )
 
     assert worker._capability_mismatches(_leg(), args) == (
@@ -518,6 +521,8 @@ def test_api_gate_fails_closed_when_profile_tool_schemas_cannot_be_resolved(monk
             supports_reasoning=True,
             context_window=1000,
             max_output_tokens=10,
+            context_window_observed=True,
+            max_output_tokens_observed=True,
         ),
     )
     args = argparse.Namespace(
@@ -527,6 +532,86 @@ def test_api_gate_fails_closed_when_profile_tool_schemas_cannot_be_resolved(monk
     )
 
     assert worker._capability_mismatches(_leg(), args) == ("tool_schema_evidence",)
+
+
+@pytest.mark.parametrize(
+    ("limit", "observed_field"),
+    [
+        ({"output": 4096}, "context_window_observed"),
+        ({"context": 128_000}, "max_output_tokens_observed"),
+        ({"context": 0, "output": 4096}, "context_window_observed"),
+        ({"context": 128_000, "output": -1}, "max_output_tokens_observed"),
+        ({"context": "128000", "output": 4096}, "context_window_observed"),
+        ({"context": 128_000, "output": "4096"}, "max_output_tokens_observed"),
+        ({"context": 128_000.0, "output": 4096}, "context_window_observed"),
+        ({"context": 128_000, "output": 4096.0}, "max_output_tokens_observed"),
+    ],
+)
+def test_api_gate_rejects_missing_or_invalid_catalog_limits(
+    monkeypatch, limit, observed_field
+):
+    from agent import models_dev
+    from hermes_cli import backend_failover_worker as worker
+
+    monkeypatch.setattr(
+        models_dev,
+        "_get_provider_models",
+        lambda _provider: {
+            "gpt-6.1-sol": {
+                "tool_call": True,
+                "modalities": {"input": ["text"]},
+                "limit": limit,
+            }
+        },
+    )
+    capabilities = models_dev.get_model_capabilities("openai-codex", "gpt-6.1-sol")
+    assert capabilities is not None
+    assert getattr(capabilities, observed_field) is False
+    monkeypatch.setattr(models_dev, "get_model_capabilities", lambda *_args: capabilities)
+    monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _toolsets: (set(), 2))
+    args = argparse.Namespace(
+        required_toolset=[],
+        required_context_chars=1,
+        requires_native_image=False,
+        native_image_path=[],
+    )
+
+    assert worker._capability_mismatches(_leg(), args) == (
+        "context_limit_evidence",
+    )
+
+
+def test_effective_context_size_counts_native_media_and_envelope(tmp_path, monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    system_prompt = tmp_path / "system.md"
+    system_prompt.write_text("system", encoding="utf-8")
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr("hermes_cli.kanban_db.connect_closing", lambda **_kwargs: _Conn())
+    monkeypatch.setattr("hermes_cli.kanban_db.build_worker_context", lambda *_args: "task")
+    monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _toolsets: (set(), 100))
+
+    without_image = worker._effective_context_chars(
+        "t_probe",
+        declared_chars=0,
+        system_prompt_path=system_prompt,
+        required_toolsets=[],
+    )
+    with_image = worker._effective_context_chars(
+        "t_probe",
+        declared_chars=0,
+        system_prompt_path=system_prompt,
+        required_toolsets=[],
+        native_image_bytes=300,
+    )
+    assert with_image - without_image == 400 + worker._NATIVE_IMAGE_ENVELOPE_CHARS
 
 
 def test_effective_context_size_includes_durable_handoff_and_system_prompt(
@@ -916,6 +1001,12 @@ def test_dispatcher_selects_supervisor_only_for_enabled_role(monkeypatch):
         lambda profile, home: (_leg(), _leg(kind="claude_code", provider=None, model="sonnet"), _leg(provider="deepseek", model="deepseek-flash"))
         if profile == "talos"
         else (),
+    )
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: [])
+    monkeypatch.setattr(
+        kb,
+        "_native_image_attachment_evidence",
+        lambda *_args, **_kwargs: ([], 0),
     )
     assert kb._backend_failover_worker_argv(
         task, "talos", "/dispatcher", "/profiles/talos"

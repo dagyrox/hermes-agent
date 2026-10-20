@@ -127,6 +127,41 @@ owner-executor MCP bridge, cancellation/reconciliation, and exactly-once final
 delivery contract. This checkpoint must not be activated or represented as
 Issue #260 complete.
 
+## Bounded B4 repair run 511
+
+Talos repaired the three evidence gaps identified by Athena's round-2 review at
+`b6e71f92f52ba14aa20bc80a68dfa25b9b971706` under card `t_1b0b7dab`, coordinated
+by `t_45e68439`. Valid empty assignee toolset resolution is now distinct from a
+resolver failure: failure aborts supervised spawn, while an empty explicit set
+is pinned with a no-explicit-tools sentinel and still resolves, compares, and
+budgets the implicit task-scoped Kanban schemas that the API child receives.
+
+Supervisor startup now reads image attachment metadata from the durable Kanban
+task before route selection, verifies the immutable file path and size, records
+the native-media requirement and byte count in argv/ledger state, and transports
+exactly one image through the API child's native `--image` input. Claude legs
+remain ineligible for native image payloads, and API legs require both observed
+vision support and an exact supported transport shape; multiple native images
+fail closed rather than being partially forwarded. The frozen request budget
+now includes the exact serialized tool schemas, request framing, and base64
+native-media expansion.
+
+`models.dev` capability results now retain whether context and output limits
+were actually observed. Legacy callers still receive conservative numeric
+defaults, but backend eligibility rejects missing, non-numeric, boolean,
+zero, or negative context/output evidence instead of allowing those defaults
+to certify a route. Behavioral coverage includes valid-empty and failed
+toolset resolution, real durable PNG attachment spawn-to-parity and API argv
+transport, native-media budget accounting, and missing/invalid limit cases.
+
+This remains a reviewable, disabled checkpoint rather than an activation or
+Issue #260 completion. B3 remains dependency-blocked on PR #13. B5 remains out
+of this bounded repair: the shipping Slack/default gateway coordinator,
+durable transition acknowledgement, owner-executor bridge, replay/cancellation
+contract, and exactly-once delivery acceptance are still unimplemented. No
+credential/store mutation, activation, merge, deploy, restart, or PR #13 write
+was performed.
+
 ## Claude CLI provenance caveat
 
 A prior run reported that the installed Claude CLI changed despite the original restriction against updating the active binary. Athena's pinned-head review observed version/package `2.1.304`, executable mtime `2026-10-19T22:54:36Z`, and package mtime `2026-10-19T22:54:28Z`; the older `2.1.81` observation was stale. The provenance and operational impact require independent review. Do not repeat an install/update as part of checkpoint review.
