@@ -232,6 +232,35 @@ class TestDeepseekVSeriesPassThrough:
         assert result == "deepseek-v4-flash"
 
 
+# ── DeepSeek Flash canonical model identity ────────────────────────────
+
+class TestDeepseekFlashCanonicalIdentity:
+    """The direct API's documented Flash model name must reach the wire."""
+
+    @pytest.mark.parametrize("model", [
+        "deepseek-flash",
+        "deepseek/deepseek-flash",
+        "DeepSeek-Flash",
+        "deepseek/DEEPSEEK-FLASH",
+    ])
+    def test_canonical_flash_model_is_preserved(self, model):
+        assert normalize_model_for_provider(model, "deepseek") == "deepseek-flash"
+
+    @pytest.mark.parametrize("model", [
+        "deepseek-flash-1017",
+        "deepseek/deepseek-flash-1017",
+        "DEEPSEEK-FLASH.1017",
+    ])
+    def test_flash_dated_variants_resolve_to_served_identifier(self, model):
+        assert normalize_model_for_provider(model, "deepseek") == "deepseek-flash"
+
+    def test_unknown_flash_suffix_still_falls_back_to_chat(self):
+        assert normalize_model_for_provider("deepseek-flash-preview", "deepseek") == "deepseek-chat"
+
+    def test_reasoner_flash_suffix_still_maps_to_reasoner(self):
+        assert normalize_model_for_provider("deepseek-flash-r1", "deepseek") == "deepseek-reasoner"
+
+
 # ── DeepSeek regressions (existing behaviour still holds) ──────────────
 
 class TestDeepseekCanonicalAndReasonerMapping:
