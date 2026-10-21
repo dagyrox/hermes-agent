@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 
 import pytest
 
@@ -86,7 +87,7 @@ def _install_synthetic_transports(
 
     _write_executable(
         hermes_fixture,
-        f"""#!/usr/local/lib/hermes-agent/venv/bin/python
+        f"""#!{sys.executable}
 import pathlib, sys
 workspace = pathlib.Path.cwd()
 provider = sys.argv[sys.argv.index('--provider') + 1]
@@ -97,7 +98,7 @@ raise SystemExit(75)
     )
     _write_executable(
         claude_fixture,
-        f"""#!/usr/local/lib/hermes-agent/venv/bin/python
+        f"""#!{sys.executable}
 import json, os, pathlib, sys
 if '--version' in sys.argv:
     print('2.1.999')
