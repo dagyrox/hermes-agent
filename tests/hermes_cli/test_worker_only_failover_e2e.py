@@ -46,6 +46,14 @@ def _claimed_board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             workspace_path=str(workspace),
         )
         task = kb.claim_task(conn, task_id, claimer="synthetic-claim")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="local-test",
+            chat_id="synthetic-coordinator",
+            thread_id="run-ack",
+            notifier_profile="hyperion",
+        )
     assert task is not None and task.current_run_id is not None
 
     monkeypatch.setenv("HERMES_HOME", str(profile))
@@ -196,13 +204,15 @@ def _run_synthetic_supervisor(tmp_path, monkeypatch, *, complete_on_claude: bool
             "SELECT kind, run_id FROM task_events WHERE task_id=? ORDER BY id",
             (task.id,),
         ))
-    return rc, workspace, durable_task, durable_run, events
+    return rc, workspace, db_path, durable_task, durable_run, events
 
 
 def test_synthetic_primary_failure_falls_back_through_real_subprocess_once(
     tmp_path, monkeypatch
 ):
-    rc, workspace, task, run, events = _run_synthetic_supervisor(
+    from hermes_cli import kanban_db as kb
+
+    rc, workspace, db_path, task, run, events = _run_synthetic_supervisor(
         tmp_path,
         monkeypatch,
         complete_on_claude=True,
@@ -223,11 +233,38 @@ def test_synthetic_primary_failure_falls_back_through_real_subprocess_once(
     assert len(terminal_events) == 1
     assert terminal_events[0]["run_id"] == run["id"]
 
+    # Exercise the same atomic cursor claim used by the production coordinator
+    # event handler.  This is the durable acknowledgement boundary; merely
+    # sending a chat notification would not prove that the terminal event was
+    # consumed exactly once.
+    with kb.connect(db_path) as conn:
+        old_cursor, cursor, claimed = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=task.id,
+            platform="local-test",
+            chat_id="synthetic-coordinator",
+            thread_id="run-ack",
+            kinds=("completed", "blocked"),
+        )
+        second_old, second_cursor, duplicate = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=task.id,
+            platform="local-test",
+            chat_id="synthetic-coordinator",
+            thread_id="run-ack",
+            kinds=("completed", "blocked"),
+        )
+    assert old_cursor == 0
+    assert [event.kind for event in claimed] == ["completed"]
+    assert claimed[0].run_id == run["id"]
+    assert cursor == claimed[0].id
+    assert (second_old, second_cursor, duplicate) == (cursor, cursor, [])
+
 
 def test_synthetic_three_leg_exhaustion_blocks_once(tmp_path, monkeypatch):
     from hermes_cli.backend_failover import EXIT_ELIGIBLE
 
-    rc, workspace, task, _run, events = _run_synthetic_supervisor(
+    rc, workspace, _db_path, task, _run, events = _run_synthetic_supervisor(
         tmp_path,
         monkeypatch,
         complete_on_claude=False,

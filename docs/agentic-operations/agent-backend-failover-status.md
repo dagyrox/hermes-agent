@@ -4,18 +4,19 @@ Project: Agent Wiring / Agent Routing & Automatic Failover
 Primary repository: `dagyrox/hermes-agent`
 Consumer repository: `dagyrox/or7-platform`, Issues #259 and #260
 Acting lane: Talos
-Implementation card/run: `t_8a13918e` / run 549
-Review packet: `/root/.hermes/run-state/worker-only-staged-release.md`
-Dependency: PR #13 head `2949cbbe24c7d07c0367712a6ad453a1a1c2168f` (open and unaccepted)
+Implementation card/runs: `t_8a13918e` / runs 549 and 558
+Current release packet: `/root/.hermes/work-packets/fallbacks-finish-release.md`
+Original extraction packet: `/root/.hermes/run-state/worker-only-staged-release.md`
+Integrated dependency: `origin/main` at `cb85f67a575b139433bba61d957f243bba927efc`
 Extracted worker source boundary: `99521b4ac82f`
 
 ## Scope and status
 
-This branch is a worker-only extraction built on the open PR #13 dependency. It retains the dispatcher/Kanban supervised-worker path and its narrow shared CLI/conversation metadata, model capability evidence, MCP lifecycle surface, configuration, and tests.
+This branch is a worker-only extraction integrated with the accepted shared-credential and CI-baseline changes on current `main`. It retains the dispatcher/Kanban supervised-worker path and its narrow shared CLI/conversation metadata, model capability evidence, MCP lifecycle surface, configuration, and tests.
 
 It deliberately excludes `gateway/backend_failover.py`, the gateway coordinator tests, owner conversation bridges, owner-turn delivery, gateway adapters, and the later PR #14 gateway-ledger commits `0a4f95fc719` and `afb9a7154b4`. Ordinary gateway behavior is unchanged; no worker-only coordinator or bridge is imported there.
 
-The feature is disabled by default. This candidate is not activation, merge, deployment, or Issue #260 completion authority. PR #13 has not been accepted or merged, its required actual Claude subscription rereview remains outstanding, and the worker candidate requires independent exact-head review.
+The feature remains disabled by default while this candidate receives independent exact-head review and hosted CI. Worker-only release, installation, a finite authorized canary, and limited trusted-role activation are separate post-review steps under the current release packet. Conversation fallback remains off and outside this branch.
 
 ## Preserved worker surfaces
 
@@ -35,9 +36,7 @@ Task identity, active run, assignee profile, claim ownership, and workspace stay
 
 ## Credential dependency
 
-The branch consumes PR #13 through an explicit stacked base. It does not copy credentials, widen trusted profiles/providers, alter login/config stores, or modify the credential owner's branch. Trusted-profile membership and provider allowlists remain exact; guest/client profiles and Anthropic shared inheritance remain denied; local profile overrides remain authoritative.
-
-The two stale zero-argument xAI test mocks identified on PR #13 remain the credential owner's correction. Their candidate-specific failures must not be reported as frozen-main baseline failures.
+The branch consumes the merged shared-credential implementation from current `main`. It does not copy credentials, widen trusted profiles/providers, alter login/config stores, or restore stale tokens. Trusted-profile membership and provider allowlists remain exact; guest/client profiles and Anthropic shared inheritance remain denied; local profile overrides remain authoritative.
 
 ## Evidence limits
 
@@ -45,9 +44,10 @@ Synthetic scripted transports in the isolated acceptance suite are test fixtures
 
 ## Release gates
 
-1. PR #13 correction and mandated actual Claude subscription exact-head acceptance, plus authorized adjudication of hosted failures.
-2. Worker-only isolated E2E/negative/credential acceptance and independent exact-head Athena review.
-3. Separate human approval for merge, installation, activation, restart, exact canary roles/providers, finite budget, and rollback ownership.
-4. One newly created eligible, no-override, non-`goal_mode` canary with exact supported profile identity and observed terminal acknowledgement.
+1. Worker-only isolated subprocess/replay/identity/credential/approval acceptance and independent exact-head Athena review.
+2. Hosted CI green at the exact reviewed PR head.
+3. Worker-only merge and supported installation, preserving current credential authority and rollback state.
+4. One newly created eligible, no-override, non-`goal_mode` trusted internal canary with exact supported profile identity, finite authorized provider use, real artifact readback, and observed terminal acknowledgement.
+5. Limited worker-role activation and verification; conversation fallback remains off until its independent review and acceptance.
 
 Until all gates are satisfied, activation remains NO-GO.
