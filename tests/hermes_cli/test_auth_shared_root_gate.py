@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -55,7 +57,13 @@ def test_trusted_profile_inherits_only_allowlisted_root_credentials(tmp_path, mo
                 },
             },
             "credential_pool": {
-                "deepseek": [{"id": "manual:api_key", "api_key": "deepseek-key"}],
+                "deepseek": [
+                    {
+                        "id": "manual:api_key",
+                        "api_key": "deepseek-key",
+                        "base_url": "https://api.deepseek.com/v1",
+                    }
+                ],
                 "openrouter": [{"id": "manual:api_key", "api_key": "openrouter-key"}],
             },
         },
@@ -66,6 +74,7 @@ def test_trusted_profile_inherits_only_allowlisted_root_credentials(tmp_path, mo
     assert codex["tokens"]["access_token"] == "codex-access"
     deepseek_pool = cast(Any, auth.read_credential_pool("deepseek"))
     assert deepseek_pool[0]["api_key"] == "deepseek-key"
+    assert deepseek_pool[0]["base_url"] == "https://api.deepseek.com/v1"
     assert auth.get_provider_auth_state("xai-oauth") is None
     assert auth.read_credential_pool("openrouter") == []
 
@@ -274,3 +283,130 @@ def test_malformed_root_provider_state_is_not_inherited(tmp_path, monkeypatch):
     )
 
     assert auth.get_provider_auth_state("openai-codex") is None
+
+
+def test_runtime_refresh_root_lock_timeout_records_failed_write_through(
+    tmp_path, monkeypatch
+):
+    root, profile = _configure(tmp_path, monkeypatch, "talos")
+    root_auth = root / "auth.json"
+    _write_store(
+        root_auth,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                }
+            },
+        },
+    )
+    real_lock = auth._auth_store_lock
+
+    @contextmanager
+    def timeout_root_lock(*args, **kwargs):
+        if kwargs.get("target_path") == root_auth:
+            raise TimeoutError("root lock unavailable")
+        with real_lock(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(auth, "_auth_store_lock", timeout_root_lock)
+
+    with pytest.raises(TimeoutError, match="root lock unavailable"):
+        auth.resolve_codex_runtime_credentials(force_refresh=True)
+
+    profile_store = json.loads((profile / "auth.json").read_text(encoding="utf-8"))
+    assert profile_store["credential_inheritance_status"]["openai-codex"][
+        "write_through_ok"
+    ] is False
+    assert not profile_store.get("providers", {}).get("openai-codex")
+
+
+def test_runtime_refresh_root_replace_failure_preserves_root_and_records_failure(
+    tmp_path, monkeypatch
+):
+    root, profile = _configure(tmp_path, monkeypatch, "talos")
+    root_auth = root / "auth.json"
+    _write_store(
+        root_auth,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                }
+            },
+        },
+    )
+    before = root_auth.read_bytes()
+    unaffected = {
+        root / "config.yaml": (root / "config.yaml").read_bytes(),
+        root / "memory" / "MEMORY.md": b"durable-memory\n",
+        root / "sessions" / "session.json": b'{"id":"session"}\n',
+    }
+    for path, content in unaffected.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_bytes(content)
+    unaffected_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in unaffected
+    }
+    monkeypatch.setattr(
+        auth,
+        "refresh_codex_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+        },
+    )
+    real_save = auth._save_auth_store
+
+    def fail_root_save(store, target_path=None):
+        if target_path == root_auth:
+            raise OSError("replace failed")
+        return real_save(store, target_path=target_path)
+
+    monkeypatch.setattr(auth, "_save_auth_store", fail_root_save)
+
+    with pytest.raises(OSError, match="replace failed"):
+        auth.resolve_codex_runtime_credentials(force_refresh=True)
+
+    assert root_auth.read_bytes() == before
+    profile_store = json.loads((profile / "auth.json").read_text(encoding="utf-8"))
+    assert profile_store["credential_inheritance_status"]["openai-codex"][
+        "write_through_ok"
+    ] is False
+    assert not profile_store.get("providers", {}).get("openai-codex")
+    assert {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in unaffected
+    } == unaffected_hashes
+
+
+def test_auth_store_crash_before_replace_preserves_old_file_and_cleans_temp(
+    tmp_path, monkeypatch
+):
+    auth_file = tmp_path / "auth.json"
+    original = {"version": 1, "providers": {"openai-codex": {"label": "old"}}}
+    _write_store(auth_file, original)
+    monkeypatch.setattr(auth, "_auth_file_path", lambda: auth_file)
+
+    def crash_before_replace(_source, _destination):
+        raise OSError("simulated crash before replace")
+
+    monkeypatch.setattr(auth, "atomic_replace", crash_before_replace)
+
+    with pytest.raises(OSError, match="simulated crash before replace"):
+        auth._save_auth_store(
+            {"version": 1, "providers": {"openai-codex": {"label": "new"}}}
+        )
+
+    assert json.loads(auth_file.read_text(encoding="utf-8")) == original
+    assert list(tmp_path.glob("auth.json.tmp.*")) == []

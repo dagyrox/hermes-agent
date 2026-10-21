@@ -5,6 +5,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 def test_launcher_delegates_to_argparse_entrypoint(monkeypatch):
     """`./hermes` should use `hermes_cli.main`, not the legacy Fire wrapper."""
@@ -37,6 +39,8 @@ def test_launcher_delegates_to_argparse_entrypoint(monkeypatch):
 
     monkeypatch.setattr(sys, "argv", [str(launcher_path), "gateway", "status"])
 
-    runpy.run_path(str(launcher_path), run_name="__main__")
+    with pytest.raises(SystemExit) as exc_info:
+        runpy.run_path(str(launcher_path), run_name="__main__")
 
+    assert exc_info.value.code is None
     assert called == ["hermes_cli.main"]

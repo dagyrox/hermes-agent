@@ -39,8 +39,14 @@ def test_shared_write_through_detects_silent_noop(tmp_path, monkeypatch, caplog)
         "openai-codex", state
     ) is False
     assert "verification failed" in caplog.text
-    assert "rotated-access" not in caplog.text
-    assert "rotated-refresh" not in caplog.text
+    rendered_surfaces = [
+        caplog.text,
+        json.dumps(auth.get_auth_status("openai-codex"), sort_keys=True),
+    ]
+    for secret in ("rotated-access", "rotated-refresh"):
+        for surface in rendered_surfaces:
+            assert secret not in surface
+            assert secret[:8] not in surface
 
 
 def test_shared_write_through_reports_policy_denial(tmp_path, monkeypatch):
