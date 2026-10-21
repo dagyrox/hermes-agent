@@ -46,7 +46,9 @@ _CANONICAL_ROUTES = {
     "talos": (("api", "openai-codex", "gpt-6.1-sol"), ("claude_code", None, "claude-sonnet-5-5"), ("api", "deepseek", "deepseek-flash")),
     "apollo": (("claude_code", None, "claude-sonnet-5-5"), ("api", "openai-codex", "gpt-6.1-sol"), ("api", "deepseek", "deepseek-flash")),
 }
-_TOP_LEVEL_KEYS = frozenset({"enabled", "max_attempts_per_leg", "roles"})
+_TOP_LEVEL_KEYS = frozenset(
+    {"enabled", "gateway_owner_bridge", "max_attempts_per_leg", "roles"}
+)
 _LEG_KEYS = frozenset({"kind", "provider", "model", "reasoning_effort", "capability_mode"})
 
 
@@ -271,6 +273,12 @@ def resolve_role_chain(config: dict[str, Any] | None, profile: str) -> tuple[Bac
     if actual_route != _CANONICAL_ROUTES[profile_key]:
         raise ConfigError(f"{profile_key} does not match its frozen route")
     return tuple(chain)
+
+
+def gateway_owner_bridge_enabled(config: dict[str, Any] | None) -> bool:
+    """Return the independent, default-off conversation failover gate."""
+    cfg = config or {}
+    return bool(cfg.get("enabled") and cfg.get("gateway_owner_bridge") is True)
 
 
 def validate_backend_failover_config(config: dict[str, Any] | None) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import sys
@@ -58,6 +59,11 @@ def test_sdk_leg_uses_frozen_owner_mcp_and_request_local_roleful_resume(
     fake.AssistantMessage = _AssistantMessage
     fake.ResultMessage = _ResultMessage
     fake.TextBlock = _TextBlock
+    setattr(
+        fake,
+        "PermissionResultDeny",
+        lambda message: SimpleNamespace(behavior="deny", message=message),
+    )
     fake.ClaudeAgentOptions = _Options
     setattr(fake, "project_key_for_directory", lambda cwd: f"project:{cwd}")
 
@@ -113,6 +119,8 @@ def test_sdk_leg_uses_frozen_owner_mcp_and_request_local_roleful_resume(
             history=[{"role": "user", "content": "prior"}],
             system_prompt="frozen system",
             cwd=str(tmp_path),
+            reasoning_effort="high",
+            capability_mode="full",
         ),
         dispatch,
         bridge,
@@ -125,6 +133,9 @@ def test_sdk_leg_uses_frozen_owner_mcp_and_request_local_roleful_resume(
     assert options.strict_mcp_config is True
     assert options.setting_sources == []
     assert options.allowed_tools == ["mcp__gateway-owner__todo"]
+    assert options.effort == "high"
+    denied = asyncio.run(options.can_use_tool("Bash", {"command": "true"}, None))
+    assert denied.behavior == "deny"
     assert options.system_prompt == "frozen system"
     assert options.resume
     assert captured["seeded"][0]["message"] == {

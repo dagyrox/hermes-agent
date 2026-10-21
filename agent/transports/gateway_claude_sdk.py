@@ -37,6 +37,8 @@ class ClaudeSubscriptionTurn:
     history: Sequence[Mapping[str, Any]]
     system_prompt: str | None
     cwd: str
+    reasoning_effort: str | None = None
+    capability_mode: str = "full"
     max_history_messages: int = 120
     max_history_bytes: int = 512_000
     max_turns: int = 60
@@ -83,6 +85,7 @@ async def _query_sdk(
             project_key_for_directory,
             ResultMessage,
             TextBlock,
+            PermissionResultDeny,
             query,
         )
     except (ImportError, FeatureUnavailable) as exc:  # pragma: no cover - install boundary
@@ -106,9 +109,19 @@ async def _query_sdk(
     if history:
         await store.append(key, history)
 
+    allowed_tools = _allowed_tools(dispatch)
+
+    async def deny_unlisted_tool(name: str, _input: dict[str, Any], _context: Any):
+        if name in allowed_tools:
+            # Listed MCP calls are auto-approved by the SDK and still pass the
+            # authenticated owner bridge, which applies Hermes policy/approval.
+            return PermissionResultDeny("owner MCP permission routing error")
+        return PermissionResultDeny(f"native Claude tool {name!r} is disabled")
+
     options = ClaudeAgentOptions(
         tools=[],
-        allowed_tools=_allowed_tools(dispatch),
+        allowed_tools=allowed_tools,
+        can_use_tool=deny_unlisted_tool,
         system_prompt=turn.system_prompt,
         mcp_servers={"gateway-owner": _mcp_config(bridge)},
         strict_mcp_config=True,
@@ -117,6 +130,7 @@ async def _query_sdk(
         session_id=None if history else session_id,
         max_turns=turn.max_turns,
         model=turn.model,
+        effort=turn.reasoning_effort,
         cwd=Path(turn.cwd),
         setting_sources=[],
         verbatim_prompts=True,
@@ -154,19 +168,39 @@ def run_claude_subscription_turn(
     """Run one SDK leg while executing MCP calls on the calling owner thread."""
     result: list[str] = []
     failure: list[BaseException] = []
+    loop_ready = threading.Event()
+    state: dict[str, Any] = {}
 
     def worker() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(_query_sdk(turn, dispatch, bridge))
+        state.update(loop=loop, task=task)
+        loop_ready.set()
         try:
-            result.append(asyncio.run(_query_sdk(turn, dispatch, bridge)))
+            result.append(loop.run_until_complete(task))
+        except asyncio.CancelledError:
+            failure.append(ClaudeSubscriptionTurnError("Claude subscription turn cancelled"))
         except BaseException as exc:  # propagate on the owner thread
             failure.append(exc)
+        finally:
+            loop.close()
 
     thread = threading.Thread(target=worker, name="claude-subscription-turn", daemon=True)
     thread.start()
+    loop_ready.wait(timeout=5.0)
     while thread.is_alive():
         if is_cancelled is not None and is_cancelled():
             bridge.revoke("gateway_run_cancelled")
-            thread.join(timeout=1.0)
+            loop = state.get("loop")
+            task = state.get("task")
+            if loop is not None and task is not None:
+                loop.call_soon_threadsafe(task.cancel)
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                raise ClaudeSubscriptionTurnError(
+                    "Claude subscription child did not terminate after cancellation"
+                )
             raise ClaudeSubscriptionTurnError("Claude subscription turn cancelled")
         bridge.drain_one(timeout=0.05)
     thread.join()

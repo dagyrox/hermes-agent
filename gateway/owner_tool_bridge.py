@@ -45,6 +45,45 @@ class ToolBridgeError(RuntimeError):
     """A caller violated the frozen owner-bridge contract."""
 
 
+_READ_ONLY_TOOLS = frozenset(
+    {
+        "read_file",
+        "search_files",
+        "session_search",
+        "skills_list",
+        "skill_view",
+        "vision_analyze",
+        "browser_snapshot",
+        "browser_get_images",
+        "kanban_show",
+        "kanban_attachments",
+    }
+)
+_ORCHESTRATOR_TOOLS = _READ_ONLY_TOOLS | frozenset(
+    {
+        "kanban_create",
+        "kanban_link",
+        "kanban_comment",
+        "kanban_block",
+        "kanban_complete",
+        "kanban_heartbeat",
+        "kanban_attach",
+        "kanban_attach_url",
+    }
+)
+
+
+def tool_allowed_for_capability(name: str, capability_mode: str) -> bool:
+    """Apply the failover role's hard tool ceiling before normal approval."""
+    if capability_mode == "full":
+        return True
+    if capability_mode == "read_only":
+        return name in _READ_ONLY_TOOLS
+    if capability_mode == "orchestrator":
+        return name in _ORCHESTRATOR_TOOLS
+    return False
+
+
 @dataclass
 class OwnerTurnExecution:
     agent: Any
@@ -57,6 +96,8 @@ class OwnerTurnExecution:
     generation: int
     snapshot_digest: str
     identity: tuple[str, ...]
+    expected_identity: tuple[str, ...] | None = None
+    capability_mode: str = "full"
     cancellation: threading.Event = field(default_factory=threading.Event)
     record_intent: Callable[[str, str, Mapping[str, Any]], None] | None = None
     record_result: Callable[[str, str, bool], None] | None = None
@@ -84,6 +125,8 @@ class OwnerToolBridge:
     ) -> None:
         if dispatch != execution.dispatch:
             raise ToolBridgeError("execution dispatch does not match the opened snapshot")
+        if execution.expected_identity is not None and execution.identity != execution.expected_identity:
+            raise ToolBridgeError("owner execution identity does not match the gateway owner")
         self.dispatch = dispatch
         self.execution = execution
         self.capability = secrets.token_urlsafe(32)
@@ -93,6 +136,7 @@ class OwnerToolBridge:
         self._lock = threading.RLock()
         self._revoked_reason: str | None = None
         self._closed = False
+        self.terminated = threading.Event()
         root = Path(runtime_root) if runtime_root is not None else None
         self.runtime_dir = Path(
             tempfile.mkdtemp(prefix="hermes-owner-", dir=str(root) if root else None)
@@ -218,6 +262,20 @@ class OwnerToolBridge:
                 )
                 pending.ready.set()
                 return True
+        if not tool_allowed_for_capability(
+            pending.name, self.execution.capability_mode
+        ):
+            pending.response = {
+                "call_id": pending.call_id,
+                "disposition": "error",
+                "content": (
+                    f"tool {pending.name!r} is forbidden in "
+                    f"{self.execution.capability_mode!r} capability mode"
+                ),
+                "is_error": True,
+            }
+            pending.ready.set()
+            return True
         if self.execution.record_intent is not None:
             self.execution.record_intent(pending.call_id, pending.name, pending.arguments)
         assistant_dict = {
@@ -299,6 +357,7 @@ class OwnerToolBridge:
                         pending.call_id, self._revoked_reason
                     )
                     pending.ready.set()
+            self.terminated.set()
 
     def close(self) -> None:
         self.revoke("closed")

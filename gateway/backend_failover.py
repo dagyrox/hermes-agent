@@ -310,6 +310,31 @@ class GatewayFailoverLedger:
                     PRIMARY KEY(coordinator_id, leg_index),
                     FOREIGN KEY(coordinator_id) REFERENCES gateway_failover_turns(coordinator_id)
                 );
+                CREATE TABLE IF NOT EXISTS gateway_failover_tool_calls (
+                    coordinator_id TEXT NOT NULL,
+                    leg_index INTEGER NOT NULL,
+                    call_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    arguments_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    result_digest TEXT,
+                    is_error INTEGER,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(coordinator_id, leg_index, call_id),
+                    FOREIGN KEY(coordinator_id, leg_index)
+                        REFERENCES gateway_failover_attempts(coordinator_id, leg_index)
+                );
+                CREATE TABLE IF NOT EXISTS gateway_failover_delivery_parts (
+                    coordinator_id TEXT NOT NULL,
+                    part_index INTEGER NOT NULL,
+                    content_digest TEXT NOT NULL,
+                    receipt TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(coordinator_id, part_index),
+                    FOREIGN KEY(coordinator_id) REFERENCES gateway_failover_turns(coordinator_id)
+                );
                 """
             )
 
@@ -544,6 +569,18 @@ class GatewayFailoverLedger:
             if attempt is None or attempt["state"] != "started":
                 raise ReplayDenied("attempt is not in started state")
 
+            if observation.outcome == "success":
+                unresolved = conn.execute(
+                    """SELECT call_id FROM gateway_failover_tool_calls
+                       WHERE coordinator_id=? AND leg_index=?
+                         AND result_digest IS NULL LIMIT 1""",
+                    (coordinator_id, int(leg_index)),
+                ).fetchone()
+                if unresolved is not None:
+                    raise ReplayDenied(
+                        "cannot complete a leg with an unresolved owner tool call"
+                    )
+
             replayable = observation.replayable
             conn.execute(
                 """UPDATE gateway_failover_attempts SET
@@ -736,6 +773,171 @@ class GatewayFailoverLedger:
                 (coordinator_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_tool_intent(
+        self,
+        coordinator_id: str,
+        leg_index: int,
+        call_id: str,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        owner: str,
+        generation: int,
+    ) -> None:
+        """Latch an authenticated tool intent before owner-side execution."""
+        if not call_id or not name:
+            raise ValueError("tool call id and name are required")
+        arguments_json = _canonical_json(arguments)
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._row(conn, coordinator_id)
+            self._fence(row, owner=owner, generation=generation)
+            attempt = conn.execute(
+                "SELECT state FROM gateway_failover_attempts WHERE coordinator_id=? AND leg_index=?",
+                (coordinator_id, int(leg_index)),
+            ).fetchone()
+            if attempt is None or attempt["state"] != "started":
+                raise ReplayDenied("tool intent has no live attempt")
+            existing = conn.execute(
+                "SELECT name, arguments_json FROM gateway_failover_tool_calls "
+                "WHERE coordinator_id=? AND leg_index=? AND call_id=?",
+                (coordinator_id, int(leg_index), call_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["name"] != name or existing["arguments_json"] != arguments_json:
+                    raise ReplayDenied("duplicate tool call id changed identity")
+                return
+            conn.execute(
+                "INSERT INTO gateway_failover_tool_calls "
+                "(coordinator_id, leg_index, call_id, name, arguments_json, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'intent', ?, ?)",
+                (coordinator_id, int(leg_index), call_id, name, arguments_json, now, now),
+            )
+
+    def record_tool_result(
+        self,
+        coordinator_id: str,
+        leg_index: int,
+        call_id: str,
+        content: str,
+        is_error: bool,
+        *,
+        owner: str,
+        generation: int,
+    ) -> None:
+        """Latch a result digest after owner persistence and before publication."""
+        result_digest = hashlib.sha256(str(content).encode("utf-8")).hexdigest()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._row(conn, coordinator_id)
+            self._fence(row, owner=owner, generation=generation)
+            existing = conn.execute(
+                "SELECT state, result_digest, is_error FROM gateway_failover_tool_calls "
+                "WHERE coordinator_id=? AND leg_index=? AND call_id=?",
+                (coordinator_id, int(leg_index), call_id),
+            ).fetchone()
+            if existing is None:
+                raise ReplayDenied("tool result has no durable intent")
+            if existing["state"] == "result":
+                if (
+                    existing["result_digest"] != result_digest
+                    or existing["is_error"] != int(bool(is_error))
+                ):
+                    raise ReplayDenied("duplicate tool result changed identity")
+                return
+            cursor = conn.execute(
+                "UPDATE gateway_failover_tool_calls SET state='result', result_digest=?, "
+                "is_error=?, updated_at=? WHERE coordinator_id=? AND leg_index=? "
+                "AND call_id=? AND state IN ('intent', 'result')",
+                (
+                    result_digest,
+                    int(bool(is_error)),
+                    time.time(),
+                    coordinator_id,
+                    int(leg_index),
+                    call_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ReplayDenied("tool result has no durable intent")
+
+    def debug_tool_calls(self, coordinator_id: str) -> list[Mapping[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT leg_index, call_id, name, state, result_digest, is_error "
+                "FROM gateway_failover_tool_calls WHERE coordinator_id=? "
+                "ORDER BY leg_index, created_at",
+                (coordinator_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def initialize_delivery_parts(
+        self,
+        coordinator_id: str,
+        parts: Sequence[str],
+        *,
+        owner: str,
+        generation: int,
+    ) -> None:
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._row(conn, coordinator_id)
+            self._fence(row, owner=owner, generation=generation)
+            if row["state"] != "completed":
+                raise ReplayDenied("delivery parts require a completed turn")
+            existing = conn.execute(
+                "SELECT part_index, content_digest FROM gateway_failover_delivery_parts "
+                "WHERE coordinator_id=? ORDER BY part_index",
+                (coordinator_id,),
+            ).fetchall()
+            expected = [hashlib.sha256(part.encode("utf-8")).hexdigest() for part in parts]
+            if existing:
+                if [r["content_digest"] for r in existing] != expected:
+                    raise ReplayDenied("delivery parts changed after finalization")
+                return
+            conn.executemany(
+                "INSERT INTO gateway_failover_delivery_parts "
+                "(coordinator_id, part_index, content_digest, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(coordinator_id, index, digest, now, now) for index, digest in enumerate(expected)],
+            )
+
+    def record_delivery_receipt(
+        self,
+        coordinator_id: str,
+        part_index: int,
+        receipt: str,
+        *,
+        owner: str,
+        generation: int,
+    ) -> None:
+        if not receipt:
+            raise ValueError("delivery receipt is required")
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._row(conn, coordinator_id)
+            self._fence(row, owner=owner, generation=generation)
+            if row["delivery_state"] != "claimed":
+                raise ReplayDenied("delivery receipt requires a claimed final")
+            cursor = conn.execute(
+                "UPDATE gateway_failover_delivery_parts SET receipt=?, updated_at=? "
+                "WHERE coordinator_id=? AND part_index=? AND (receipt IS NULL OR receipt=?)",
+                (receipt, time.time(), coordinator_id, int(part_index), receipt),
+            )
+            if cursor.rowcount != 1:
+                raise ReplayDenied("unknown delivery part or conflicting receipt")
+
+    def delivery_receipts_complete(self, coordinator_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total, SUM(CASE WHEN receipt IS NOT NULL THEN 1 ELSE 0 END) AS received "
+                "FROM gateway_failover_delivery_parts WHERE coordinator_id=?",
+                (coordinator_id,),
+            ).fetchone()
+        return bool(row and row["total"] and row["total"] == row["received"])
 
     def load_snapshot(self, coordinator_id: str) -> Mapping[str, Any]:
         """Read back the exact durable request buckets for diagnostics/tests."""
