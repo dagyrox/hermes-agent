@@ -2445,7 +2445,7 @@ def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
     if use_tui and getattr(args, "reasoning_effort", None) is not None:
-        raise ValueError("--reasoning-effort requires --cli; TUI reasoning is configured separately")
+        raise SystemExit("--reasoning-effort requires --cli; TUI reasoning is configured separately")
 
     _apply_safe_mode(args)
 

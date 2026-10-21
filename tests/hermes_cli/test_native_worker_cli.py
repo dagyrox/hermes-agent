@@ -116,5 +116,36 @@ def test_tui_does_not_silently_drop_reasoning_override(monkeypatch):
 
     parser, _, _ = build_top_level_parser()
     monkeypatch.setattr(native, "_resolve_use_tui", lambda args: True)
-    with pytest.raises(ValueError, match="requires --cli"):
+    with pytest.raises(SystemExit, match="requires --cli"):
         native.cmd_chat(parser.parse_args(["chat", "--reasoning-effort", "high"]))
+
+
+def test_native_entry_rejects_tui_reasoning_without_traceback(tmp_path):
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path),
+        "USERPROFILE": str(tmp_path),
+        "HERMES_HOME": str(tmp_path / ".hermes"),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+    }
+    for key in ("SYSTEMROOT", "TEMP", "TMP"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    # Keep parser, main dispatch and cmd_chat real; suppress unrelated startup
+    # work so this rejection never loads credentials or starts inference.
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import hermes_cli.env_loader as loader; "
+         "loader.load_hermes_dotenv = lambda **kwargs: None; "
+         "import hermes_cli.main as native; "
+         "native._recover_from_interrupted_install = lambda: None; "
+         "native._prepare_agent_startup = lambda args: None; "
+         "native.main()",
+         "chat", "--tui", "--reasoning-effort", "high", "-q", "x"],
+        env=env, cwd=tmp_path, text=True, capture_output=True, timeout=60,
+    )
+    assert result.returncode == 1
+    assert result.stderr.strip() == (
+        "--reasoning-effort requires --cli; TUI reasoning is configured separately"
+    )
+    assert "Traceback" not in result.stdout + result.stderr
