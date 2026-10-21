@@ -603,8 +603,6 @@ def _leg_command(
             "--provider",
             str(leg.provider),
         ]
-        if leg.reasoning_effort:
-            cmd.extend(["--reasoning-effort", leg.reasoning_effort])
         for skill in getattr(args, "skill", ()):
             cmd.extend(["--skills", skill])
         required_toolsets = list(getattr(args, "required_toolset", ()) or ())
@@ -617,6 +615,8 @@ def _leg_command(
         # 75 so the supervisor can advance rather than treating CLI exit 0 as
         # a successful task execution.
         cmd.extend(["chat", "-q", prompt])
+        if leg.reasoning_effort:
+            cmd.extend(["--reasoning-effort", leg.reasoning_effort])
         if len(native_images) == 1:
             cmd.extend(["--image", native_images[0]])
         cmd.append("-Q")

@@ -120,6 +120,7 @@ Common options:
 | `--safe-mode` | Troubleshooting mode: disable ALL customizations — user config, rules/memory injection, plugins, shell hooks, and MCP servers (implies `--ignore-user-config` and `--ignore-rules`). Use to isolate whether a problem comes from your setup or from Hermes itself. |
 | `--source <tag>` | Session source tag for filtering (default: `cli`). Use `tool` for third-party integrations that should not appear in user session lists. |
 | `--max-turns <N>` | Maximum tool-calling iterations per conversation turn (default: 90, or `agent.max_turns` in config). |
+| `--reasoning-effort <level>` | Classic CLI only (`--cli`): invocation-only reasoning override, placed after `chat`. Accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` (case-insensitive). Takes precedence over global and per-model reasoning config without modifying either. Example: `hermes --cli chat --reasoning-effort high -q "Review this change"`. |
 
 Examples:
 

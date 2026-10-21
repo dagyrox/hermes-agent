@@ -3947,6 +3947,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        reasoning_effort: str = None,
     ):
         """
         Initialize the Hermes CLI.
@@ -3962,6 +3963,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
             pass_session_id: Include the session ID in the agent's system prompt
+            reasoning_effort: Startup-only override, ahead of persistent reasoning config
         """
         # Initialize Rich console
         self.console = Console()
@@ -4175,10 +4177,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         )
         
         # Reasoning config (OpenRouter reasoning effort level)
-        # Per-model override > global reasoning_effort — resolved through the
+        # Explicit startup override > per-model override > global effort.
+        # Persistent defaults are resolved through the
         # shared chokepoint in hermes_constants (Closes #21256).
-        from hermes_constants import resolve_reasoning_config
-        self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+        if reasoning_effort is not None:
+            self.reasoning_config = parse_reasoning_effort(reasoning_effort)
+            if self.reasoning_config is None:
+                raise ValueError(f"Invalid reasoning effort: {reasoning_effort!r}")
+        else:
+            self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -16167,6 +16175,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    reasoning_effort: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -16182,6 +16191,7 @@ def main(
         api_key: API key for authentication
         base_url: Base URL for the API
         max_turns: Maximum tool-calling iterations (default: 60)
+        reasoning_effort: Classic CLI startup reasoning override (never persisted)
         verbose: Enable verbose logging
         compact: Use compact display mode
         list_tools: List available tools and exit
@@ -16302,6 +16312,7 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        reasoning_effort=reasoning_effort,
     )
 
     if parsed_skills:
