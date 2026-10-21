@@ -352,14 +352,15 @@ def test_resolve_xai_runtime_credentials_refreshes_expiring_token(tmp_path, monk
     new_access = _jwt_with_exp(int(time.time()) + 2 * 60 * 60)
     called = {"count": 0}
 
-    def _fake_refresh(tokens, **kwargs):
+    def _fake_refresh(_access_token, _refresh_token, **kwargs):
         called["count"] += 1
-        updated = dict(tokens)
-        updated["access_token"] = new_access
-        updated["refresh_token"] = "rt-new"
-        return updated
+        return {
+            "access_token": new_access,
+            "refresh_token": "rt-new",
+            "last_refresh": "2020-01-02T00:00:00Z",
+        }
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
 
     creds = resolve_xai_oauth_runtime_credentials()
     assert called["count"] == 1
@@ -379,13 +380,15 @@ def test_resolve_xai_runtime_credentials_force_refresh(tmp_path, monkeypatch):
     forced = _jwt_with_exp(int(time.time()) + 7200)
     called = {"count": 0}
 
-    def _fake_refresh(tokens, **kwargs):
+    def _fake_refresh(_access_token, refresh_token, **kwargs):
         called["count"] += 1
-        updated = dict(tokens)
-        updated["access_token"] = forced
-        return updated
+        return {
+            "access_token": forced,
+            "refresh_token": refresh_token,
+            "last_refresh": "2020-01-02T00:00:00Z",
+        }
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _fake_refresh)
 
     creds = resolve_xai_oauth_runtime_credentials(force_refresh=True, refresh_if_expiring=False)
     assert called["count"] == 1
@@ -575,7 +578,7 @@ def test_resolve_credentials_quarantines_dead_tokens_on_terminal_refresh_failure
     _seed_xai_oauth_state(hermes_home, dict(_STALE_XAI_OAUTH_STATE), active_provider="nous")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    def _terminal_refresh(tokens, **kwargs):
+    def _terminal_refresh(_access_token, _refresh_token, **kwargs):
         raise AuthError(
             "xAI token refresh failed. Response: invalid_grant",
             provider="xai-oauth",
@@ -583,7 +586,7 @@ def test_resolve_credentials_quarantines_dead_tokens_on_terminal_refresh_failure
             relogin_required=True,
         )
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _terminal_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _terminal_refresh)
 
     with pytest.raises(AuthError) as exc_info:
         resolve_xai_oauth_runtime_credentials(force_refresh=True)
@@ -625,7 +628,7 @@ def test_resolve_credentials_does_not_quarantine_on_transient_refresh_failure(
     _seed_xai_oauth_state(hermes_home, dict(_STALE_XAI_OAUTH_STATE))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    def _transient_refresh(tokens, **kwargs):
+    def _transient_refresh(_access_token, _refresh_token, **kwargs):
         raise AuthError(
             "xAI token refresh failed: connection error",
             provider="xai-oauth",
@@ -633,7 +636,7 @@ def test_resolve_credentials_does_not_quarantine_on_transient_refresh_failure(
             relogin_required=False,
         )
 
-    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _transient_refresh)
+    monkeypatch.setattr("hermes_cli.auth.refresh_xai_oauth_pure", _transient_refresh)
 
     with pytest.raises(AuthError) as exc_info:
         resolve_xai_oauth_runtime_credentials(force_refresh=True)

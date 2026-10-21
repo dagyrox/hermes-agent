@@ -53,8 +53,13 @@ def test_read_xai_oauth_tokens_uses_global_store_when_profile_state_empty(monkey
             }
         }
     }
+
+    def load_global_store(provider_id):
+        assert provider_id == "xai-oauth"
+        return global_store
+
     monkeypatch.setattr(auth, "_load_auth_store", lambda: profile_store)
-    monkeypatch.setattr(auth, "_load_global_auth_store", lambda: global_store)
+    monkeypatch.setattr(auth, "_load_global_auth_store", load_global_store)
 
     resolved = auth._read_xai_oauth_tokens(_lock=False)
 
@@ -69,8 +74,13 @@ def test_read_xai_oauth_tokens_still_requires_usable_tokens(monkeypatch):
         "providers": {"xai-oauth": {"tokens": {}}},
         "credential_pool": {"xai-oauth": [{"access_token": "", "refresh_token": ""}]},
     }
+
+    def load_global_store(provider_id):
+        assert provider_id == "xai-oauth"
+        return {}
+
     monkeypatch.setattr(auth, "_load_auth_store", lambda: store)
-    monkeypatch.setattr(auth, "_load_global_auth_store", lambda: {})
+    monkeypatch.setattr(auth, "_load_global_auth_store", load_global_store)
 
     with pytest.raises(AuthError) as exc:
         auth._read_xai_oauth_tokens(_lock=False)
