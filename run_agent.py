@@ -1977,6 +1977,20 @@ class AIAgent:
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                _owner_attempt_metadata = getattr(
+                    self, "_gateway_owner_attempt_metadata", None
+                )
+                if (
+                    role == "assistant"
+                    and content
+                    and not msg.get("tool_calls")
+                    and isinstance(_owner_attempt_metadata, dict)
+                ):
+                    for _key, _value in _owner_attempt_metadata.items():
+                        msg.setdefault(_key, _value)
+                    _display_metadata = dict(msg.get("display_metadata") or {})
+                    _display_metadata.update(_owner_attempt_metadata)
+                    msg["display_metadata"] = _display_metadata
                 # api_content sidecar: the exact bytes sent to the API when
                 # they differ from the clean content (stamped by the turn
                 # prologue for prefetch/plugin injections). Written verbatim
@@ -2091,6 +2105,7 @@ class AIAgent:
                         and not msg.get("_compressed_summary_has_user_turn")
                         else msg.get("display_kind")
                     ),
+                    display_metadata=msg.get("display_metadata"),
                 )
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the

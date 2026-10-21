@@ -386,9 +386,12 @@ def test_final_delivery_can_be_claimed_exactly_once_across_restart(tmp_path):
         generation=7,
     )
 
-    assert first.claim_delivery(
+    first_claim = first.claim_delivery(
         planned.coordinator_id, owner="gateway:100", generation=7
-    ) == "final answer"
+    )
+    assert first_claim is not None
+    assert first_claim[0] == "final answer"
+    first_claim_token = first_claim[1]
     assert first.claim_delivery(
         planned.coordinator_id, owner="gateway:100", generation=7
     ) is None
@@ -404,7 +407,10 @@ def test_final_delivery_can_be_claimed_exactly_once_across_restart(tmp_path):
     ) is None
     with pytest.raises(ReplayDenied, match="not claimed"):
         restarted.mark_delivered(
-            planned.coordinator_id, owner="gateway:100", generation=7
+            planned.coordinator_id,
+            owner="gateway:100",
+            generation=7,
+            claim_token=first_claim_token,
         )
 
 
@@ -436,9 +442,11 @@ def test_restart_before_delivery_accepts_completed_output(tmp_path):
     )
     assert recovered.state == "completed"
     assert recovered.delivery_state == "pending"
-    assert restarted.claim_delivery(
+    restarted_claim = restarted.claim_delivery(
         planned.coordinator_id, owner="gateway:200", generation=7
-    ) == "durable answer"
+    )
+    assert restarted_claim is not None
+    assert restarted_claim[0] == "durable answer"
 
 
 def test_confirmed_delivery_is_terminal_and_not_claimable_again(ledger):
@@ -454,12 +462,25 @@ def test_confirmed_delivery_is_terminal_and_not_claimable_again(ledger):
         owner="gateway:100",
         generation=7,
     )
-    assert ledger.claim_delivery(
+    claim = ledger.claim_delivery(
         planned.coordinator_id, owner="gateway:100", generation=7
-    ) == "delivered answer"
+    )
+    assert claim is not None
+    assert claim[0] == "delivered answer"
+
+    with pytest.raises(ReplayDenied, match="not claimed"):
+        ledger.mark_delivered(
+            planned.coordinator_id,
+            owner="gateway:100",
+            generation=7,
+            claim_token="wrong-claim",
+        )
 
     ledger.mark_delivered(
-        planned.coordinator_id, owner="gateway:100", generation=7
+        planned.coordinator_id,
+        owner="gateway:100",
+        generation=7,
+        claim_token=claim[1],
     )
 
     assert ledger.recover(

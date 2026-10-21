@@ -1875,6 +1875,26 @@ def run_conversation(
                 except Exception:
                     pass
 
+                # Freeze the exact first primary request after every request
+                # mutation (middleware and hooks) and immediately before model
+                # dispatch. The callback is one-shot: provider retries and
+                # tool-loop continuations belong to the already-started primary
+                # attempt and must not plan a second coordinator.
+                _gateway_prepare = getattr(
+                    agent, "_gateway_owner_turn_prepared_callback", None
+                )
+                if callable(_gateway_prepare):
+                    agent._gateway_owner_turn_prepared_callback = None
+                    _wire_messages = api_kwargs.get("messages")
+                    if not isinstance(_wire_messages, list):
+                        _wire_messages = api_kwargs.get("input")
+                    _gateway_prepare(
+                        api_messages=_wire_messages,
+                        transcript_messages=messages,
+                        tools=agent.tools,
+                        history_offset=current_turn_user_idx,
+                    )
+
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 

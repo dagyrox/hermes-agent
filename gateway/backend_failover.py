@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import secrets
 import sqlite3
 import threading
 import time
@@ -289,6 +290,7 @@ class GatewayFailoverLedger:
                     current_leg INTEGER NOT NULL DEFAULT 0,
                     final_response TEXT,
                     delivery_state TEXT NOT NULL DEFAULT 'none',
+                    delivery_claim_token TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     UNIQUE(session_key, session_id, event_id, generation)
@@ -337,6 +339,17 @@ class GatewayFailoverLedger:
                 );
                 """
             )
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(gateway_failover_turns)"
+                ).fetchall()
+            }
+            if "delivery_claim_token" not in columns:
+                conn.execute(
+                    "ALTER TABLE gateway_failover_turns "
+                    "ADD COLUMN delivery_claim_token TEXT"
+                )
 
     @staticmethod
     def _record(row: sqlite3.Row) -> CoordinatorRecord:
@@ -691,7 +704,7 @@ class GatewayFailoverLedger:
                 conn.execute(
                     "UPDATE gateway_failover_turns "
                     "SET delivery_state='ambiguous', reason='unfinished_delivery', "
-                    "updated_at=? WHERE coordinator_id=?",
+                    "delivery_claim_token=NULL, updated_at=? WHERE coordinator_id=?",
                     (time.time(), coordinator_id),
                 )
                 row = self._row(conn, coordinator_id)
@@ -712,7 +725,7 @@ class GatewayFailoverLedger:
 
     def claim_delivery(
         self, coordinator_id: str, *, owner: str, generation: int
-    ) -> str | None:
+    ) -> tuple[str, str] | None:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._row(conn, coordinator_id)
@@ -721,25 +734,49 @@ class GatewayFailoverLedger:
                 raise ReplayDenied("coordinator has no completed response")
             if row["delivery_state"] != "pending":
                 return None
+            claim_token = secrets.token_urlsafe(32)
             cursor = conn.execute(
-                "UPDATE gateway_failover_turns SET delivery_state='claimed', updated_at=? "
+                "UPDATE gateway_failover_turns SET delivery_state='claimed', "
+                "delivery_claim_token=?, updated_at=? "
                 "WHERE coordinator_id=? AND delivery_state='pending'",
-                (time.time(), coordinator_id),
+                (claim_token, time.time(), coordinator_id),
             )
-            return row["final_response"] if cursor.rowcount == 1 else None
+            return (
+                (row["final_response"], claim_token)
+                if cursor.rowcount == 1
+                else None
+            )
 
     def mark_delivered(
-        self, coordinator_id: str, *, owner: str, generation: int
+        self,
+        coordinator_id: str,
+        *,
+        owner: str,
+        generation: int,
+        claim_token: str,
     ) -> None:
         self._finish_delivery(
-            coordinator_id, "delivered", owner=owner, generation=generation
+            coordinator_id,
+            "delivered",
+            owner=owner,
+            generation=generation,
+            claim_token=claim_token,
         )
 
     def mark_delivery_ambiguous(
-        self, coordinator_id: str, *, owner: str, generation: int
+        self,
+        coordinator_id: str,
+        *,
+        owner: str,
+        generation: int,
+        claim_token: str,
     ) -> None:
         self._finish_delivery(
-            coordinator_id, "ambiguous", owner=owner, generation=generation
+            coordinator_id,
+            "ambiguous",
+            owner=owner,
+            generation=generation,
+            claim_token=claim_token,
         )
 
     def _finish_delivery(
@@ -749,17 +786,23 @@ class GatewayFailoverLedger:
         *,
         owner: str,
         generation: int,
+        claim_token: str,
     ) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._row(conn, coordinator_id)
             self._fence(row, owner=owner, generation=generation)
-            if row["delivery_state"] != "claimed":
+            if (
+                row["delivery_state"] != "claimed"
+                or not claim_token
+                or row["delivery_claim_token"] != claim_token
+            ):
                 raise ReplayDenied("final delivery was not claimed")
             conn.execute(
-                "UPDATE gateway_failover_turns SET delivery_state=?, updated_at=? "
-                "WHERE coordinator_id=?",
-                (delivery_state, time.time(), coordinator_id),
+                "UPDATE gateway_failover_turns SET delivery_state=?, "
+                "delivery_claim_token=NULL, updated_at=? "
+                "WHERE coordinator_id=? AND delivery_claim_token=?",
+                (delivery_state, time.time(), coordinator_id, claim_token),
             )
 
     def debug_attempts(self, coordinator_id: str) -> list[Mapping[str, Any]]:
@@ -913,6 +956,7 @@ class GatewayFailoverLedger:
         *,
         owner: str,
         generation: int,
+        claim_token: str,
     ) -> None:
         if not receipt:
             raise ValueError("delivery receipt is required")
@@ -920,7 +964,11 @@ class GatewayFailoverLedger:
             conn.execute("BEGIN IMMEDIATE")
             row = self._row(conn, coordinator_id)
             self._fence(row, owner=owner, generation=generation)
-            if row["delivery_state"] != "claimed":
+            if (
+                row["delivery_state"] != "claimed"
+                or not claim_token
+                or row["delivery_claim_token"] != claim_token
+            ):
                 raise ReplayDenied("delivery receipt requires a claimed final")
             cursor = conn.execute(
                 "UPDATE gateway_failover_delivery_parts SET receipt=?, updated_at=? "

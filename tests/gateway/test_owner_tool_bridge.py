@@ -184,6 +184,29 @@ def test_revoke_rejects_queued_and_future_calls_without_execution(tmp_path):
     bridge.close()
 
 
+def test_live_owner_identity_is_rechecked_before_tool_execution(tmp_path):
+    agent = _OwnerAgent()
+    execution = _execution(agent)
+    execution.expected_identity = execution.identity
+    live_identity = [execution.identity]
+    execution.identity_provider = lambda: live_identity[0]
+    bridge = OwnerToolBridge.open(_dispatch(), execution, runtime_root=tmp_path)
+    result = []
+
+    child = threading.Thread(
+        target=lambda: result.append(bridge.submit(_call(bridge)))
+    )
+    child.start()
+    live_identity[0] = ("other-owner",)
+    assert bridge.drain_one(timeout=1.0) is True
+    child.join(timeout=1.0)
+
+    assert result[0]["disposition"] == "revoked"
+    assert result[0]["content"] == "owner_identity_changed"
+    assert agent.calls == []
+    bridge.close()
+
+
 def test_runtime_endpoint_is_private_and_capability_is_not_in_argv_material(tmp_path):
     bridge = OwnerToolBridge.open(_dispatch(), _execution(_OwnerAgent()), runtime_root=tmp_path)
     assert bridge.runtime_dir.stat().st_mode & 0o777 == 0o700

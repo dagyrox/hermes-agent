@@ -97,6 +97,7 @@ class OwnerTurnExecution:
     snapshot_digest: str
     identity: tuple[str, ...]
     expected_identity: tuple[str, ...] | None = None
+    identity_provider: Callable[[], tuple[str, ...]] | None = None
     capability_mode: str = "full"
     cancellation: threading.Event = field(default_factory=threading.Event)
     record_intent: Callable[[str, str, Mapping[str, Any]], None] | None = None
@@ -232,6 +233,16 @@ class OwnerToolBridge:
         canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return call_id, name, arguments, canonical
 
+    def _identity_is_current(self) -> bool:
+        expected = self.execution.expected_identity
+        provider = self.execution.identity_provider
+        if expected is None or provider is None:
+            return True
+        try:
+            return provider() == expected
+        except Exception:
+            return False
+
     def submit(self, call: Mapping[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         call_id, name, arguments, canonical = self._validate_frame(call)
         with self._lock:
@@ -276,6 +287,13 @@ class OwnerToolBridge:
             }
             pending.ready.set()
             return True
+        if not self._identity_is_current():
+            self.revoke("owner_identity_changed")
+            pending.response = self._revoked_response(
+                pending.call_id, "owner_identity_changed"
+            )
+            pending.ready.set()
+            return True
         if self.execution.record_intent is not None:
             self.execution.record_intent(pending.call_id, pending.name, pending.arguments)
         assistant_dict = {
@@ -295,6 +313,8 @@ class OwnerToolBridge:
             tool_calls=[SimpleNamespace(id=pending.call_id, type="function", function=function)]
         )
         try:
+            if not self._identity_is_current():
+                raise ToolBridgeError("owner identity changed before tool execution")
             self.execution.agent._execute_tool_calls(
                 assistant,
                 self.execution.messages,

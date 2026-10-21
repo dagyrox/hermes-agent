@@ -8,7 +8,7 @@ a restart is ambiguous and is never resent automatically.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 from gateway.backend_failover import GatewayFailoverLedger, ReplayDenied
@@ -23,6 +23,7 @@ class OwnerFinalDelivery:
     payload: str
     parts: Sequence[str]
     obligation_id: str | None = None
+    _claim_token: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.payload:
@@ -41,6 +42,7 @@ class OwnerFinalDelivery:
             owner=self.owner,
             generation=self.generation,
         )
+        self._claim_token = None
         claimed = self.ledger.claim_delivery(
             self.coordinator_id,
             owner=self.owner,
@@ -48,34 +50,47 @@ class OwnerFinalDelivery:
         )
         if claimed is None:
             return ()
-        if claimed != self.payload:
+        claimed_payload, claim_token = claimed
+        if claimed_payload != self.payload:
             raise ReplayDenied("claimed final payload does not match delivery handle")
+        self._claim_token = claim_token
         return tuple(self.parts)
 
     def record_receipt(self, part_index: int, receipt: str) -> None:
+        if not self._claim_token:
+            raise ReplayDenied("delivery handle has no active claim")
         self.ledger.record_delivery_receipt(
             self.coordinator_id,
             part_index,
             receipt,
             owner=self.owner,
             generation=self.generation,
+            claim_token=self._claim_token,
         )
 
     def complete(self) -> None:
+        if not self._claim_token:
+            raise ReplayDenied("delivery handle has no active claim")
         if not self.ledger.delivery_receipts_complete(self.coordinator_id):
             raise ReplayDenied("cannot complete delivery with missing part receipts")
         self.ledger.mark_delivered(
             self.coordinator_id,
             owner=self.owner,
             generation=self.generation,
+            claim_token=self._claim_token,
         )
+        self._claim_token = None
 
     def ambiguous(self) -> None:
+        if not self._claim_token:
+            raise ReplayDenied("delivery handle has no active claim")
         self.ledger.mark_delivery_ambiguous(
             self.coordinator_id,
             owner=self.owner,
             generation=self.generation,
+            claim_token=self._claim_token,
         )
+        self._claim_token = None
 
     def reconcile_after_restart(self) -> str:
         return self.ledger.recover(
