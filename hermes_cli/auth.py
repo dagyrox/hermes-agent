@@ -600,12 +600,34 @@ def _resolve_api_key_provider_secret(
 
     from hermes_cli.config import get_env_value_prefer_dotenv
     for env_var in pconfig.api_key_env_vars:
-        # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation
-        # in the user's .env file isn't shadowed by a stale shell export
-        # inherited from a parent process (Codex CLI, test runners, etc.).
+        # Prefer the active profile's .env over os.environ so a deliberate key
+        # rotation is authoritative for profile-owned credentials.
         val = (get_env_value_prefer_dotenv(env_var) or "").strip()
         if has_usable_secret(val):
             return val, env_var
+
+    # Trusted profiles may inherit an allowlisted provider whose canonical key
+    # lives only in the root .env. Read that file directly after the profile's
+    # own sources, without exporting the secret or copying it into profile
+    # state. Do not consult root process environment: inheritance is durable,
+    # policy-gated configuration rather than incidental parent injection.
+    if is_shared_inheritance_allowed(provider_id):
+        from hermes_constants import (
+            get_default_hermes_root,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.config import load_env
+
+        home_token = set_hermes_home_override(get_default_hermes_root())
+        try:
+            root_env = load_env()
+        finally:
+            reset_hermes_home_override(home_token)
+        for env_var in pconfig.api_key_env_vars:
+            val = str(root_env.get(env_var) or "").strip()
+            if has_usable_secret(val):
+                return val, f"shared_root_dotenv:{env_var}"
 
     # Fallback: try credential pool (e.g. zai key stored via auth.json)
     try:
