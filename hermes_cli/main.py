@@ -2444,6 +2444,8 @@ def _resolve_use_tui(args) -> bool:
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
+    if use_tui and getattr(args, "reasoning_effort", None) is not None:
+        raise ValueError("--reasoning-effort requires --cli; TUI reasoning is configured separately")
 
     _apply_safe_mode(args)
 
@@ -2642,6 +2644,7 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "reasoning_effort": getattr(args, "reasoning_effort", None),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}

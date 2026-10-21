@@ -277,6 +277,15 @@ def build_top_level_parser():
     chat_parser.add_argument(
         "--image", help="Optional local image path to attach to a single query"
     )
+    from hermes_constants import VALID_REASONING_EFFORTS
+
+    chat_parser.add_argument(
+        "--reasoning-effort",
+        type=str.lower,
+        choices=("none", *VALID_REASONING_EFFORTS),
+        default=None,
+        help="Classic CLI only: override reasoning for this invocation without saving config",
+    )
     # `default=argparse.SUPPRESS` on flags that are ALSO declared on the
     # top-level parser: when the user writes `hermes -m foo chat`, argparse
     # first sets `args.model = "foo"` from the top-level parser, then
