@@ -721,6 +721,76 @@ class CredentialPool:
             removed_ids=removed_ids,
         )
 
+    def _update_shared_root_pool_failure(
+        self,
+        auth_store: Dict[str, Any],
+        entry: PooledCredential,
+        *,
+        removed_ids: Optional[List[str]] = None,
+    ) -> bool:
+        """Update only failure metadata in the root-owned pool slice."""
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            pool = {}
+            auth_store["credential_pool"] = pool
+        existing = pool.get(self.provider)
+        if not isinstance(existing, list):
+            existing = []
+            pool[self.provider] = existing
+        removed = {entry_id for entry_id in (removed_ids or []) if entry_id}
+        if removed:
+            retained = [
+                item
+                for item in existing
+                if not isinstance(item, dict) or item.get("id") not in removed
+            ]
+            pool[self.provider] = retained
+            return retained != existing
+        for item in existing:
+            if not isinstance(item, dict) or item.get("id") != entry.id:
+                continue
+            for field_name in (
+                "last_status",
+                "last_status_at",
+                "last_error_code",
+                "last_error_reason",
+                "last_error_message",
+                "last_error_reset_at",
+            ):
+                item[field_name] = getattr(entry, field_name)
+            return True
+        root_entry = entry.to_dict()
+        root_entry.pop("shared_root_source", None)
+        root_entry.pop("write_through_ok", None)
+        existing.append(root_entry)
+        return True
+
+    def _persist_shared_root_pool_failure(
+        self,
+        entry: PooledCredential,
+        *,
+        root_path: Optional[Path] = None,
+    ) -> bool:
+        """Persist inherited cooldown state without acquiring the profile lock."""
+        if root_path is None:
+            root_path = self._shared_root_auth_path(entry)
+        if root_path is None:
+            return False
+        try:
+            with _auth_store_lock(target_path=root_path):
+                auth_store = _load_auth_store(root_path)
+                if not self._update_shared_root_pool_failure(auth_store, entry):
+                    return False
+                _save_auth_store(auth_store, target_path=root_path)
+            return True
+        except Exception as exc:
+            logger.debug(
+                "Failed to persist %s shared-root failure state: %s",
+                self.provider,
+                type(exc).__name__,
+            )
+            return False
+
     def _is_terminal_auth_failure(
         self,
         status_code: Optional[int],
@@ -1267,16 +1337,22 @@ class CredentialPool:
                         if not force and not self._entry_needs_refresh(entry):
                             result = entry
                         else:
-                            result = self._refresh_entry_impl(entry, force=force)
+                            result = self._refresh_entry_impl(
+                                entry, force=force, shared_root_path=root_path
+                            )
                     else:
-                        result = self._refresh_entry_impl(entry, force=force)
+                        result = self._refresh_entry_impl(
+                            entry, force=force, shared_root_path=root_path
+                        )
                 elif (
                     synced.access_token != entry.access_token
                     or synced.refresh_token != entry.refresh_token
                 ):
                     result = synced
                 else:
-                    result = self._refresh_entry_impl(synced, force=force)
+                    result = self._refresh_entry_impl(
+                        synced, force=force, shared_root_path=root_path
+                    )
             self._record_shared_write_through_status(result)
             return result
         result = self._refresh_entry_impl(entry, force=force)
@@ -1303,7 +1379,11 @@ class CredentialPool:
         )
 
     def _refresh_entry_impl(
-        self, entry: PooledCredential, *, force: bool
+        self,
+        entry: PooledCredential,
+        *,
+        force: bool,
+        shared_root_path: Optional[Path] = None,
     ) -> Optional[PooledCredential]:
         try:
             if self.provider == "anthropic":
@@ -1457,9 +1537,18 @@ class CredentialPool:
                     logger.debug(
                         "xAI OAuth refresh token is terminally invalid; clearing local token state"
                     )
+                    removed_ids = [
+                        item.id for item in self._entries
+                        if item.source == "device_code"
+                    ]
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        root_path = (
+                            shared_root_path
+                            if entry.extra.get("shared_root_source")
+                            else None
+                        )
+                        with _auth_store_lock(target_path=root_path):
+                            auth_store = _load_auth_store(root_path)
                             state = _load_provider_state(auth_store, "xai-oauth") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1479,22 +1568,27 @@ class CredentialPool:
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
                                         _save_provider_state(auth_store, "xai-oauth", state)
-                                        _save_auth_store(auth_store)
+                                        if entry.extra.get("shared_root_source"):
+                                            self._update_shared_root_pool_failure(
+                                                auth_store,
+                                                entry,
+                                                removed_ids=removed_ids,
+                                            )
+                                        _save_auth_store(
+                                            auth_store, target_path=root_path
+                                        )
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
                     self._entries = [
                         item for item in self._entries
                         if item.source != "device_code"
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    if not entry.extra.get("shared_root_source"):
+                        self._persist(removed_ids=removed_ids)
                     return None
             # For openai-codex: same race as xAI/nous — another Hermes process
             # may have consumed the refresh token between our proactive sync
@@ -1530,9 +1624,18 @@ class CredentialPool:
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
+                    removed_ids = [
+                        item.id for item in self._entries
+                        if item.source == "device_code"
+                    ]
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        root_path = (
+                            shared_root_path
+                            if entry.extra.get("shared_root_source")
+                            else None
+                        )
+                        with _auth_store_lock(target_path=root_path):
+                            auth_store = _load_auth_store(root_path)
                             state = _load_provider_state(auth_store, "openai-codex") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1552,22 +1655,27 @@ class CredentialPool:
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
                                         _save_provider_state(auth_store, "openai-codex", state)
-                                        _save_auth_store(auth_store)
+                                        if entry.extra.get("shared_root_source"):
+                                            self._update_shared_root_pool_failure(
+                                                auth_store,
+                                                entry,
+                                                removed_ids=removed_ids,
+                                            )
+                                        _save_auth_store(
+                                            auth_store, target_path=root_path
+                                        )
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
                         )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
                     self._entries = [
                         item for item in self._entries
                         if item.source != "device_code"
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    if not entry.extra.get("shared_root_source"):
+                        self._persist(removed_ids=removed_ids)
                     return None
             # For nous: another process may have consumed the refresh token
             # between our proactive sync and the HTTP call.  Re-sync from
@@ -1636,7 +1744,16 @@ class CredentialPool:
                         self._current_id = None
                     self._persist(removed_ids=removed_ids)
                     return None
-            self._mark_exhausted(entry, None)
+            updated_failure = self._mark_exhausted(
+                entry,
+                None,
+                persist=not entry.extra.get("shared_root_source"),
+            )
+            if entry.extra.get("shared_root_source"):
+                self._persist_shared_root_pool_failure(
+                    updated_failure,
+                    root_path=shared_root_path,
+                )
             return None
 
         updated = replace(

@@ -169,6 +169,78 @@ def _multiprocess_runtime_refresh_worker(
     )
 
 
+def _terminal_refresh_worker(
+    profile_path,
+    root_path,
+    root_lock_held,
+    profile_lock_held,
+    results,
+):
+    from pathlib import Path
+
+    profile_path = Path(profile_path)
+    root_path = Path(root_path)
+    A._auth_file_path = lambda: profile_path
+    A._global_auth_file_path = lambda provider_id=None: root_path
+    A.AUTH_LOCK_TIMEOUT_SECONDS = 1.0
+    A._is_terminal_xai_oauth_refresh_error = lambda _exc: True
+
+    def terminal_refresh(*_args, **_kwargs):
+        root_lock_held.set()
+        if not profile_lock_held.wait(timeout=5):
+            raise RuntimeError("profile contender did not acquire its lock")
+        raise A.AuthError(
+            "revoked",
+            provider="xai-oauth",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    A.refresh_xai_oauth_pure = terminal_refresh
+    entry = _entry(
+        "xai-oauth",
+        id="shared-xai",
+        access_token="stale-access",
+        refresh_token="stale-refresh",
+    )
+    entry.extra["shared_root_source"] = True
+    try:
+        result = CredentialPool("xai-oauth", [entry])._refresh_entry(
+            entry, force=True
+        )
+        results.put(("refresh", result is None, None))
+    except Exception as exc:
+        results.put(("refresh", False, type(exc).__name__))
+
+
+def _profile_then_root_lock_worker(
+    profile_path,
+    root_path,
+    root_lock_held,
+    profile_lock_held,
+    results,
+):
+    from pathlib import Path
+
+    profile_path = Path(profile_path)
+    root_path = Path(root_path)
+    A._auth_file_path = lambda: profile_path
+    A._global_auth_file_path = lambda provider_id=None: root_path
+    A.AUTH_LOCK_TIMEOUT_SECONDS = 1.0
+    if not root_lock_held.wait(timeout=5):
+        results.put(("writer", False, "root lock was not acquired"))
+        return
+    try:
+        with A._auth_store_lock():
+            profile_lock_held.set()
+            with A._auth_store_lock(target_path=root_path):
+                store = A._load_auth_store(root_path)
+                ok = isinstance(store.get("providers"), dict)
+        results.put(("writer", ok, None))
+    except Exception as exc:
+        results.put(("writer", False, type(exc).__name__))
+
+
 @pytest.fixture
 def profile_and_root(tmp_path, monkeypatch):
     """Wire a profile auth store + a distinct global-root auth store on disk.
@@ -607,6 +679,203 @@ def test_inherited_pool_refresh_does_not_invert_root_and_profile_locks(
 
     assert refreshed is not None
     assert inversions == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "terminal"),
+    [("openai-codex", False), ("xai-oauth", True)],
+)
+def test_inherited_refresh_failure_does_not_take_profile_lock_or_create_shadow(
+    monkeypatch, tmp_path, provider, terminal
+):
+    profile_path = tmp_path / "profiles" / "talos" / "auth.json"
+    root_path = tmp_path / "auth.json"
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    root_store = {
+        "version": 1,
+        "providers": {
+            provider: {
+                "tokens": {
+                    "access_token": "stale-access",
+                    "refresh_token": "stale-refresh",
+                }
+            }
+        },
+    }
+    if terminal:
+        root_store["credential_pool"] = {
+            provider: [
+                {
+                    "id": f"shared-{provider}",
+                    "provider": provider,
+                    "auth_type": "oauth",
+                    "source": "device_code",
+                    "access_token": "stale-access",
+                    "refresh_token": "stale-refresh",
+                }
+            ]
+        }
+    _write_store(root_path, root_store)
+    monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(
+        A,
+        "_global_auth_file_path",
+        lambda provider_id=None: root_path,
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    stack = []
+    inversions = []
+    real_lock = A._auth_store_lock
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def tracking_lock(*args, **kwargs):
+        target = kwargs.get("target_path")
+        if target is None and root_path in stack:
+            inversions.append((tuple(stack), target))
+        stack.append(target)
+        try:
+            with real_lock(*args, **kwargs):
+                yield
+        finally:
+            stack.pop()
+
+    monkeypatch.setattr(A, "_auth_store_lock", tracking_lock)
+    monkeypatch.setattr(CP, "_auth_store_lock", tracking_lock)
+    error = A.AuthError(
+        "refresh failed",
+        provider=provider,
+        code="invalid_grant" if terminal else "temporarily_unavailable",
+        relogin_required=terminal,
+    )
+    if provider == "openai-codex":
+        monkeypatch.setattr(
+            A,
+            "refresh_codex_oauth_pure",
+            lambda *_a, **_k: (_ for _ in ()).throw(error),
+        )
+        monkeypatch.setattr(
+            A,
+            "_is_terminal_codex_oauth_refresh_error",
+            lambda _exc: terminal,
+        )
+    else:
+        monkeypatch.setattr(
+            A,
+            "refresh_xai_oauth_pure",
+            lambda *_a, **_k: (_ for _ in ()).throw(error),
+        )
+        monkeypatch.setattr(
+            A,
+            "_is_terminal_xai_oauth_refresh_error",
+            lambda _exc: terminal,
+        )
+
+    entry = _entry(
+        provider,
+        id=f"shared-{provider}",
+        access_token="stale-access",
+        refresh_token="stale-refresh",
+    )
+    entry.extra["shared_root_source"] = True
+    pool = CredentialPool(provider, [entry])
+    source_path_calls = 0
+
+    def source_path(_entry):
+        nonlocal source_path_calls
+        source_path_calls += 1
+        return root_path if source_path_calls == 1 else None
+
+    monkeypatch.setattr(pool, "_shared_root_auth_path", source_path)
+
+    assert pool._refresh_entry(entry, force=True) is None
+
+    assert source_path_calls >= 2
+    assert inversions == []
+    profile = _read_store(profile_path)
+    assert not profile.get("providers", {}).get(provider)
+    assert not profile.get("credential_pool", {}).get(provider)
+    root = _read_store(root_path)
+    root_tokens = root["providers"][provider]["tokens"]
+    root_pool = root["credential_pool"][provider]
+    if terminal:
+        assert "access_token" not in root_tokens
+        assert "refresh_token" not in root_tokens
+        assert root_pool == []
+    else:
+        assert root_tokens["refresh_token"] == "stale-refresh"
+        assert root_pool[0]["last_status"] == CP.STATUS_EXHAUSTED
+        assert "shared_root_source" not in root_pool[0]
+        assert "write_through_ok" not in root_pool[0]
+
+
+def test_terminal_inherited_refresh_does_not_deadlock_profile_then_root_writer(
+    tmp_path,
+):
+    """A terminal root refresh must not wait on the profile lock it does not own."""
+    profile_path = tmp_path / "profiles" / "talos" / "auth.json"
+    root_path = tmp_path / "auth.json"
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "stale-access",
+                        "refresh_token": "stale-refresh",
+                    }
+                }
+            },
+        },
+    )
+    ctx = multiprocessing.get_context("fork")
+    root_lock_held = ctx.Event()
+    profile_lock_held = ctx.Event()
+    results = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_terminal_refresh_worker,
+            args=(
+                str(profile_path),
+                str(root_path),
+                root_lock_held,
+                profile_lock_held,
+                results,
+            ),
+        ),
+        ctx.Process(
+            target=_profile_then_root_lock_worker,
+            args=(
+                str(profile_path),
+                str(root_path),
+                root_lock_held,
+                profile_lock_held,
+                results,
+            ),
+        ),
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+
+    assert [process.exitcode for process in processes] == [0, 0]
+    outcomes = {
+        name: (ok, error)
+        for name, ok, error in (results.get(timeout=2) for _ in processes)
+    }
+    assert outcomes == {"refresh": (True, None), "writer": (True, None)}
+    profile = _read_store(profile_path)
+    assert not profile.get("providers", {}).get("xai-oauth")
+    assert not profile.get("credential_pool", {}).get("xai-oauth")
 
 
 def test_failed_shared_write_through_is_recorded_without_local_shadow(
