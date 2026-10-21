@@ -8728,7 +8728,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
+        return toolsets
     except Exception as exc:
         _log.debug(
             "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
@@ -8736,6 +8736,100 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             exc,
         )
         return None
+
+
+def _native_image_attachment_evidence(
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> tuple[list[str], int]:
+    """Return immutable image paths and verified bytes from the durable task."""
+
+    paths: list[str] = []
+    total_bytes = 0
+    with connect_closing(board=board) as conn:
+        for attachment in list_attachments(conn, task_id):
+            if not str(attachment.content_type or "").lower().startswith("image/"):
+                continue
+            path = Path(attachment.stored_path)
+            if not path.is_file():
+                raise RuntimeError(
+                    f"backend failover image attachment is unavailable: {attachment.filename}"
+                )
+            actual_size = path.stat().st_size
+            if attachment.size > 0 and attachment.size != actual_size:
+                raise RuntimeError(
+                    f"backend failover image attachment size changed: {attachment.filename}"
+                )
+            paths.append(str(path.resolve()))
+            total_bytes += actual_size
+    return paths, total_bytes
+
+
+def _backend_failover_worker_argv(
+    task: Task,
+    profile: str,
+    dispatcher_home: Optional[str],
+    assignee_home: Optional[str],
+    *,
+    board: Optional[str] = None,
+) -> Optional[list[str]]:
+    """Return the bounded cross-runtime supervisor argv when activated.
+
+    Per-task model/provider overrides remain authoritative and intentionally
+    bypass canonical role routing. Invalid activated config raises so the
+    dispatcher records a spawn failure instead of silently degrading to an
+    unreviewed route.
+    """
+
+    if (
+        getattr(task, "model_override", None)
+        or getattr(task, "provider_override", None)
+        or getattr(task, "goal_mode", False)
+    ):
+        return None
+    from hermes_cli.backend_failover import load_profile_chain, worker_argv
+
+    chain = load_profile_chain(profile, dispatcher_home)
+    if chain and not assignee_home:
+        raise RuntimeError(
+            f"backend failover assignee profile {profile!r} does not exist"
+        )
+    if not chain:
+        return None
+    required_toolsets = _resolve_worker_cli_toolsets(assignee_home)
+    if required_toolsets is None:
+        raise RuntimeError(
+            f"backend failover could not resolve CLI toolsets for assignee {profile!r}"
+        )
+    native_image_paths, native_image_bytes = _native_image_attachment_evidence(
+        task.id,
+        board=board,
+    )
+    # Ordinary workers can discover task-body media during CLI startup. The
+    # supervised path transports only immutable attachment evidence, so reject
+    # any body reference outside that snapshot before starting the supervisor.
+    from agent.image_routing import extract_image_refs
+
+    body_paths, body_urls = extract_image_refs(str(getattr(task, "body", "") or ""))
+    admitted_paths = {str(Path(path).resolve()) for path in native_image_paths}
+    unrepresented_paths = {
+        str(Path(path).resolve()) for path in body_paths
+    } - admitted_paths
+    if unrepresented_paths or body_urls:
+        raise RuntimeError(
+            "backend failover task-body media is not represented by the immutable "
+            "attachment snapshot"
+        )
+    return worker_argv(
+        task,
+        profile,
+        chain,
+        required_toolsets,
+        requires_native_image=bool(native_image_paths),
+        native_image_bytes=native_image_bytes,
+        native_image_paths=native_image_paths,
+    )
 
 
 def _default_spawn(
@@ -8766,6 +8860,11 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    # The long-lived dispatcher's config owns the single authoritative
+    # role→chain map. Capture its home before HERMES_HOME is rewritten to the
+    # assignee profile for the actual worker process.
+    from hermes_constants import get_hermes_home
+    dispatcher_hermes_home = str(get_hermes_home())
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -8778,13 +8877,13 @@ def _default_spawn(
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        assignee_hermes_home = resolve_profile_env(profile_arg)
     except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+        # Preserve the historical direct-worker test/deferred-resolution path,
+        # but never permit a supervised cross-runtime route to inherit it.
+        assignee_hermes_home = None
+    if assignee_hermes_home:
+        env["HERMES_HOME"] = assignee_hermes_home
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -8847,6 +8946,18 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # Cross-runtime chains are supervised by a tiny dispatcher-owned wrapper.
+    # It inherits the exact same task/run/board/workspace identity assembled
+    # above, and each child leg gets one attempt.  Profiles without an active
+    # chain continue through the historical direct Hermes worker path.
+    supervisor_cmd = _backend_failover_worker_argv(
+        task,
+        profile_arg,
+        dispatcher_hermes_home,
+        assignee_hermes_home,
+        board=board,
+    )
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -8855,7 +8966,7 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = [
+    cmd = supervisor_cmd or [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
         "--cli",
@@ -8870,11 +8981,11 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
+    if supervisor_cmd is None and task.skills:
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
+    if supervisor_cmd is None and task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
@@ -8882,14 +8993,15 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
-    if task.goal_mode:
+    if supervisor_cmd is None:
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if worker_toolsets:
+            cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+        cmd.extend([
+            "chat",
+            "-q", prompt,
+        ])
+    if supervisor_cmd is None and task.goal_mode:
         # Goal-mode workers must take the fully-quiet single-query path:
         # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
         # cli.py's quiet branch. Without -Q the worker gets exactly one
