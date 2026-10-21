@@ -3576,6 +3576,54 @@ def _collect_query_images(query: str | None, image_arg: str | None = None) -> tu
     return message, deduped
 
 
+def _collect_kanban_body_images(
+    images: list[Path],
+) -> tuple[list[Path], list[str]]:
+    """Add task-body media for ordinary workers, never failover children.
+
+    The cross-runtime supervisor freezes and budgets its native-media snapshot
+    before selecting a leg. Its API child receives that snapshot exclusively
+    through ``--image``; reopening the task body here would create a second,
+    mutable media source after admission.
+    """
+
+    collected = list(images)
+    if os.environ.get("HERMES_BACKEND_FAILOVER_CHILD") == "1":
+        return collected, []
+
+    image_urls: list[str] = []
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not task_id:
+        return collected, image_urls
+    try:
+        from agent.image_routing import extract_image_refs
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, task_id)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        body = getattr(task, "body", "") if task is not None else ""
+        if body:
+            body_paths, body_urls = extract_image_refs(body)
+            seen = {str(path) for path in collected}
+            for body_path in body_paths:
+                if body_path not in seen:
+                    seen.add(body_path)
+                    collected.append(Path(body_path))
+            image_urls.extend(body_urls)
+    except Exception as exc:
+        # Ordinary workers retain the historical best-effort enrichment
+        # contract. Failover children return before this block and therefore
+        # cannot silently consume media outside the supervisor snapshot.
+        logger.debug("kanban image-ref extraction failed: %s", exc)
+    return collected, image_urls
+
+
 # Strip OSC escape sequences (e.g. OSC-8 hyperlinks) that prompt_toolkit's
 # ANSI parser can't handle — it strips \x1b but passes the payload through
 # as literal text, garbling the TUI output.
@@ -16398,36 +16446,9 @@ def main(
             # worker's first turn. Without this, users who paste a screenshot
             # path or URL into a kanban task body never get it routed to the
             # model's vision input.
-            single_query_image_urls: list[str] = []
-            _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
-            if _kanban_task_id:
-                try:
-                    from hermes_cli import kanban_db as _kb
-                    from agent.image_routing import extract_image_refs as _extract_refs
-
-                    _conn = _kb.connect()
-                    try:
-                        _task = _kb.get_task(_conn, _kanban_task_id)
-                    finally:
-                        try:
-                            _conn.close()
-                        except Exception:
-                            pass
-                    _body = getattr(_task, "body", "") if _task is not None else ""
-                    if _body:
-                        _kb_paths, _kb_urls = _extract_refs(_body)
-                        if _kb_paths:
-                            # Dedupe against any --image the user already passed.
-                            _seen = {str(p) for p in single_query_images}
-                            for _p in _kb_paths:
-                                if _p not in _seen:
-                                    _seen.add(_p)
-                                    single_query_images.append(Path(_p))
-                        if _kb_urls:
-                            single_query_image_urls.extend(_kb_urls)
-                except Exception as _exc:
-                    # Best-effort enrichment; never block worker startup on it.
-                    logger.debug("kanban image-ref extraction failed: %s", _exc)
+            single_query_images, single_query_image_urls = (
+                _collect_kanban_body_images(single_query_images)
+            )
             if quiet:
                 # Quiet mode: suppress banner, spinner, tool previews.
                 # Only print the final response and parseable session info.
@@ -16570,7 +16591,20 @@ def main(
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
+                            if os.environ.get("HERMES_BACKEND_FAILOVER_CHILD") == "1":
+                                # The dispatcher-owned cross-runtime supervisor
+                                # needs a stronger contract than generic 0/1:
+                                # only pre-tool availability failures are
+                                # eligible, while refusals and potentially
+                                # side-effecting attempts stop without replay.
+                                try:
+                                    from hermes_cli.backend_failover import (
+                                        classify_failed_result as _classify_failed_result,
+                                    )
+                                    _exit_code = _classify_failed_result(result)
+                                except Exception:
+                                    _exit_code = 1
+                            elif os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"
                             ) in ("rate_limit", "billing"):
                                 try:

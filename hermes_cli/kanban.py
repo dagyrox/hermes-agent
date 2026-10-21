@@ -269,6 +269,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- init ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
 
+    p_backend_status = sub.add_parser(
+        "backend-status",
+        help="Show configured, available, and active worker backend routes",
+    )
+    p_backend_status.add_argument("--json", action="store_true")
+
     # --- boards (new in v2: multi-project support) ---
     p_boards = sub.add_parser(
         "boards",
@@ -1092,6 +1098,7 @@ def kanban_command(args: argparse.Namespace) -> int:
 
         handlers = {
             "init":     _cmd_init,
+            "backend-status": _cmd_backend_status,
             "create":   _cmd_create,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
@@ -1457,13 +1464,9 @@ def _parse_duration(val) -> Optional[int]:
 def _cmd_init(args: argparse.Namespace) -> int:
     path = kb.init_db()
     print(f"Kanban DB initialized at {path}")
-
     print()
     # Enumerate profiles on disk so the user knows what assignees are
-    # already addressable. Multica does this auto-detection on its
-    # daemon start; we do it here at init time instead because our
-    # dispatcher doesn't need to enumerate — we just pass the name
-    # through to `hermes -p <name>`.
+    # already addressable.
     try:
         profiles = kb.list_profiles_on_disk()
     except Exception:
@@ -1485,6 +1488,52 @@ def _cmd_init(args: argparse.Namespace) -> int:
         "by default (config: kanban.dispatch_interval_seconds). Without a\n"
         "running gateway, tasks stay in 'ready' forever."
     )
+    return 0
+
+
+def _backend_leg_available(profile: str, leg: Any) -> bool:
+    """Best-effort, secret-free readiness probe for backend-status."""
+    try:
+        from pathlib import Path
+
+        from hermes_cli.backend_failover_worker import _leg_available
+        from hermes_cli.profiles import resolve_profile_env
+
+        return _leg_available(leg, Path(resolve_profile_env(profile)))
+    except Exception:
+        return False
+
+
+def _cmd_backend_status(args: argparse.Namespace) -> int:
+    from hermes_cli.backend_failover import build_status
+    from hermes_cli.config import load_config
+
+    raw = load_config().get("agent_backend_failover") or {}
+    status = build_status(raw, availability_check=_backend_leg_available)
+    if getattr(args, "json", False):
+        print(json.dumps(status, indent=2, sort_keys=True))
+        return 0
+
+    print(
+        "Backend failover: "
+        f"configured={'yes' if status['configured'] else 'no'}  "
+        f"activation-requested={'yes' if status['activation_requested'] else 'no'}  "
+        f"live-activated={'yes' if status['live_activated'] else 'no'}"
+    )
+    for profile, role in status["roles"].items():
+        print(
+            f"  {profile}: available={'yes' if role['available'] else 'no'}  "
+            f"activation-requested={'yes' if role['activation_requested'] else 'no'}  "
+            f"live-activated={'yes' if role['live_activated'] else 'no'}"
+        )
+        for leg in role["chain"]:
+            backend = leg.get("provider") or "claude-subscription"
+            marker = "active" if leg["active"] else "standby"
+            available = "available" if leg["available"] else "unavailable"
+            print(
+                f"    {leg['position']}. {backend}/{leg['model']} "
+                f"[{marker}, {available}]"
+            )
     return 0
 
 
