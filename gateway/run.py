@@ -7471,7 +7471,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             if not ledger_enabled():
-                return 0
+                from hermes_cli.backend_failover import (
+                    gateway_owner_bridge_enabled,
+                )
+                from hermes_cli.config import load_config
+
+                if not gateway_owner_bridge_enabled(
+                    load_config().get("agent_backend_failover")
+                ):
+                    return 0
             # Only claim rows we can actually send this boot: self.adapters
             # holds a platform only after its connect() succeeded, and each
             # claim spends one of the row's three redelivery attempts.
@@ -14336,6 +14344,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
                 response = ""
+
+            _owner_delivery_meta = agent_result.get("owner_final_delivery")
+            if response and isinstance(_owner_delivery_meta, dict):
+                from pathlib import Path as _Path
+                from gateway.backend_failover import GatewayFailoverLedger
+                from gateway.delivery_ledger import (
+                    compute_obligation_id,
+                    record_obligation,
+                )
+                from gateway.owner_turn_delivery import OwnerFinalDelivery
+
+                _delivery_adapter = self._adapter_for_source(source)
+                _owner_obligation_id = compute_obligation_id(
+                    session_key,
+                    str(getattr(event, "message_id", "") or ""),
+                    response,
+                )
+                record_obligation(
+                    obligation_id=_owner_obligation_id,
+                    session_key=session_key,
+                    platform=str(
+                        getattr(source.platform, "value", source.platform)
+                    ),
+                    chat_id=source.chat_id,
+                    thread_id=getattr(source, "thread_id", None),
+                    content=response,
+                    recovery_policy="fail_closed",
+                )
+                _delivery_handle = OwnerFinalDelivery(
+                    ledger=GatewayFailoverLedger(
+                        _Path(str(_owner_delivery_meta["ledger_path"]))
+                    ),
+                    coordinator_id=str(_owner_delivery_meta["coordinator_id"]),
+                    owner=str(_owner_delivery_meta["owner"]),
+                    generation=int(_owner_delivery_meta["generation"]),
+                    payload=str(_owner_delivery_meta["payload"]),
+                    parts=(response,),
+                    obligation_id=_owner_obligation_id,
+                )
+                _delivery_adapter.register_owner_final_delivery(
+                    session_key,
+                    _delivery_handle,
+                    generation=run_generation,
+                )
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
@@ -22108,26 +22160,89 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                # Freeze the exact owner prompt/tool surface before the primary
-                # provider runs. A later cross-runtime leg may consume this
-                # snapshot, but may never rebuild or widen it after failure.
-                _owner_failover_dispatch = None
+                # The conversation bridge has a separate default-off gate from
+                # worker failover. When selected, reserve the primary attempt
+                # before dispatch and consume only ledger-issued frozen bytes.
+                _owner_failover = None
                 _owner_failover_chain = ()
+                _owner_bridge_requested = bool(
+                    (user_config.get("agent_backend_failover") or {}).get("enabled")
+                    and (user_config.get("agent_backend_failover") or {}).get(
+                        "gateway_owner_bridge"
+                    )
+                    is True
+                )
                 try:
                     from dataclasses import asdict
-                    from gateway.backend_failover import FrozenLegDispatch, FrozenTurn
-                    from hermes_cli.backend_failover import resolve_role_chain
-
-                    _owner_failover_chain = resolve_role_chain(
-                        user_config.get("agent_backend_failover") or {},
-                        self._active_profile_name(),
+                    import hashlib
+                    from gateway.backend_failover import FrozenTurn, GatewayFailoverLedger
+                    from gateway.owner_tool_bridge import tool_allowed_for_capability
+                    from hermes_cli.backend_failover import (
+                        gateway_owner_bridge_enabled,
+                        resolve_role_chain,
                     )
+                    from hermes_constants import get_hermes_home
+
+                    _failover_config = user_config.get("agent_backend_failover") or {}
+                    if gateway_owner_bridge_enabled(_failover_config):
+                        _owner_failover_chain = resolve_role_chain(
+                            _failover_config,
+                            self._active_profile_name(),
+                        )
                     if _owner_failover_chain:
                         _legs = [asdict(leg) for leg in _owner_failover_chain]
+                        _primary_provider = str(
+                            (turn_route.get("runtime") or {}).get("provider") or ""
+                        ).lower()
+                        if not (
+                            _owner_failover_chain[0].kind == "api"
+                            and _owner_failover_chain[0].model == turn_route.get("model")
+                            and _owner_failover_chain[0].provider == _primary_provider
+                        ):
+                            raise RuntimeError("gateway owner route does not match the active primary")
+                        _claude_capability = (
+                            _owner_failover_chain[1].capability_mode
+                            if len(_owner_failover_chain) > 1
+                            else "full"
+                        )
+                        _tool_snapshot = [
+                            _tool
+                            for _tool in (getattr(agent, "tools", None) or [])
+                            if tool_allowed_for_capability(
+                                str((_tool.get("function") or {}).get("name") or ""),
+                                _claude_capability,
+                            )
+                        ]
+                        if not _tool_snapshot:
+                            raise RuntimeError("gateway owner bridge requires a non-empty frozen tool snapshot")
+                        _media_snapshot = []
+                        if isinstance(_api_run_message, list):
+                            for _part in _api_run_message:
+                                if isinstance(_part, dict) and _part.get("type") in {
+                                    "image_url",
+                                    "input_image",
+                                }:
+                                    _encoded = json.dumps(
+                                        _part, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                                    ).encode("utf-8")
+                                    _media_snapshot.append(
+                                        {
+                                            "type": _part.get("type"),
+                                            "sha256": hashlib.sha256(_encoded).hexdigest(),
+                                        }
+                                    )
+                        _owner_identity = (
+                            self._active_profile_name(),
+                            platform_key,
+                            str(source.chat_id or ""),
+                            str(source.user_id or ""),
+                            session_key,
+                        )
+                        _owner_name = f"gateway:{os.getpid()}:{int(run_generation or 0)}"
                         _frozen_turn = FrozenTurn.create(
                             session_key=session_key,
                             session_id=session_id,
-                            event_id=f"{session_key}:{run_generation}",
+                            event_id=str(event_message_id or f"{session_key}:{run_generation}"),
                             generation=int(run_generation or 0),
                             prompt={
                                 "system": getattr(agent, "_cached_system_prompt", None)
@@ -22135,74 +22250,148 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "history": agent_history,
                                 "current": _api_run_message,
                             },
-                            tools=getattr(agent, "tools", None) or [],
-                            media=(),
+                            tools=_tool_snapshot,
+                            media=_media_snapshot,
                             legs=_legs,
                         )
-                        _owner_failover_dispatch = FrozenLegDispatch(
-                            prompt_json=json.dumps(
-                                _frozen_turn.prompt,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                                ensure_ascii=False,
-                            ),
-                            tools_json=json.dumps(
-                                _frozen_turn.tools,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                                ensure_ascii=False,
-                            ),
-                            media_json=json.dumps(
-                                _frozen_turn.media,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                                ensure_ascii=False,
-                            ),
-                            leg_json=json.dumps(
-                                _legs[1] if len(_legs) > 1 else _legs[0],
-                                sort_keys=True,
-                                separators=(",", ":"),
-                                ensure_ascii=False,
-                            ),
-                            prompt_digest=_frozen_turn.prompt_digest,
-                            tool_digest=_frozen_turn.tool_digest,
-                            media_digest=_frozen_turn.media_digest,
-                            chain_digest=_frozen_turn.chain_digest,
+                        _ledger = GatewayFailoverLedger(
+                            get_hermes_home() / "state" / "gateway_failover.db"
+                        )
+                        _record = _ledger.plan(_frozen_turn, owner=_owner_name)
+                        _primary_dispatch = _ledger.start_leg(
+                            _record.coordinator_id,
+                            0,
+                            turn=_frozen_turn,
+                            owner=_owner_name,
+                            generation=int(run_generation or 0),
+                        )
+                        _owner_failover = (
+                            _ledger,
+                            _record.coordinator_id,
+                            _owner_name,
+                            _owner_identity,
+                            _frozen_turn,
+                            _primary_dispatch,
                         )
                 except Exception:
-                    logger.warning(
-                        "Unable to freeze gateway owner failover dispatch",
-                        exc_info=True,
+                    logger.exception(
+                        "Unable to prepare gateway owner failover turn",
                     )
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
-                # One exercised shipping vertical: when the configured primary
-                # API leg fails before any tool activity and the next canonical
-                # leg is Claude Code, execute that leg through the request-scoped
-                # owner bridge. The surrounding gateway path remains the sole
-                # transcript/final-delivery owner.
-                if _owner_failover_dispatch is not None:
+                    if _owner_bridge_requested:
+                        raise RuntimeError(
+                            "gateway owner failover preparation failed closed"
+                        )
+                _saved_stream_callbacks = None
+                if _owner_failover is not None:
+                    # Owner-final delivery is receipt-bound below.  Streaming
+                    # any assistant bytes before that claim would create an
+                    # observable-output boundary and defeat exactly-once
+                    # delivery, so freeze streaming off for this one turn.
+                    _saved_stream_callbacks = (
+                        getattr(agent, "stream_delta_callback", None),
+                        getattr(agent, "_stream_callback", None),
+                    )
+                    setattr(agent, "stream_delta_callback", None)
+                    setattr(agent, "_stream_callback", None)
+                try:
+                    result = agent.run_conversation(
+                        _api_run_message, **_conversation_kwargs
+                    )
+                finally:
+                    if _saved_stream_callbacks is not None:
+                        setattr(
+                            agent,
+                            "stream_delta_callback",
+                            _saved_stream_callbacks[0],
+                        )
+                        setattr(
+                            agent,
+                            "_stream_callback",
+                            _saved_stream_callbacks[1],
+                        )
+                if _owner_failover is not None:
                     try:
+                        from gateway.backend_failover import AttemptObservation, ReplayDenied
                         from hermes_cli.backend_failover import (
                             EXIT_ELIGIBLE,
+                            EXIT_REFUSAL,
                             classify_failed_result,
                         )
 
+                        (
+                            _ledger,
+                            _coordinator_id,
+                            _owner_name,
+                            _owner_identity,
+                            _frozen_turn,
+                            _primary_dispatch,
+                        ) = _owner_failover
                         _chain = _owner_failover_chain
-                        _primary_provider = str(
-                            (turn_route.get("runtime") or {}).get("provider") or ""
-                        ).lower()
-                        _primary_matches = bool(
-                            _chain
-                            and _chain[0].kind == "api"
-                            and _chain[0].model == turn_route.get("model")
-                            and _chain[0].provider == _primary_provider
+                        _classification = classify_failed_result(result)
+                        _reason = str(result.get("failure_reason") or "unknown").lower()
+                        _partial_output = bool(
+                            result.get("partial") or result.get("response_previewed")
                         )
-                        if (
-                            _primary_matches
+                        if not result.get("failed") and str(
+                            result.get("final_response") or ""
+                        ):
+                            _primary_observation = AttemptObservation.success(
+                                str(result.get("final_response") or "")
+                            )
+                        elif not result.get("failed"):
+                            _primary_observation = AttemptObservation.failure(
+                                "format_error"
+                            )
+                        elif _classification == EXIT_REFUSAL:
+                            _primary_observation = AttemptObservation.refusal(_reason)
+                        elif (
+                            _classification == EXIT_ELIGIBLE
+                            and not _partial_output
+                            and _reason not in {"timeout", "format_error"}
+                        ):
+                            _primary_observation = AttemptObservation.availability_failure(
+                                str(_reason)
+                            )
+                        else:
+                            _primary_observation = AttemptObservation.failure(
+                                _reason,
+                                partial_output=_partial_output,
+                                tool_activity=_classification != EXIT_ELIGIBLE,
+                                timed_out=_reason == "timeout",
+                                cancelled=_reason == "cancelled",
+                            )
+                        _primary_outcome = _ledger.finish_leg(
+                            _coordinator_id,
+                            0,
+                            _primary_observation,
+                            owner=_owner_name,
+                            generation=int(run_generation or 0),
+                        )
+                        if _primary_observation.outcome == "success":
+                            result["owner_final_delivery"] = {
+                                "ledger_path": str(_ledger.path),
+                                "coordinator_id": _coordinator_id,
+                                "owner": _owner_name,
+                                "generation": int(run_generation or 0),
+                                "payload": _primary_observation.response,
+                            }
+                        elif (
+                            _primary_outcome.replayable
                             and len(_chain) > 1
                             and _chain[1].kind == "claude_code"
-                            and classify_failed_result(result) == EXIT_ELIGIBLE
                         ):
+                            _leg_index = _ledger.next_leg(
+                                _coordinator_id,
+                                owner=_owner_name,
+                                generation=int(run_generation or 0),
+                            )
+                            _owner_failover_dispatch = _ledger.start_leg(
+                                _coordinator_id,
+                                _leg_index,
+                                turn=_frozen_turn,
+                                owner=_owner_name,
+                                generation=int(run_generation or 0),
+                            )
                             from agent.transports.gateway_claude_sdk import (
                                 ClaudeSubscriptionTurn,
                                 run_claude_subscription_turn,
@@ -22215,11 +22404,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 dispatch=_owner_failover_dispatch,
                                 effective_task_id=session_id,
                                 turn_id=f"{session_key}:{run_generation}",
-                                coordinator_id=_frozen_turn.coordinator_id,
-                                attempt_id=f"{_frozen_turn.coordinator_id}:1",
+                                coordinator_id=_coordinator_id,
+                                attempt_id=f"{_coordinator_id}:{_leg_index}",
                                 generation=int(run_generation or 0),
                                 snapshot_digest=_owner_failover_dispatch.prompt_digest,
-                                identity=(platform_key, str(source.user_id), session_key),
+                                identity=_owner_identity,
+                                expected_identity=_owner_identity,
+                                capability_mode=_chain[1].capability_mode,
+                                record_intent=lambda call_id, name, arguments: _ledger.record_tool_intent(
+                                    _coordinator_id,
+                                    _leg_index,
+                                    call_id,
+                                    name,
+                                    arguments,
+                                    owner=_owner_name,
+                                    generation=int(run_generation or 0),
+                                ),
+                                record_result=lambda call_id, content, is_error: _ledger.record_tool_result(
+                                    _coordinator_id,
+                                    _leg_index,
+                                    call_id,
+                                    content,
+                                    is_error,
+                                    owner=_owner_name,
+                                    generation=int(run_generation or 0),
+                                ),
                             )
                             _bridge = OwnerToolBridge.open(
                                 _owner_failover_dispatch,
@@ -22242,6 +22451,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _owner_failover_dispatch.prompt_json
                                         )["system"],
                                         cwd=os.getcwd(),
+                                        reasoning_effort=_chain[1].reasoning_effort,
+                                        capability_mode=_chain[1].capability_mode,
                                     ),
                                     _owner_failover_dispatch,
                                     _bridge,
@@ -22257,9 +22468,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _bridge,
                                 )
                                 _bridge.close()
-                            _messages = list(result.get("messages") or [])
+                            _messages = _execution.messages
                             _messages.append(
                                 {"role": "assistant", "content": _claude_final}
+                            )
+                            agent._flush_messages_to_session_db(
+                                _messages,
+                                conversation_history=agent_history,
+                            )
+                            _ledger.finish_leg(
+                                _coordinator_id,
+                                _leg_index,
+                                AttemptObservation.success(_claude_final),
+                                owner=_owner_name,
+                                generation=int(run_generation or 0),
                             )
                             result = {
                                 **result,
@@ -22272,7 +22494,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "failure_reason": None,
                                 "should_fallback": False,
                                 "backend_failover_leg": "claude_code",
+                                "agent_persisted": True,
+                                "history_offset": len(agent_history),
+                                "owner_final_delivery": {
+                                    "ledger_path": str(_ledger.path),
+                                    "coordinator_id": _coordinator_id,
+                                    "owner": _owner_name,
+                                    "generation": int(run_generation or 0),
+                                    "payload": _claude_final,
+                                },
                             }
+                    except ReplayDenied:
+                        logger.exception("Gateway owner failover replay denied")
+                        raise
                     except Exception:
                         logger.exception("Gateway Claude subscription failover leg failed")
             finally:

@@ -15,7 +15,17 @@ from gateway.owner_tool_bridge import (
     OwnerToolBridge,
     OwnerTurnExecution,
     ToolBridgeError,
+    tool_allowed_for_capability,
 )
+
+
+def test_role_capabilities_apply_a_hard_ceiling_before_normal_approval():
+    assert tool_allowed_for_capability("read_file", "read_only") is True
+    assert tool_allowed_for_capability("terminal", "read_only") is False
+    assert tool_allowed_for_capability("kanban_create", "orchestrator") is True
+    assert tool_allowed_for_capability("terminal", "orchestrator") is False
+    assert tool_allowed_for_capability("terminal", "full") is True
+    assert tool_allowed_for_capability("read_file", "unknown") is False
 
 
 def _dispatch() -> FrozenLegDispatch:
