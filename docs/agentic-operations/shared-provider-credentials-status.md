@@ -32,7 +32,7 @@ No live migration, installation, activation, restart, deployment, credential mut
 - Round-3 repair commit: `290450a0b92bc1ff6ed34b3a7a05e44738128fcd`
 - Athena round-3 review artifact: `docs/agentic-operations/athena-review-pr13-87bfbc.md`
 - Hosted CI: https://github.com/dagyrox/hermes-agent/actions/runs/39510318075
-- Provenance: Issue `dagyrox/or7-platform#259`, card `t_1af34c61`, run `552`, packet `docs/agentic-operations/shared-provider-credentials-work-packet.md`
+- Provenance: Issue `dagyrox/or7-platform#259`, card `t_1af34c61`, run `552`, packet `docs/agentic-operations/shared-provider-credentials.md`
 
 ## Round-4 failure-path repair
 
