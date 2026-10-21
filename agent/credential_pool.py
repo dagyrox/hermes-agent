@@ -1301,7 +1301,22 @@ class CredentialPool:
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
-                self._mark_exhausted(entry, None)
+                if entry.extra.get("shared_root_source"):
+                    root_path = self._shared_root_auth_path(entry)
+                    if root_path is None:
+                        return None
+                    with _auth_store_lock(target_path=root_path):
+                        updated_failure = self._mark_exhausted(
+                            entry,
+                            None,
+                            persist=False,
+                        )
+                        self._persist_shared_root_pool_failure(
+                            updated_failure,
+                            root_path=root_path,
+                        )
+                else:
+                    self._mark_exhausted(entry, None)
             return None
 
         # Codex and xAI OAuth refresh tokens are single-use.  The
@@ -1529,18 +1544,15 @@ class CredentialPool:
                         updated.extra["write_through_ok"] = True
                     return updated
                 # Terminal error: auth.json has no newer tokens — the stored
-                # refresh_token is dead.  Clear it from auth.json so the next
-                # session does not re-seed the same revoked credentials, and
-                # remove all singleton-seeded xAI entries from the in-memory
-                # pool. Mirrors the Nous quarantine path above.
+                # refresh_token is dead. Clear it from auth.json so the next
+                # session does not re-seed the same revoked credential, and
+                # remove only the failed grant from the pool; independent xAI
+                # grants remain eligible.
                 if auth_mod._is_terminal_xai_oauth_refresh_error(exc):
                     logger.debug(
                         "xAI OAuth refresh token is terminally invalid; clearing local token state"
                     )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
+                    removed_ids = [entry.id]
                     try:
                         root_path = (
                             shared_root_path
@@ -1583,7 +1595,7 @@ class CredentialPool:
                         )
                     self._entries = [
                         item for item in self._entries
-                        if item.source != "device_code"
+                        if item.id != entry.id
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
@@ -1616,18 +1628,15 @@ class CredentialPool:
                         updated.extra["write_through_ok"] = True
                     return updated
                 # Terminal error: auth.json has no newer tokens — the stored
-                # refresh_token is dead.  Clear it from auth.json so the next
-                # session does not re-seed the same revoked credentials, and
-                # remove all singleton-seeded (device_code) entries from the
-                # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
+                # refresh_token is dead. Clear it from auth.json so the next
+                # session does not re-seed the same revoked credential, and
+                # remove only the failed grant from the pool; independent
+                # Codex grants remain eligible.
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
-                    removed_ids = [
-                        item.id for item in self._entries
-                        if item.source == "device_code"
-                    ]
+                    removed_ids = [entry.id]
                     try:
                         root_path = (
                             shared_root_path
@@ -1670,7 +1679,7 @@ class CredentialPool:
                         )
                     self._entries = [
                         item for item in self._entries
-                        if item.source != "device_code"
+                        if item.id != entry.id
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None

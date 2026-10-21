@@ -712,7 +712,15 @@ def test_inherited_refresh_failure_does_not_take_profile_lock_or_create_shadow(
                     "source": "device_code",
                     "access_token": "stale-access",
                     "refresh_token": "stale-refresh",
-                }
+                },
+                {
+                    "id": f"independent-{provider}",
+                    "provider": provider,
+                    "auth_type": "oauth",
+                    "source": "device_code",
+                    "access_token": "independent-access",
+                    "refresh_token": "independent-refresh",
+                },
             ]
         }
     _write_store(root_path, root_store)
@@ -780,7 +788,17 @@ def test_inherited_refresh_failure_does_not_take_profile_lock_or_create_shadow(
         refresh_token="stale-refresh",
     )
     entry.extra["shared_root_source"] = True
-    pool = CredentialPool(provider, [entry])
+    entries = [entry]
+    if terminal:
+        entries.append(
+            _entry(
+                provider,
+                id=f"independent-{provider}",
+                access_token="independent-access",
+                refresh_token="independent-refresh",
+            )
+        )
+    pool = CredentialPool(provider, entries)
     source_path_calls = 0
 
     def source_path(_entry):
@@ -803,12 +821,69 @@ def test_inherited_refresh_failure_does_not_take_profile_lock_or_create_shadow(
     if terminal:
         assert "access_token" not in root_tokens
         assert "refresh_token" not in root_tokens
-        assert root_pool == []
+        assert [row["id"] for row in root_pool] == [f"independent-{provider}"]
     else:
         assert root_tokens["refresh_token"] == "stale-refresh"
         assert root_pool[0]["last_status"] == CP.STATUS_EXHAUSTED
         assert "shared_root_source" not in root_pool[0]
         assert "write_through_ok" not in root_pool[0]
+
+
+@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth"])
+def test_inherited_missing_refresh_token_stays_root_owned(
+    monkeypatch, tmp_path, provider
+):
+    profile_path = tmp_path / "profiles" / "talos" / "auth.json"
+    root_path = tmp_path / "auth.json"
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    inherited = _entry(
+        provider,
+        id=f"shared-missing-refresh-{provider}",
+        access_token="stale-access",
+        refresh_token="",
+    )
+    inherited.extra["shared_root_source"] = True
+    root_entry = inherited.to_dict()
+    root_entry.pop("shared_root_source", None)
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {provider: [root_entry]},
+        },
+    )
+    monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(
+        A,
+        "_global_auth_file_path",
+        lambda provider_id=None: root_path,
+    )
+
+    import contextlib
+
+    lock_targets = []
+    real_lock = A._auth_store_lock
+
+    @contextlib.contextmanager
+    def tracking_lock(*args, **kwargs):
+        lock_targets.append(kwargs.get("target_path"))
+        with real_lock(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(A, "_auth_store_lock", tracking_lock)
+    monkeypatch.setattr(CP, "_auth_store_lock", tracking_lock)
+    pool = CredentialPool(provider, [inherited])
+
+    assert pool._refresh_entry(inherited, force=True) is None
+
+    assert None not in lock_targets
+    assert root_path in lock_targets
+    profile = _read_store(profile_path)
+    assert not profile.get("providers", {}).get(provider)
+    assert not profile.get("credential_pool", {}).get(provider)
+    root_pool = _read_store(root_path)["credential_pool"][provider]
+    assert root_pool[0]["last_status"] == CP.STATUS_EXHAUSTED
 
 
 def test_terminal_inherited_refresh_does_not_deadlock_profile_then_root_writer(
