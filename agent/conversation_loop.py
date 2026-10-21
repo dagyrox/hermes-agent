@@ -1885,11 +1885,22 @@ def run_conversation(
                 )
                 if callable(_gateway_prepare):
                     agent._gateway_owner_turn_prepared_callback = None
+                    # Dispatch repeats Responses preflight after middleware.
+                    # Freeze that normalized shape, not pre-normalization text.
+                    if agent.api_mode == "codex_responses":
+                        api_kwargs = agent._get_transport().preflight_kwargs(
+                            api_kwargs,
+                            allow_stream=False,
+                            is_github_responses=agent._is_copilot_url(),
+                        )
                     _wire_messages = api_kwargs.get("messages")
+                    _wire_instructions = None
                     if not isinstance(_wire_messages, list):
                         _wire_messages = api_kwargs.get("input")
+                        _wire_instructions = api_kwargs.get("instructions")
                     _gateway_prepare(
                         api_messages=_wire_messages,
+                        system_instructions=_wire_instructions,
                         transcript_messages=messages,
                         tools=agent.tools,
                         history_offset=current_turn_user_idx,

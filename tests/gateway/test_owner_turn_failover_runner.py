@@ -138,8 +138,9 @@ def _source() -> SessionSource:
     )
 
 
-def _configure_runner_test(monkeypatch, tmp_path) -> None:
-    _install_fake_agent(monkeypatch)
+def _configure_runner_test(monkeypatch, tmp_path, *, fake_agent=True) -> None:
+    if fake_agent:
+        _install_fake_agent(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")

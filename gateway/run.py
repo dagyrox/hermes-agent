@@ -22238,6 +22238,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         def _prepare_gateway_owner_turn(
                             *,
                             api_messages,
+                            system_instructions=None,
                             transcript_messages,
                             tools,
                             history_offset,
@@ -22253,6 +22254,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                             _wire_prompt = freeze_owner_wire_prompt(
                                 api_messages,
+                                system_instructions=system_instructions,
                                 transcript_messages=transcript_messages,
                                 history_offset=history_offset,
                             )

@@ -54,6 +54,7 @@ def freeze_owner_wire_prompt(
     *,
     transcript_messages: Any,
     history_offset: int,
+    system_instructions: str | None = None,
 ) -> dict[str, Any]:
     """Freeze final wire bytes plus the exact internal replay boundary."""
 
@@ -64,25 +65,43 @@ def freeze_owner_wire_prompt(
     wire_messages = deepcopy(api_messages)
     if not all(isinstance(message, Mapping) for message in wire_messages):
         raise GatewayOwnerFailoverError("final API messages must be objects")
-    if wire_messages[0].get("role") != "system" or not isinstance(
-        wire_messages[0].get("content"), str
-    ):
-        raise GatewayOwnerFailoverError(
-            "gateway owner bridge requires one leading system message"
-        )
-    if any(message.get("role") == "system" for message in wire_messages[1:]):
-        raise GatewayOwnerFailoverError(
-            "gateway owner bridge cannot project multiple system messages"
-        )
+    if system_instructions is not None:
+        if not isinstance(system_instructions, str) or not system_instructions.strip():
+            raise GatewayOwnerFailoverError(
+                "gateway owner bridge requires non-empty wire instructions"
+            )
+        if any(message.get("role") == "system" for message in wire_messages):
+            raise GatewayOwnerFailoverError(
+                "gateway owner bridge cannot mix instructions and system messages"
+            )
+        system = system_instructions
+        history_start = 0
+        wire_mode = "responses"
+        wire_request = {"instructions": system, "input": wire_messages}
+    else:
+        if wire_messages[0].get("role") != "system" or not isinstance(
+            wire_messages[0].get("content"), str
+        ):
+            raise GatewayOwnerFailoverError(
+                "gateway owner bridge requires one leading system message"
+            )
+        if any(message.get("role") == "system" for message in wire_messages[1:]):
+            raise GatewayOwnerFailoverError(
+                "gateway owner bridge cannot project multiple system messages"
+            )
+        system = wire_messages[0]["content"]
+        history_start = 1
+        wire_mode = "messages"
+        wire_request = {"messages": wire_messages}
     current_idx = next(
         (
             idx
-            for idx in range(len(wire_messages) - 1, 0, -1)
+            for idx in range(len(wire_messages) - 1, history_start - 1, -1)
             if wire_messages[idx].get("role") == "user"
         ),
         -1,
     )
-    if current_idx < 1:
+    if current_idx < history_start:
         raise GatewayOwnerFailoverError(
             "gateway owner bridge requires a current API user message"
         )
@@ -102,9 +121,11 @@ def freeze_owner_wire_prompt(
             "gateway owner bridge requires a current transcript user boundary"
         )
     return {
-        "system": wire_messages[0]["content"],
-        "history": wire_messages[1:current_idx],
+        "system": system,
+        "history": wire_messages[history_start:current_idx],
         "current": current,
+        "wire_mode": wire_mode,
+        "wire_request": wire_request,
         "wire_messages": wire_messages,
         "transcript_prefix": deepcopy(transcript_messages[:history_offset]),
         "transcript_current": deepcopy(transcript_messages[history_offset]),
@@ -184,42 +205,3 @@ def prepare_owner_replay_messages(
             "gateway replay projection cannot prove an untouched transcript boundary"
         )
     return deepcopy(list(transcript_prefix)) + [deepcopy(dict(transcript_current))]
-
-
-def project_owner_final_messages(
-    result: Mapping[str, Any],
-    *,
-    history_offset: int,
-    transcript_prefix: Sequence[Mapping[str, Any]],
-    transcript_current: Mapping[str, Any],
-    final_response: str,
-    coordinator_id: str,
-    attempt_id: str,
-    leg_index: int,
-) -> list[dict[str, Any]]:
-    """Replace failed-attempt traffic with one identity-stamped final message."""
-
-    if not final_response:
-        raise GatewayOwnerFailoverError(
-            "gateway owner bridge cannot project an empty final response"
-        )
-    prefix = prepare_owner_replay_messages(
-        result,
-        history_offset=history_offset,
-        transcript_prefix=transcript_prefix,
-        transcript_current=transcript_current,
-    )
-    metadata = {
-        "backend_failover_coordinator_id": coordinator_id,
-        "backend_failover_attempt_id": attempt_id,
-        "backend_failover_leg_index": int(leg_index),
-    }
-    prefix.append(
-        {
-            "role": "assistant",
-            "content": final_response,
-            **metadata,
-            "display_metadata": metadata,
-        }
-    )
-    return prefix
