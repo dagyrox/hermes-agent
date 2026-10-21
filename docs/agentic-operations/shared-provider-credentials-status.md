@@ -10,29 +10,35 @@ Architecture packet: `docs/agentic-operations/shared-provider-credentials.md`
 
 ## Status
 
-`ROUND_4_FAILURE_PATH_REPAIRED_AND_LOCAL_VERIFIED__PUBLISH_REVIEW_CI_PENDING`
+`ROUND_5_ATHENA_BLOCKERS_REPAIRED_ON_CURRENT_MAIN__FINAL_REVIEW_CI_PENDING`
 
-Round-4 code candidate `0114e6e7e6d597ae90b7589201d779ce641696aa` (tree `e158d68147b96b06e61b8b7f5e8bf4480a429af2`) repairs inherited Codex/xAI OAuth failure handling under shared-root contention. The candidate is locally committed and verified but has not yet been pushed; remote/PR parity, hosted CI, and exact-head Athena review remain pending.
+Round-5 code candidate `7a1e7739a7d061fba3dddcfbcd9cc80d799f3540` (tree `e8214cd0bf1f1d72c81f75d034f9022794bbc37d`) repairs Athena DeepSeek review card `t_1b31cf48` / run `554` findings and includes current `origin/main` at `95638faeaf6b446cd21c6e57fa9383fc9dfaecf8` through merge commit `82eacf1bea7`.
 
-The round-4 repair removes the root→profile ABBA edge from transient and terminal failure paths, keeps root-owned cooldown/quarantine state in the root store selected at transaction entry, creates no profile credential shadow, and strips runtime-only inheritance markers when a singleton-derived cooldown row must be materialized in the root pool.
+The blocking missing-refresh-token short circuit now takes only the owning root-store lock, persists exhausted state at root, and never calls profile persistence for an inherited row. Terminal xAI/Codex quarantine now removes only the failed grant rather than deleting independent sibling grants from the shared root pool.
 
-A separate pre-commit review found and drove fixes for two additional failure-path defects: lost singleton cooldown state and unstable source-path recomputation. The final pre-commit review returned `PASS` with no security or logic findings. This does not replace the required exact-head Athena DeepSeek review.
+The prerequisite main-hygiene repair was independently Athena-approved at exact head `6a93c343b91f1f46a451fa31b1fa5979a3c080db` and merged through PR #15 as `95638faeaf6b446cd21c6e57fa9383fc9dfaecf8`. PR #13's prior CI run `39524394371` failed on the known stale test-contract baseline; the merged dependency repairs those test fixtures. A new hosted run and independent exact-final-head Athena DeepSeek review remain required.
 
-No live migration, installation, activation, restart, deployment, credential mutation, merge, paid inference, or Hyperion unblocking occurred.
+No live migration, installation, activation, restart, deployment, credential mutation, or PR #13 merge has occurred.
 
 ## Repository state
 
 - Workspace: `/root/projects/hermes-agent-credential-unification`
 - Branch: `talos/shared-provider-credentials`
-- Base observed: `origin/main` at `b8087e0c69302e9fc4b947e2e96fb49d42a0f5f2`
+- Current integrated base: `origin/main` at `95638faeaf6b446cd21c6e57fa9383fc9dfaecf8`
 - Pull request: https://github.com/dagyrox/hermes-agent/pull/13
-- Round-4 code candidate: `0114e6e7e6d597ae90b7589201d779ce641696aa`
-- Round-4 code tree: `e158d68147b96b06e61b8b7f5e8bf4480a429af2`
-- xAI fixture repair commit: `87bfbc9390077d3991e3981070c60b8f17a1d5c2`
-- Round-3 repair commit: `290450a0b92bc1ff6ed34b3a7a05e44738128fcd`
-- Athena round-3 review artifact: `docs/agentic-operations/athena-review-pr13-87bfbc.md`
-- Hosted CI: https://github.com/dagyrox/hermes-agent/actions/runs/39510318075
+- Round-5 code candidate: `7a1e7739a7d061fba3dddcfbcd9cc80d799f3540`
+- Round-5 code tree: `e8214cd0bf1f1d72c81f75d034f9022794bbc37d`
+- Main integration commit: `82eacf1bea7`
+- Athena round-4 review: `t_1b31cf48` / run `554`, `BLOCK` at `606b0d31d29`
+- Prerequisite PR #15 merge: `95638faeaf6b446cd21c6e57fa9383fc9dfaecf8`
+- Pull request CI pending after publication
 - Provenance: Issue `dagyrox/or7-platform#259`, card `t_1af34c61`, run `552`, packet `docs/agentic-operations/shared-provider-credentials.md`
+
+## Round-5 review repairs
+
+1. The no-refresh-token forced-refresh path now recognizes inherited rows before `_mark_exhausted`, acquires the resolved root lock, disables profile persistence, and writes exhausted metadata back to the owning root pool.
+2. Terminal xAI/Codex quarantine scopes pool removal to the failed entry id, preserving independent grants in the same root pool and in-memory rotation set.
+3. Regression coverage proves both providers take no profile lock or profile write for inherited rows lacking refresh tokens and preserve independent sibling grants after terminal failure.
 
 ## Round-4 failure-path repair
 
@@ -54,13 +60,21 @@ No live migration, installation, activation, restart, deployment, credential mut
 
 ## Verification
 
-Round-4 candidate verification:
+Round-5 candidate verification:
+
+- Focused failure-path suite: **17 passed, 0 failed**; pre-fix RED evidence was **3 failed, 14 passed**.
+- Canonical credential and credential-pool matrix: **183 passed, 0 failed** across 10 discovered files.
+- Full Hermes auth test surface (`tests/hermes_cli/test_auth*.py`): **371 passed, 0 failed**.
+- Merged prerequisite baseline matrix: **142 passed, 0 failed** across four previously stale files.
+- Changed-file Ruff, Python byte compilation, and `git diff --check`: passed.
+- Changed-file Windows footgun scan: passed, 3 files scanned.
+- Athena DeepSeek round-4 review: `BLOCK` at `606b0d31d29`; blocking finding and sibling-grant residual risk are repaired in `7a1e7739a7d`.
+
+Prior round-4 evidence retained for provenance:
 
 - Focused failure-path suite: **15 passed, 0 failed**.
 - Canonical credential and credential-pool matrix: **275 passed, 0 failed** across 11 files.
 - Full Hermes auth test surface (`tests/hermes_cli/test_auth*.py`): **371 passed, 0 failed**.
-- Changed-file Ruff, Python byte compilation, and `git diff --check`: passed.
-- Changed-file Windows footgun scan: passed, 2 files scanned.
 - Independent pre-commit review round 3: `PASS`, no security or logic findings.
 
 Prior round-3 evidence retained for provenance:
@@ -100,9 +114,9 @@ No credential values, identities, fingerprints, account identifiers, or credenti
 
 ## Deterministic resume
 
-1. Push the round-4 candidate and verify local branch, remote branch, pull ref, and live PR head parity.
-2. Obtain an independent exact-head Athena DeepSeek review of the published round-4 head; prior review artifacts do not approve this candidate.
-3. Require a durable `READY_TO_MERGE` or `BLOCK` result covering AC1–AC18/H1–H6 and all round-4 failure-path repairs.
-4. Resolve or receive explicit authorized maintainer adjudication for any required hosted CI failures; red checks must not be relabeled green.
-5. Only after those gates pass may the separately authorized install/activation phase begin with snapshot, protected rollback, minimal authorized policy, runtime source readback, and finite smokes.
-6. Do not merge, migrate, activate, install, restart, deploy, mutate/revoke credentials, call paid DeepSeek inference, or unblock Hyperion without the packet's separate approvals and quiescence checks.
+1. Commit and push the round-5 status artifact, then verify local branch, remote branch, pull ref, and live PR head parity.
+2. Obtain an independent exact-final-head Athena DeepSeek review of the published round-5 head; the prior `BLOCK` is fully addressed but does not approve the new bytes.
+3. Require a durable `READY_TO_MERGE` covering AC1–AC18/H1–H6, the missing-refresh-token path, sibling-grant preservation, and the integrated PR #15 dependency.
+4. Require hosted CI green at that exact head; the old red run predates the PR #15 integration and is not final evidence.
+5. After review and CI pass, merge PR #13 only under Jason's explicit current authorization, snapshot the installed tree/config, perform a scoped install, apply the packet's minimal root-owned inheritance policy without credential exposure, restart only the affected gateway/service, and run finite direct proof.
+6. Roll back code/config immediately if health, inheritance source, exclusion, or secret-safety checks fail; do not continue to broader rollout.
