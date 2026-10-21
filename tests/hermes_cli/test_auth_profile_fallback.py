@@ -88,6 +88,49 @@ def test_profile_with_zero_entries_falls_back_to_global(profile_env):
     assert entries[0]["access_token"] == "sk-or-global"
 
 
+def test_trusted_profile_resolves_allowlisted_root_dotenv_without_copy(profile_env):
+    """An inherited env-backed API key is read from root without a profile shadow."""
+    (profile_env["global"] / ".env").write_text(
+        "DEEPSEEK_API_KEY=root-deepseek-secret\n",
+        encoding="utf-8",
+    )
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={}))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
+    from hermes_cli.auth import resolve_api_key_provider_credentials
+
+    resolved = resolve_api_key_provider_credentials("deepseek")
+
+    assert resolved["api_key"] == "root-deepseek-secret"
+    assert resolved["source"] == "shared_root_dotenv:DEEPSEEK_API_KEY"
+    assert not (profile_env["profile"] / ".env").exists()
+    profile_store = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert profile_store.get("credential_pool", {}).get("deepseek") in (None, [])
+
+
+def test_untrusted_profile_cannot_resolve_root_dotenv(profile_env):
+    """Root dotenv reads remain denied when the active profile is not trusted."""
+    (profile_env["global"] / ".env").write_text(
+        "DEEPSEEK_API_KEY=root-deepseek-secret\n",
+        encoding="utf-8",
+    )
+    (profile_env["global"] / "config.yaml").write_text(
+        "profiles:\n"
+        "  shared_credentials:\n"
+        "    enabled: true\n"
+        "    trusted_profiles: [someone-else]\n"
+        "    providers: [deepseek]\n",
+        encoding="utf-8",
+    )
+
+    from hermes_cli.auth import resolve_api_key_provider_credentials
+
+    resolved = resolve_api_key_provider_credentials("deepseek")
+
+    assert resolved["api_key"] == ""
+    assert resolved["source"] == "default"
+
+
 def test_profile_with_entries_fully_shadows_global(profile_env):
     """Once the profile has any entries for a provider, global is ignored."""
     from hermes_cli.auth import read_credential_pool
