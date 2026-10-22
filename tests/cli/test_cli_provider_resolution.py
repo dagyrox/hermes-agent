@@ -608,6 +608,34 @@ def test_codex_provider_uses_config_model(monkeypatch):
     assert shell.model != "should-be-ignored"
 
 
+def test_deepseek_canonical_model_reaches_agent_unchanged(monkeypatch):
+    """The configured direct-API model and request model stay identical."""
+    cli = _import_cli()
+    configured_model = "deepseek-flash"
+
+    def _runtime_resolve(**kwargs):
+        return {
+            "provider": "deepseek",
+            "api_mode": "chat_completions",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "test-key",
+            "source": "env/config",
+        }
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+    monkeypatch.setattr(cli, "AIAgent", _DummyAgent)
+
+    shell = cli.HermesCLI(model=configured_model, compact=True, max_turns=1)
+
+    assert shell._init_agent() is True
+    assert shell.agent.kwargs["model"] == configured_model
+
+
 def test_codex_config_model_not_replaced_by_normalization(monkeypatch):
     """When the user sets model.default in config.yaml to a specific codex
     model, _normalize_model_for_provider must NOT replace it with the latest

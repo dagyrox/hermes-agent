@@ -12,12 +12,11 @@ Different LLM providers expect model identifiers in different formats:
   model IDs, but Claude still uses hyphenated native names like
   ``claude-sonnet-4-6``.
 - **OpenCode Go** preserves dots in model names: ``minimax-m2.7``.
-- **DeepSeek** accepts ``deepseek-chat`` (V3), ``deepseek-reasoner``
-  (R1-family), and the first-class V-series IDs (``deepseek-v4-pro``,
-  ``deepseek-v4-flash``, and any future ``deepseek-v<N>-*``).  Older
-  Hermes revisions folded every non-reasoner input into
-  ``deepseek-chat``, which on aggregators routes to V3 — so a user
-  picking V4 Pro was silently downgraded.
+- **DeepSeek** accepts ``deepseek-flash`` (V4.1 Flash),
+  ``deepseek-v4-pro``, the legacy ``deepseek-chat`` /
+  ``deepseek-reasoner`` names, and legacy/future V-series IDs. Older
+  Hermes revisions folded unrecognized non-reasoner inputs into
+  ``deepseek-chat``; recognized direct-API names must remain distinct.
 - **Custom** and remaining providers pass the name through as-is.
 
 This module centralises that translation so callers can simply write::
@@ -132,9 +131,16 @@ _DEEPSEEK_REASONER_KEYWORDS: frozenset[str] = frozenset({
 _DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
     "deepseek-chat",       # V3 on DeepSeek direct and most aggregators
     "deepseek-reasoner",   # R1-family reasoning model
+    "deepseek-flash",      # V4.1 Flash — current direct-API model ID
     "deepseek-v4-pro",     # V4 Pro — first-class model ID
     "deepseek-v4-flash",   # V4 Flash — first-class model ID
 })
+
+# DeepSeek documents ``deepseek-flash`` as the served model name for
+# DeepSeek-V4.1-Flash-1017. Normalize numeric date-qualified config aliases
+# to that accepted wire identifier rather than silently routing them to V3.
+# https://api-docs.deepseek.com/quick_start/pricing/
+_DEEPSEEK_FLASH_DATE_ALIAS_RE = re.compile(r"^deepseek-flash[-.]\d{4,8}$")
 
 # First-class V-series IDs (``deepseek-v4-pro``, ``deepseek-v4-flash``,
 # future ``deepseek-v5-*``, dated variants like ``deepseek-v4-flash-20260423``).
@@ -149,8 +155,10 @@ def _normalize_for_deepseek(model_name: str) -> str:
     """Map a model input to a DeepSeek-accepted identifier.
 
     Rules:
-    - Already a known canonical (``deepseek-chat``/``deepseek-reasoner``/
-      ``deepseek-v4-pro``/``deepseek-v4-flash``) -> pass through.
+    - Already a known canonical (including ``deepseek-flash``) -> pass
+      through.
+    - A numeric date-qualified ``deepseek-flash-*`` alias ->
+      ``deepseek-flash``.
     - Matches the V-series pattern ``deepseek-v<digit>...`` -> pass through
       (covers future ``deepseek-v5-*`` and dated variants without a release).
     - Contains a reasoner keyword (r1, think, reasoning, cot, reasoner)
@@ -167,6 +175,9 @@ def _normalize_for_deepseek(model_name: str) -> str:
 
     if bare in _DEEPSEEK_CANONICAL_MODELS:
         return bare
+
+    if _DEEPSEEK_FLASH_DATE_ALIAS_RE.fullmatch(bare):
+        return "deepseek-flash"
 
     # V-series first-class IDs (v4-pro, v4-flash, future v5-*, dated variants)
     if _DEEPSEEK_V_SERIES_RE.match(bare):
