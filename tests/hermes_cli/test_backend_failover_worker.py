@@ -335,8 +335,12 @@ def test_api_capability_gate_fails_closed_without_model_evidence(monkeypatch):
     assert worker._capability_mismatches(_leg(), args) == ("capability_evidence",)
 
 
-def test_claude_leg_command_uses_subscription_cli_and_scrubs_api_credentials(tmp_path):
+def test_claude_leg_command_uses_subscription_cli_and_scrubs_api_credentials(tmp_path, monkeypatch):
     from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import provider_access
+
+    account_home = tmp_path / "native-account-home"
+    monkeypatch.setattr(provider_access, "native_home", lambda: account_home)
 
     args = argparse.Namespace(profile="athena", task="t_probe", timeout_seconds=600)
     env = {
@@ -364,7 +368,8 @@ def test_claude_leg_command_uses_subscription_cli_and_scrubs_api_credentials(tmp
     assert "ANTHROPIC_API_KEY" not in child_env
     assert "ANTHROPIC_AUTH_TOKEN" not in child_env
     assert "OPENAI_API_KEY" not in child_env
-    assert child_env["HOME"] == "/root"
+    assert child_env["HOME"] == str(account_home)
+    assert child_env["HOME"] != env["HOME"]
 
 
 def test_backend_child_environments_do_not_inherit_unrelated_secrets():

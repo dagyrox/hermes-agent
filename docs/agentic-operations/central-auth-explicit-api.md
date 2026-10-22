@@ -177,7 +177,7 @@ API server funding/usability remains unverified until separately authorized.
 Initial hosted CI failed before jobs on a GitHub internal error. Same-head
 reopen recovered full existing CI run39800725940. Its slice4 exposed two old
 synthetic-worker E2E fixtures which injected availability but did not establish
-the new trust boundary. The ONLY follow-up code change is that existing test
+the new trust boundary. The first follow-up code change was that existing test
 fixture: temporary root trust and a 0600 synthetic native token, never runner or
 live auth. Production bytes stay identical to Athena's approved candidate.
 The repaired three E2E tests plus four new policy regressions passed (7/7).
@@ -185,6 +185,17 @@ Slice6's separate exit143 was an infrastructure runner shutdown, not an assertio
 No local broad suite or new test harness was added. Updated manifest includes
 the repaired existing E2E file (21 listed files, self-excluded). The successor
 still requires narrow independent exact-head confirmation and hosted green CI.
+Athena confirmed that successor `798fed3d0ec` in `t_99becafe`/run617. Its hosted
+run39801852705 passed slice4, then exposed a separate slice1 test assumption:
+the native child HOME assertion hardcoded `/root` instead of the OS-account
+home (`/home/runner` on GitHub). Repair card `t_2cd0a51f`/run616 makes that test
+use an isolated account-home fixture distinct from inherited HOME and asserts
+the child uses the former. The old assertion failed under this deterministic
+fixture before correction; all 74 focused worker/E2E/policy tests then passed.
+No production bytes changed. Slice6 again explicitly reported runner shutdown
+(exit143), not a test assertion. Manifest remains 21 entries, regenerated after
+the test/document edits. This successor also requires fresh independent review
+and terminal hosted green CI; earlier approvals cannot substitute for it.
 Hermes/default release continuation card `t_fa44c5ab` owns authorized merge,
 installation and safe activation after those gates; it must never use an older
 approval for changed production bytes.
