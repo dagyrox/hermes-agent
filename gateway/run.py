@@ -2303,6 +2303,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
         "max_tokens": max_tokens,
+        **({"model": runtime["model"]} if runtime.get("provider_access_mode") == "api" else {}),
     }
 
 
@@ -2325,6 +2326,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        **({"model": runtime["model"]} if runtime.get("provider_access_mode") == "api" else {}),
     }
 
 

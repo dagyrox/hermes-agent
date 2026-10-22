@@ -385,7 +385,7 @@ def test_backend_child_environments_do_not_inherit_unrelated_secrets():
     }
     claude = _claude_environment(base)
     api = _api_environment(base)
-    assert claude == {"HOME": "/tmp/home", "PATH": "/bin", "USER": "root"}
+    assert claude == {"HOME": str(Path.home()), "PATH": "/bin"}
     assert api["HERMES_KANBAN_TASK"] == "t_1"
     assert api["HERMES_KANBAN_RUN_ID"] == "9"
     assert "HERMES_KANBAN_SECRET_TOKEN" not in api
@@ -801,8 +801,14 @@ def test_claude_balanced_reasoning_maps_to_supported_medium_effort(tmp_path):
     assert cmd[cmd.index("--effort") + 1] == "medium"
 
 
-def test_claude_availability_checks_binary_and_subscription_auth(monkeypatch):
+def test_claude_availability_checks_binary_and_subscription_auth(monkeypatch, tmp_path):
     from hermes_cli import backend_failover_worker as worker
+    from hermes_constants import get_default_hermes_root
+
+    token = get_default_hermes_root() / "claude" / "subscription.token"
+    token.parent.mkdir(parents=True, exist_ok=True)
+    token.write_text("sk-ant-oat01-test-only")
+    token.chmod(0o600)
 
     monkeypatch.setattr(worker.shutil, "which", lambda _name: "/bin/claude")
     def fake_run(command, *_args, **_kwargs):

@@ -387,6 +387,8 @@ def _run_agent(
         target_model=effective_model or None,
         explicit_base_url=explicit_base_url_from_alias,
     )
+    if runtime.get("provider_access_mode") == "api":
+        effective_model = runtime["model"]
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived

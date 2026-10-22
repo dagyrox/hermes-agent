@@ -37,11 +37,15 @@ class CLIAgentSetupMixin:
 
         _primary_exc = None
         runtime = None
+        from hermes_cli.provider_access import load_provider_access, trusted_profile
         try:
+            if not hasattr(self, "_provider_access_snapshot"):
+                self._provider_access_snapshot = load_provider_access() if trusted_profile() else {}
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                provider_access_snapshot=self._provider_access_snapshot,
             )
         except Exception as exc:
             _primary_exc = exc
@@ -59,7 +63,7 @@ class CLIAgentSetupMixin:
                     try:
                         from hermes_cli.fallback_config import resolve_entry_api_key
 
-                        _fb_kwargs = {"requested": _fb_provider}
+                        _fb_kwargs = {"requested": _fb_provider, "provider_access_snapshot": {}}
                         if _fb.get("base_url"):
                             _fb_kwargs["explicit_base_url"] = _fb["base_url"]
                         _fb_api_key = resolve_entry_api_key(_fb)
@@ -144,6 +148,7 @@ class CLIAgentSetupMixin:
         if runtime_model and isinstance(runtime_model, str):
             # Only use runtime model if: model is unset, or model equals provider name
             should_use_runtime_model = (
+                runtime.get("provider_access_mode") == "api" or
                 not self.model or  # No model configured yet
                 self.model == self.provider or  # Model is the provider slug
                 self.model == runtime.get("name")  # Model matches provider display name

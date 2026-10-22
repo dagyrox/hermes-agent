@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 from urllib.parse import urlparse
@@ -1545,6 +1546,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    provider_access_snapshot: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1557,6 +1559,14 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+
+    from hermes_cli.provider_access import managed_runtime
+
+    snapshot = provider_access_snapshot
+    if os.environ.get("HERMES_BACKEND_FAILOVER_CHILD") == "1":
+        raw_snapshot = os.environ.get("HERMES_PROVIDER_ACCESS_SNAPSHOT")
+        if raw_snapshot is not None:
+            snapshot = json.loads(raw_snapshot)
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /
@@ -1578,6 +1588,12 @@ def resolve_runtime_provider(
                 f"provider {requested_provider!r} is disabled in config "
                 f"(providers.{requested_provider}.enabled: false)"
             )
+
+    managed = managed_runtime(requested_provider, snapshot=snapshot)
+    if managed is not None:
+        if explicit_base_url or explicit_api_key:
+            raise ValueError("Managed vendor routes refuse explicit credential/endpoint overrides")
+        return managed
 
     if requested_provider == "moa":
         return {
@@ -1708,6 +1724,10 @@ def resolve_runtime_provider(
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
     )
+    if requested_provider == "auto":
+        managed = managed_runtime(provider, snapshot=snapshot)
+        if managed is not None:
+            return managed
     model_cfg = _get_model_config()
     explicit_runtime = _resolve_explicit_runtime(
         provider=provider,

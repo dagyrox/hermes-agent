@@ -999,6 +999,12 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
+    from hermes_cli.provider_access import managed_deployment
+
+    if managed_deployment():
+        # Managed native subscription state belongs exclusively to Claude CLI,
+        # including when a guest attempts the legacy raw-provider fallback.
+        return None
     kc_creds = _read_claude_code_credentials_from_keychain()
     file_creds = _read_claude_code_credentials_from_file()
 
@@ -1164,6 +1170,10 @@ def _write_claude_code_credentials(
     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
     in the stored scopes before it will use the token.
     """
+    from hermes_cli.provider_access import managed_deployment
+
+    if managed_deployment():
+        raise RuntimeError("Managed Claude subscription credentials are owned by the native CLI; Hermes cannot write them")
     cred_path = Path.home() / ".claude" / ".credentials.json"
     try:
         # Read existing file to preserve other fields

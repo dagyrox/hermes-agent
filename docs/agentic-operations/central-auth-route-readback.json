@@ -1,0 +1,74 @@
+{
+  "activation_requested": true,
+  "active": true,
+  "configured": true,
+  "live_activated": false,
+  "provider_access": {
+    "anthropic": {
+      "api_funded": "unverified",
+      "applies_to": "new_runs",
+      "available": false,
+      "credential_present": true,
+      "credential_shape": "home_store",
+      "default_mode": "subscription",
+      "live_sessions_unchanged": true,
+      "mode": "subscription",
+      "readiness": "configured-unverified",
+      "server_usability": "unverified",
+      "source_path": "/root/.claude/.credentials.json"
+    },
+    "openai": {
+      "api_funded": "unverified",
+      "applies_to": "new_runs",
+      "available": false,
+      "credential_present": true,
+      "credential_shape": "home_store",
+      "default_mode": "subscription",
+      "live_sessions_unchanged": true,
+      "mode": "subscription",
+      "readiness": "configured-unverified",
+      "server_usability": "unverified",
+      "source_path": "/root/.hermes/auth.json"
+    }
+  },
+  "roles": {
+    "talos": {
+      "activation_requested": true,
+      "active": true,
+      "available": true,
+      "chain": [
+        {
+          "active": true,
+          "available": true,
+          "kind": "api",
+          "model": "gpt-6.1-sol",
+          "position": 1,
+          "provider": "openai-codex",
+          "reasoning_effort": "high",
+          "server_usability": "unverified"
+        },
+        {
+          "active": false,
+          "available": true,
+          "capability_mode": "full",
+          "kind": "claude_code",
+          "model": "claude-sonnet-5-5",
+          "position": 2,
+          "reasoning_effort": "high",
+          "server_usability": "unverified"
+        },
+        {
+          "active": false,
+          "available": true,
+          "kind": "api",
+          "model": "deepseek-flash",
+          "position": 3,
+          "provider": "deepseek",
+          "server_usability": "unverified"
+        }
+      ],
+      "configured": true,
+      "live_activated": false
+    }
+  }
+}

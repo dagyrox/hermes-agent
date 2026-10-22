@@ -3608,6 +3608,10 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Root-only managed vendor modes. An absent vendor/mode is subscription;
+    # API provider + model must be explicit before API mode can be selected.
+    "provider_access": {},
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 33,
 }
@@ -7592,6 +7596,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
         failover_config = expanded.get("agent_backend_failover")
+        if "provider_access" in expanded:
+            from agent.credential_trust import resolve_profile_identity
+            from hermes_cli.provider_access import validate_provider_access
+
+            if resolve_profile_identity()[1]:
+                validate_provider_access(expanded["provider_access"])
+            else:
+                if expanded["provider_access"]:
+                    logger.warning("Profile provider_access ignored; root config is authoritative for trusted internal lanes")
+                expanded.pop("provider_access", None)
         if failover_config is not None:
             if not isinstance(failover_config, dict):
                 raise ValueError("agent_backend_failover must be a mapping")
