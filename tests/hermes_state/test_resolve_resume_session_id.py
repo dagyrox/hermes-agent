@@ -135,6 +135,29 @@ def test_compression_tip_not_confused_with_delegation_child(db):
     assert db.resolve_resume_session_id("conv") == "conv"
 
 
+def test_message_bearing_session_reset_cannot_follow_foreign_child(db):
+    """A normal child must not hijack a definitive non-compression transcript.
+
+    OCC reads sessions by exact owner/source identity.  Before this guard, the
+    legacy fallback could resolve a Slack owner's message-bearing session into
+    a newer API-server child with no owner, causing a cross-session transcript
+    envelope and a fail-closed ``transcript_mismatch`` response.
+    """
+    db.create_session("slack-owner", source="slack", user_id="owner-42")
+    db.append_message("slack-owner", role="user", content="owned transcript")
+    db.end_session("slack-owner", "session_reset")
+    db.create_session(
+        "foreign-api-child",
+        source="api_server",
+        parent_session_id="slack-owner",
+    )
+    db.append_message(
+        "foreign-api-child", role="user", content="different transcript"
+    )
+
+    assert db.resolve_resume_session_id("slack-owner") == "slack-owner"
+
+
 def test_prefers_most_recent_child_when_fork_exists(db):
     # If a session was somehow forked (two children), pick the latest one.
     # In practice, compression only produces single-chain shape, but the helper
@@ -163,6 +186,7 @@ def test_redirects_from_message_bearing_parent_to_child(db):
     # Both parent and child have messages
     db.append_message("original", role="user", content="old msg")
     db.append_message("original", role="assistant", content="old reply")
+    db.end_session("original", "compression")
     db.append_message("continued", role="user", content="new msg")
     db.append_message("continued", role="assistant", content="new reply")
 
