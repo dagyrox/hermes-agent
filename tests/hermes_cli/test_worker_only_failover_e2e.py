@@ -29,6 +29,17 @@ def _claimed_board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     root = tmp_path / "hermes-root"
     profile = root / "profiles" / "talos"
     profile.mkdir(parents=True)
+    # The native command builder enforces trust even when transport discovery
+    # is injected below. Use isolated synthetic auth, never the runner's store.
+    (root / "config.yaml").write_text(
+        "profiles:\n  shared_credentials:\n    enabled: true\n"
+        "    trusted_profiles: [talos]\n    providers: [openai-codex, deepseek]\n",
+        encoding="utf-8",
+    )
+    native = root / "claude" / "subscription.token"
+    native.parent.mkdir()
+    native.write_text("sk-ant-oat-synthetic-transport-only", encoding="utf-8")
+    native.chmod(0o600)
     (profile / "SOUL.md").write_text("Talos test identity", encoding="utf-8")
     (profile / "config.yaml").write_text(
         "platform_toolsets:\n  cli: []\n",

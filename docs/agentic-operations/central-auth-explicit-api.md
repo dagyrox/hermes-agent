@@ -100,7 +100,9 @@ in API mode. Native-only CLI arguments are not replayed across API runtimes.
 
 The reviewed deployment launcher is `scripts/launchers/athena`. After merge and
 independent release approval, install it at `/root/.local/bin/athena` with mode
-0755. The existing launcher is not changed by committing this file. It retains
+0755. On this host `/root/.local/bin/athena` is a symlink to
+`/usr/local/bin/athena`, which OCC invokes: install the canonical executable,
+preserve the symlink. The existing launcher is not changed by committing this file. It retains
 attach/status/login/smoke/escalation/explicit-fallback/logs/kill control surfaces.
 Existing tmux sessions are attached unchanged; mode switches apply to newly
 created sessions only. `athena smoke` follows the explicitly selected mode and
@@ -110,6 +112,11 @@ acceptance test without separate authorization.
 Root trust currently admits Hyperion and Talos. Activation must explicitly add
 Athena and Apollo as approved internal lanes and configure their canonical
 supervised roles before claiming centralized native launch coverage there.
+The existing `athena-hermes` explicit fallback must ALSO be admitted, with
+`openai-codex/gpt-6.1-sol` replacing its erroneous raw-Anthropic primary while
+preserving its own persona and other config. Independent Athena review F1
+requires that closure before installing the launcher; do not repoint it to
+Talos/default and thereby change persona isolation.
 Do not widen the provider inheritance list to Anthropic. Keep persona, skills,
 plugins, memory, tool configuration, and unrelated DeepSeek policy unchanged.
 Known revoked profile-token remnants are NOT used or copied by the new path;
@@ -156,3 +163,28 @@ not proof that a running dispatcher has loaded it. Do not interrupt live workers
 Release evidence must append the reviewed head, hosted CI URLs/conclusions,
 merged/installed commit, exact activation readback, and service health after
 external safe activation. Do not treat this pre-release evidence as completion.
+
+## Exact-head review and CI follow-through
+
+Athena independently approved production code at `a50f02a92528`, card
+`t_d4d8be37`/run614 (independent DeepSeek lane), with release preconditions F1
+(existing explicit fallback admission above) and F2 (canonical executable/symlink).
+API failure may advance to another vendor's subscription or approved DeepSeek
+leg after a real request; it does not change the selected vendor's mode or
+automatically spend on a paid fallback. Missing-key API preflight is terminal.
+API server funding/usability remains unverified until separately authorized.
+
+Initial hosted CI failed before jobs on a GitHub internal error. Same-head
+reopen recovered full existing CI run39800725940. Its slice4 exposed two old
+synthetic-worker E2E fixtures which injected availability but did not establish
+the new trust boundary. The ONLY follow-up code change is that existing test
+fixture: temporary root trust and a 0600 synthetic native token, never runner or
+live auth. Production bytes stay identical to Athena's approved candidate.
+The repaired three E2E tests plus four new policy regressions passed (7/7).
+Slice6's separate exit143 was an infrastructure runner shutdown, not an assertion.
+No local broad suite or new test harness was added. Updated manifest includes
+the repaired existing E2E file (21 listed files, self-excluded). The successor
+still requires narrow independent exact-head confirmation and hosted green CI.
+Hermes/default release continuation card `t_fa44c5ab` owns authorized merge,
+installation and safe activation after those gates; it must never use an older
+approval for changed production bytes.

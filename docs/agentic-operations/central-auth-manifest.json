@@ -30,8 +30,8 @@
     },
     {
       "path": "docs/agentic-operations/central-auth-explicit-api.md",
-      "bytes": 9756,
-      "sha256": "94883ae7a4d0270ad05b290ed23fc99283404daf1f24ee667a31080d6ba50bcb"
+      "bytes": 11909,
+      "sha256": "2d8389aba25405cc09e52a2a7d145065083a0cd63b3e4a345d26fae0cb3d0ce3"
     },
     {
       "path": "docs/agentic-operations/central-auth-route-readback.json",
@@ -112,6 +112,11 @@
       "path": "tests/hermes_cli/test_provider_access.py",
       "bytes": 7675,
       "sha256": "32851df084178294a9bee271301caf95d9e80e294b160d213e5481025bf71f1b"
+    },
+    {
+      "path": "tests/hermes_cli/test_worker_only_failover_e2e.py",
+      "bytes": 11690,
+      "sha256": "dd9fa26367f98ad52745300d7b36418d479a47bf1a617dd602f6db30ce7866fc"
     }
   ]
 }
