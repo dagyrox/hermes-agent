@@ -109,6 +109,31 @@ created sessions only. `athena smoke` follows the explicitly selected mode and
 can incur API cost if the operator has selected API; do not run it as a paid
 acceptance test without separate authorization.
 
+Apollo's corresponding source is `scripts/launchers/apollo`, deployment target
+`/root/.local/bin/apollo` (regular executable, mode 0755). Start/status/login/
+smoke/Opus/native passthrough all use `hermes_cli.native_claude --profile apollo`.
+The launcher preserves Apollo's display name, `apollo`/`apollo-opus` sessions,
+Sonnet primary and Opus escalation. Existing sessions attach unchanged. Explicit
+`fallback|codex|hermes` uses `-p apollo --provider openai-codex -m gpt-6.1-sol`:
+the existing Apollo persona, not a nonexistent `apollo-hermes` profile or Talos.
+`APOLLO_PYTHON` may override the installed wrapper interpreter for offline tests
+or an operator-managed installation; no credential is passed in shell argv.
+Like Athena, `apollo smoke` can incur cost in explicitly selected API mode.
+
+Canonical operator installation, ONLY after final independent review, exact-head
+green CI, merged runtime installation and F1 trust/route configuration:
+
+```sh
+install -m 0755 scripts/launchers/athena /usr/local/bin/athena
+# Preserve /root/.local/bin/athena -> /usr/local/bin/athena.
+install -m 0755 scripts/launchers/apollo /root/.local/bin/apollo
+```
+
+Do not copy profile authentication or create another Apollo profile. F3 is the
+Apollo launcher installation; canonical Athena/Apollo supervised role admission
+and root subscription defaults remain release-owned prerequisites, not evidence
+that these source-only changes have been activated.
+
 Root trust currently admits Hyperion and Talos. Activation must explicitly add
 Athena and Apollo as approved internal lanes and configure their canonical
 supervised roles before claiming centralized native launch coverage there.
@@ -227,3 +252,40 @@ genuine hosted green must bind that successor SHA before release. Release
 does not change live configuration, credentials, installation, or services and
 makes no paid API call. Missing Anthropic API credentials remain a fail-closed
 capability status, not a subscription-release blocker.
+
+## Final bounded startup-fixture and Apollo successor (t_40407c22/run628)
+
+Predecessor `d2af73bffe5` received Athena's fixture-only PASS in
+`t_e797137d`/run624. Hosted CI39942278904 nevertheless failed only the standalone
+daemon SIGTERM test (slice7, job120376524221): DB creation plus a 0.5-second sleep
+did not establish that the real handler was installed. Repository-root recovery
+markers could also leak from concurrent mocked update tests despite isolated
+`HERMES_HOME`. The earlier production-byte parity claims above describe their
+historical successors, NOT this final Apollo integration.
+
+The existing daemon subprocess fixture now observes actual SIGTERM handler
+installation through a test-only signal wrapper, invoking the real CLI main and
+dispatcher. Its repository root is temporary, and mocked update marker helpers
+are isolated to temporary files. The exit0 and zero terminal-event assertions,
+existing timeouts and production daemon implementation are unchanged. Canonical
+affected-file verification completed: 22 dispatcher tests + 49 update tests,
+71 passed, zero failed, exit0, no retry (44.5 seconds).
+
+One small offline Apollo regression executes the real shell launcher with argv
+recorders: status/login/smoke/native passthrough use the shared wrapper and
+explicit Codex uses the existing Apollo persona with supported provider/model
+flags. It failed before the launcher existed and then passed (1/1, exit0).
+Offline start/Opus tmux argv/quoting and parser checks also passed, including
+paths with spaces; no native login/status/model request was made. Bash syntax,
+focused ruff and diff checks passed. No broad local suite or new framework.
+
+This successor adds the production Apollo launcher; it does NOT claim production
+byte parity with `a50f02a92528`. The previously approved resolver and Athena
+launcher remain unchanged. The manifest covers all PR-changed files except
+itself and is regenerated after these edits. A fresh independent bounded Athena
+exact-final delta review and genuine hosted green are mandatory. Durable release
+owner `t_42185d35` retains merge/install/config/activation, F1 (trusted
+persona-preserving athena-hermes subscription route), F2 (canonical Athena 0755
+executable preserving symlink), and F3 (Apollo 0755 installation). Source/test
+completion is not installation or live admission. No credentials, live launchers,
+profiles, services, or mode defaults changed; no paid API call was made.
