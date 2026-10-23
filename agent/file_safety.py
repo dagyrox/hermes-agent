@@ -46,6 +46,7 @@ def build_write_denied_paths(home: str) -> set[str]:
             # Top-level Anthropic PKCE credential store remains sensitive even
             # when a profile is active; default/non-profile sessions still read it.
             str(hermes_root / ".anthropic_oauth.json"),
+            str(hermes_root / "claude" / "subscription.token"),
             # Bitwarden Secrets Manager encrypted disk cache.
             str(hermes_home / "cache" / "bws_cache.enc.json"),
             str(hermes_root / "cache" / "bws_cache.enc.json"),
@@ -275,6 +276,7 @@ def get_read_block_error(path: str) -> Optional[str]:
         "auth.json",
         "auth.lock",
         ".anthropic_oauth.json",
+        os.path.join("claude", "subscription.token"),
         ".env",
         "webhook_subscriptions.json",
         os.path.join("auth", "google_oauth.json"),

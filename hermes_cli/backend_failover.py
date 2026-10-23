@@ -61,6 +61,7 @@ class BackendLeg:
     provider: str | None = None
     reasoning_effort: str | None = None
     capability_mode: str = "full"
+    access_mode: str = "subscription"
 
 
 @dataclass(frozen=True)
@@ -186,7 +187,7 @@ def classify_failed_result(result: dict[str, Any]) -> int:
     return 1
 
 
-def resolve_role_chain(config: dict[str, Any] | None, profile: str) -> tuple[BackendLeg, ...]:
+def resolve_role_chain(config: dict[str, Any] | None, profile: str, *, provider_access: dict | None = None) -> tuple[BackendLeg, ...]:
     """Validate and return one profile's exact three-leg canonical chain."""
 
     cfg = config or {}
@@ -270,6 +271,16 @@ def resolve_role_chain(config: dict[str, Any] | None, profile: str) -> tuple[Bac
     actual_route = tuple((leg.kind, leg.provider, leg.model) for leg in chain)
     if actual_route != _CANONICAL_ROUTES[profile_key]:
         raise ConfigError(f"{profile_key} does not match its frozen route")
+    if provider_access is not None:
+        from hermes_cli.provider_access import validate_provider_access
+
+        modes = validate_provider_access(provider_access)
+        first = chain[0]
+        vendor = "anthropic" if first.kind == "claude_code" else "openai"
+        mode = modes[vendor]
+        if mode["mode"] == "api":
+            chain[0] = BackendLeg("api", mode["api_model"], mode["api_provider"],
+                                  first.reasoning_effort, first.capability_mode, "api")
     return tuple(chain)
 
 
@@ -380,7 +391,13 @@ def load_profile_chain(profile: str, hermes_home: str | None) -> tuple[BackendLe
         return ()
     if not isinstance(raw, dict):
         raise ConfigError("agent_backend_failover must be a mapping")
-    return resolve_role_chain(raw, profile)
+    from hermes_cli.provider_access import load_provider_access, trusted_profile
+
+    if not raw.get("enabled") or profile not in (raw.get("roles") or {}):
+        return ()
+    if not trusted_profile(profile):
+        raise ConfigError("backend chains require a trusted internal profile")
+    return resolve_role_chain(raw, profile, provider_access=load_provider_access())
 
 
 def chain_as_dicts(legs: Iterable[BackendLeg]) -> list[dict[str, str]]:
@@ -395,6 +412,8 @@ def chain_as_dicts(legs: Iterable[BackendLeg]) -> list[dict[str, str]]:
             row["reasoning_effort"] = leg.reasoning_effort
         if leg.kind == "claude_code":
             row["capability_mode"] = leg.capability_mode
+        if leg.access_mode == "api":
+            row["access_mode"] = "api"
         rows.append(row)
     return rows
 
@@ -403,6 +422,7 @@ def build_status(
     config: dict[str, Any] | None,
     *,
     availability_check: Callable[[str, BackendLeg], bool],
+    provider_access: dict | None = None,
 ) -> dict[str, Any]:
     """Return secret-free configured/available/active route diagnostics."""
 
@@ -421,7 +441,7 @@ def build_status(
         "roles": {},
     }
     for profile in sorted(roles):
-        chain = resolve_role_chain({**cfg, "enabled": True}, profile)
+        chain = resolve_role_chain({**cfg, "enabled": True}, profile, provider_access=provider_access)
         leg_rows = []
         for index, leg in enumerate(chain):
             row: dict[str, Any] = chain_as_dicts((leg,))[0]
@@ -429,6 +449,7 @@ def build_status(
                 "position": index + 1,
                 "available": bool(availability_check(profile, leg)),
                 "active": bool(cfg.get("enabled")) and index == 0,
+                "server_usability": "unverified",
             })
             leg_rows.append(row)
         result["roles"][profile] = {

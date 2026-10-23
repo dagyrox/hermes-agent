@@ -552,11 +552,33 @@ def test_standalone_daemon_sigterm_exits_cleanly_without_terminal_events(tmp_pat
     env["PYTHONPATH"] = os.pathsep.join(
         part for part in (repo_root, env.get("PYTHONPATH", "")) if part
     )
+    ready_file = tmp_path / "sigterm-ready"
+    # Observe the real handler installation, not an earlier DB/banner side
+    # effect. Keep repository recovery markers inside this fixture as well.
+    bootstrap = """
+import signal
+import sys
+from pathlib import Path
+from hermes_cli import main
+
+main.PROJECT_ROOT = Path(sys.argv.pop(1))
+ready_file = Path(sys.argv.pop(1))
+install_signal = signal.signal
+def observe_signal(sig, handler):
+    previous = install_signal(sig, handler)
+    if sig == signal.SIGTERM and callable(handler):
+        ready_file.touch()
+    return previous
+signal.signal = observe_signal
+main.main()
+"""
     proc = subprocess.Popen(
         [
             sys.executable,
-            "-m",
-            "hermes_cli.main",
+            "-c",
+            bootstrap,
+            str(tmp_path),
+            str(ready_file),
             "kanban",
             "daemon",
             "--interval",
@@ -572,15 +594,13 @@ def test_standalone_daemon_sigterm_exits_cleanly_without_terminal_events(tmp_pat
         deadline = time.monotonic() + 10
         while (
             time.monotonic() < deadline
-            and not (hermes_home / "kanban.db").exists()
+            and not ready_file.exists()
         ):
             if proc.poll() is not None:
                 break
             time.sleep(0.05)
         assert proc.poll() is None
-        # init_db creates the file before run_daemon installs its signal
-        # handlers; allow startup to reach the steady-state wait loop.
-        time.sleep(0.5)
+        assert ready_file.exists(), "daemon did not install its SIGTERM handler"
         proc.terminate()
         stdout, stderr = proc.communicate(timeout=10)
     finally:

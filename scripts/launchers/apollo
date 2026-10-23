@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# [Talos] Agent Authentication; dagyrox/hermes-agent PR21; or7-platform #259/#260.
+# Card t_40407c22/run628; packet central-auth-explicit-api-switch.md.
+# Install only after independent review. Existing tmux sessions are unchanged.
+set -euo pipefail
+SESSION="${APOLLO_TMUX_SESSION:-apollo}"
+WORKDIR="${APOLLO_WORKDIR:-/root}"
+CLAUDE_BIN="${APOLLO_CLAUDE_BIN:-/root/.hermes/node/bin/claude}"
+MODEL="${APOLLO_CLAUDE_MODEL:-sonnet}"
+ESCALATION_MODEL="${APOLLO_ESCALATION_MODEL:-opus}"
+HERMES_BIN="${APOLLO_HERMES_BIN:-/usr/local/bin/hermes}"
+NAME="${APOLLO_NAME:-Apollo}"
+PYTHON="${APOLLO_PYTHON:-/usr/local/lib/hermes-agent/venv/bin/python}"
+
+native() {
+  "$PYTHON" -m hermes_cli.native_claude --profile apollo --claude-bin "$CLAUDE_BIN" "$@"
+}
+start_session() {
+  local session="$1" model="$2" name="$3" command
+  command -v tmux >/dev/null || { printf 'tmux is required\n' >&2; exit 127; }
+  if tmux has-session -t "$session" 2>/dev/null; then
+    exec tmux attach-session -t "$session"
+  fi
+  mkdir -p "$WORKDIR"
+  # Quote argv, not secrets. The shared builder scrubs auth in the native child.
+  printf -v command '%q ' "$PYTHON" -m hermes_cli.native_claude --profile apollo --claude-bin "$CLAUDE_BIN" --model "$model" --name "$name"
+  exec tmux new-session -s "$session" -c "$WORKDIR" "$command"
+}
+case "${1:-}" in
+  ""|attach|start) start_session "$SESSION" "$MODEL" "$NAME" ;;
+  status)
+    printf 'Apollo: root vendor policy; changes apply only to new runs.\n'
+    native --status
+    ;;
+  login) cd "$WORKDIR"; native --login ;;
+  smoke) cd "$WORKDIR"; native --model "$MODEL" --query 'Reply with exactly: CLAUDE_CODE_SMOKE_OK' ;;
+  escalate|opus) start_session "${SESSION}-opus" "$ESCALATION_MODEL" "${NAME}-Opus" ;;
+  fallback|codex|hermes)
+    shift
+    # Keep Apollo's persona; no nonexistent apollo-hermes profile or raw API route.
+    exec env HERMES_NO_TMUX=1 "$HERMES_BIN" -p apollo --provider openai-codex -m gpt-6.1-sol "$@"
+    ;;
+  claude|code)
+    shift
+    native --model "$MODEL" --name "$NAME" -- "$@"
+    ;;
+  logs) exec tmux capture-pane -t "$SESSION" -p -S -200 ;;
+  detach-help) printf 'Detach: Ctrl+b, then d. Reattach: apollo\n' ;;
+  kill)
+    read -r -p "Kill tmux session '$SESSION'? Type 'kill' to confirm: " answer
+    if [ "$answer" = kill ]; then tmux kill-session -t "$SESSION"; else printf 'Cancelled.\n'; fi
+    ;;
+  help|-h|--help)
+    printf '%s\n' 'Usage: apollo [attach|status|login|smoke|escalate|opus|fallback|codex|hermes|logs|detach-help|kill|claude|help]' \
+      'Sonnet primary; Opus escalation. Native Claude uses root provider_access.anthropic.mode for new runs.' \
+      'Explicit Codex fallback uses openai-codex/gpt-6.1-sol with Apollo persona.' \
+      'API mode requires an explicit API model and separate root ANTHROPIC_API_KEY; funding is unverified.' \
+      'Existing sessions retain their original mode. Tokens are supplied only to the native child.'
+    ;;
+  *) printf 'Unknown command: %s\n' "$1" >&2; exit 2 ;;
+esac

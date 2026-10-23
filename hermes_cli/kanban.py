@@ -1508,8 +1508,11 @@ def _cmd_backend_status(args: argparse.Namespace) -> int:
     from hermes_cli.backend_failover import build_status
     from hermes_cli.config import load_config
 
+    from hermes_cli.provider_access import load_provider_access, provider_access_status
+
     raw = load_config().get("agent_backend_failover") or {}
-    status = build_status(raw, availability_check=_backend_leg_available)
+    status = build_status(raw, availability_check=_backend_leg_available, provider_access=load_provider_access())
+    status["provider_access"] = provider_access_status()
     if getattr(args, "json", False):
         print(json.dumps(status, indent=2, sort_keys=True))
         return 0
@@ -1534,6 +1537,10 @@ def _cmd_backend_status(args: argparse.Namespace) -> int:
                 f"    {leg['position']}. {backend}/{leg['model']} "
                 f"[{marker}, {available}]"
             )
+    for vendor, access in status["provider_access"].items():
+        print(f"  {vendor}: mode={access['mode']} default=subscription "
+              f"source={access['source_path']} readiness={access['readiness']} "
+              "applies-to=new-runs API-funding=unverified")
     return 0
 
 

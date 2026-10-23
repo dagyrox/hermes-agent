@@ -40,6 +40,15 @@ def mock_args():
     return SimpleNamespace()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_recovery_markers(tmp_path, monkeypatch):
+    # Mocked updates must not trigger recovery in concurrent real CLI children.
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "_update_marker_path", lambda: tmp_path / ".update-incomplete")
+    monkeypatch.setattr(hm, "_lazy_refresh_marker_path", lambda: tmp_path / ".lazy-refresh-incomplete")
+
+
 # ---------------------------------------------------------------------------
 # Managed-uv compatibility for tests that patch shutil.which
 # ---------------------------------------------------------------------------

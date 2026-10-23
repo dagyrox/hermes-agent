@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# [Talos] Agent Authentication; dagyrox/hermes-agent; or7-platform #259/#260.
+# Card t_ba92d6df; packet central-auth-explicit-api-switch.md.
+# Install only after independent review. Existing tmux sessions are unchanged.
+set -euo pipefail
+SESSION="${ATHENA_TMUX_SESSION:-athena}"
+WORKDIR="${ATHENA_WORKDIR:-/root}"
+CLAUDE_BIN="${ATHENA_CLAUDE_BIN:-/root/.hermes/node/bin/claude}"
+MODEL="${ATHENA_CLAUDE_MODEL:-opus}"
+ESCALATION_MODEL="${ATHENA_ESCALATION_MODEL:-fable}"
+HERMES_BIN="${ATHENA_HERMES_BIN:-/usr/local/bin/hermes}"
+CODEX_PROFILE="${ATHENA_CODEX_PROFILE:-athena-hermes}"
+NAME="${ATHENA_NAME:-Athena}"
+PYTHON=/usr/local/lib/hermes-agent/venv/bin/python
+
+native() {
+  "$PYTHON" -m hermes_cli.native_claude --profile athena --claude-bin "$CLAUDE_BIN" "$@"
+}
+start_session() {
+  local session="$1" model="$2" name="$3" command
+  command -v tmux >/dev/null || { printf 'tmux is required\n' >&2; exit 127; }
+  if tmux has-session -t "$session" 2>/dev/null; then
+    exec tmux attach-session -t "$session"
+  fi
+  mkdir -p "$WORKDIR"
+  # argv quoting only; neither the command nor tmux's environment contains tokens.
+  printf -v command '%q ' "$PYTHON" -m hermes_cli.native_claude --profile athena --claude-bin "$CLAUDE_BIN" --model "$model" --name "$name"
+  exec tmux new-session -s "$session" -c "$WORKDIR" "$command"
+}
+case "${1:-}" in
+  ""|attach|start) start_session "$SESSION" "$MODEL" "$NAME" ;;
+  status)
+    printf 'Athena: root vendor policy; changes apply only to new runs.\n'
+    native --status
+    ;;
+  login) cd "$WORKDIR"; native --login ;;
+  smoke) cd "$WORKDIR"; native --model "$MODEL" --query 'Reply with exactly: CLAUDE_CODE_SMOKE_OK' ;;
+  escalate|fable) start_session "${SESSION}-fable" "$ESCALATION_MODEL" "${NAME}-Fable" ;;
+  fallback|codex|hermes)
+    shift
+    exec env HERMES_NO_TMUX=1 "$HERMES_BIN" -p "$CODEX_PROFILE" "$@"
+    ;;
+  claude|code)
+    shift
+    # Companion native execution uses the same source/policy, not lane .env.
+    native --model "$MODEL" --name "$NAME" -- "$@"
+    ;;
+  logs) exec tmux capture-pane -t "$SESSION" -p -S -200 ;;
+  detach-help) printf 'Detach: Ctrl+b, then d. Reattach: athena\n' ;;
+  kill)
+    read -r -p "Kill tmux session '$SESSION'? Type 'kill' to confirm: " answer
+    if [ "$answer" = kill ]; then tmux kill-session -t "$SESSION"; else printf 'Cancelled.\n'; fi
+    ;;
+  help|-h|--help)
+    printf '%s\n' 'Usage: athena [attach|status|login|smoke|escalate|fallback|logs|detach-help|kill|claude|help]' \
+      'Native Claude subscription is the default. Root provider_access.anthropic.mode controls new runs.' \
+      'API mode requires an explicit API model and separate root ANTHROPIC_API_KEY; funding is unverified.' \
+      'Existing sessions retain their original mode. Tokens are supplied only to the native child.'
+    ;;
+  *) printf 'Unknown command: %s\n' "$1" >&2; exit 2 ;;
+esac

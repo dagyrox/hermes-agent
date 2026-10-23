@@ -584,6 +584,12 @@ def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
+    if provider_id in {"anthropic", "openai"}:
+        from hermes_cli.provider_access import managed_runtime
+
+        managed = managed_runtime(provider_id)
+        if managed is not None:
+            return managed["api_key"], managed["source"]
     if provider_id == "copilot":
         # Use the dedicated copilot auth module for proper token validation
         try:

@@ -1,0 +1,149 @@
+{
+  "project": "Agent Authentication / Shared Credentials",
+  "repository": "dagyrox/hermes-agent",
+  "consumer_repository": "dagyrox/or7-platform",
+  "issues": [
+    259,
+    260
+  ],
+  "acting_lane": "Talos",
+  "card": "t_ba92d6df",
+  "run": 613,
+  "repair_card": "t_40407c22",
+  "repair_run": 628,
+  "work_packet": "/root/.hermes/work-packets/central-auth-explicit-api-switch.md",
+  "baseline_commit": "fb739936576acc4b54f0244978a0201f56c96483",
+  "self_excluded": true,
+  "files": [
+    {
+      "path": "agent/anthropic_adapter.py",
+      "bytes": 123897,
+      "sha256": "09f478b023d9d5bef3e897c571d67ffdc3a34e6f4aaa8caaa8f0876590384edb"
+    },
+    {
+      "path": "agent/file_safety.py",
+      "bytes": 28657,
+      "sha256": "6c8963d9057c2b3ad39930799bcef881b85928b7f2e359e3794ade08b3341564"
+    },
+    {
+      "path": "docs/agentic-operations/central-auth-explicit-api-checkpoint.md",
+      "bytes": 6705,
+      "sha256": "597d472267b8cbd6414cbf33b7450a36d1a58c1b04dfc57d25e302d4d2fad848"
+    },
+    {
+      "path": "docs/agentic-operations/central-auth-explicit-api.md",
+      "bytes": 18490,
+      "sha256": "2659c71078d55650c44712f6e7ccfd6831601fb02b0fbcc9a024f75c09114c69"
+    },
+    {
+      "path": "docs/agentic-operations/central-auth-route-readback.json",
+      "bytes": 2010,
+      "sha256": "adfc125f9c6b1ef36f03e6856ebca3747233814a682bdc1fc79edab0b17538de"
+    },
+    {
+      "path": "gateway/run.py",
+      "bytes": 1179929,
+      "sha256": "8b2b66e4f92d6699f8b2dd7bd9e5d870e3949054728f5744b540fd6727d6334d"
+    },
+    {
+      "path": "hermes_cli/auth.py",
+      "bytes": 370926,
+      "sha256": "e77fa8fa1d59bd597f6b90716e3e0069e9a015a3f11d9ae8365289d377c70004"
+    },
+    {
+      "path": "hermes_cli/backend_failover.py",
+      "bytes": 18122,
+      "sha256": "580a8363492c4815a561bc8aa4469fb2cc1862d532daba4030bac1e8bd97da09"
+    },
+    {
+      "path": "hermes_cli/backend_failover_worker.py",
+      "bytes": 44927,
+      "sha256": "a449819379bbefa5987ac52f2253a7602d5eb5fff789a3c606d2b8d9dbcd9bd3"
+    },
+    {
+      "path": "hermes_cli/cli_agent_setup_mixin.py",
+      "bytes": 35647,
+      "sha256": "bef778166f1a19b32c81f6b3eb20e668e9e25fea0f6209dd3e42f96390d0cfb6"
+    },
+    {
+      "path": "hermes_cli/config.py",
+      "bytes": 442475,
+      "sha256": "25a0e41e26b6f9cbd2655af4eb88493f59827de705a6eac743c8987a764f7d00"
+    },
+    {
+      "path": "hermes_cli/fallback_config.py",
+      "bytes": 3875,
+      "sha256": "050cb3b237ca0423fb3fe6b8143b4037c8f974b66cb694c99036905d16708826"
+    },
+    {
+      "path": "hermes_cli/kanban.py",
+      "bytes": 131785,
+      "sha256": "9bdf7775672cc8db18feea34b982e748447e6072426896b51b87ab38f36bc25b"
+    },
+    {
+      "path": "hermes_cli/native_claude.py",
+      "bytes": 4354,
+      "sha256": "62874f07be5182cdcd1b3a4e0457bb744901563c7a7a4f5d4b9aba4d506c7ddd"
+    },
+    {
+      "path": "hermes_cli/oneshot.py",
+      "bytes": 20948,
+      "sha256": "606c78a984a6538665b5803527d37b412d9e3adc5cf88a7cc12b1e92d7ccfa80"
+    },
+    {
+      "path": "hermes_cli/provider_access.py",
+      "bytes": 12558,
+      "sha256": "65d5206da86efe66291b8d0687aedfd8b602f53143fe82cb218ca146ffae1e63"
+    },
+    {
+      "path": "hermes_cli/runtime_provider.py",
+      "bytes": 98869,
+      "sha256": "8ddd609699a26b301204bcfd7d5c7b84852c8aa60ec26f8e1e0b63e5af6b51e7"
+    },
+    {
+      "path": "scripts/launchers/apollo",
+      "bytes": 2999,
+      "sha256": "836d9315f4932b2da036d7eab41891c675856116cd293e4cbb95bc40435278cb"
+    },
+    {
+      "path": "scripts/launchers/athena",
+      "bytes": 2883,
+      "sha256": "f758efa8a5d75ca21d4681daf12371798522d9cf03903db94a896b49949b2526"
+    },
+    {
+      "path": "tests/hermes_cli/test_apollo_launcher.py",
+      "bytes": 1780,
+      "sha256": "c782b67962212c7f39211a82cbb8609f0521ddb556ffe557f3060f9bdad0a968"
+    },
+    {
+      "path": "tests/hermes_cli/test_backend_failover_worker.py",
+      "bytes": 40377,
+      "sha256": "4a31524f736b130436efc42cd67144b1c55816f33bcd9721397d76a5ce64518c"
+    },
+    {
+      "path": "tests/hermes_cli/test_cmd_update.py",
+      "bytes": 49549,
+      "sha256": "1398070c9f839678a4becb2d9cb910699028a1189e3f9789003e069a68dece84"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_dispatcher_options.py",
+      "bytes": 19150,
+      "sha256": "663cd5423491f3fd0809f69858f0c498c974c682bec3f1ce399d99232bf6f956"
+    },
+    {
+      "path": "tests/hermes_cli/test_provider_access.py",
+      "bytes": 7675,
+      "sha256": "32851df084178294a9bee271301caf95d9e80e294b160d213e5481025bf71f1b"
+    },
+    {
+      "path": "tests/hermes_cli/test_worker_only_failover_e2e.py",
+      "bytes": 11690,
+      "sha256": "dd9fa26367f98ad52745300d7b36418d479a47bf1a617dd602f6db30ce7866fc"
+    },
+    {
+      "path": "tests/tui_gateway/test_protocol.py",
+      "bytes": 82386,
+      "sha256": "bc96f2c38a5f9825109f8d370fb1e2eaad74f2c435a0e065e1cd5b12bba90f24"
+    }
+  ]
+}

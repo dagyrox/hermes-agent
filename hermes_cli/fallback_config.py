@@ -84,12 +84,22 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
         return []
 
     config = config or {}
+    from hermes_cli.provider_access import load_provider_access, managed_deployment, trusted_profile
+
+    managed = managed_deployment() and trusted_profile()
+    modes = load_provider_access() if managed else {}
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
     for key in ("fallback_providers", "fallback_model"):
         for entry in _iter_fallback_entries(config.get(key)):
             identity = _entry_identity(entry)
+            if managed and identity[0] in {"openai", "openai-direct", "anthropic"}:
+                # Vendor API access is an explicit primary only, never an
+                # automatic subscription-to-paid escalation.
+                continue
+            if managed and identity[0] == "openai-codex" and modes["openai"]["mode"] == "api":
+                continue
             if identity in seen:
                 continue
             seen.add(identity)

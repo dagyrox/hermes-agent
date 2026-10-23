@@ -106,6 +106,27 @@ def _load_chain(profile: str, raw_chain: str | None = None) -> tuple[BackendLeg,
 
     if raw_chain:
         parsed = json.loads(raw_chain)
+        # A dispatch snapshot can substitute ONLY the canonical primary.
+        # Revalidate against the original route, never the current mode file.
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and parsed[0].get("access_mode") == "api":
+            from hermes_cli.backend_failover import _CANONICAL_ROUTES, chain_as_dicts
+            from hermes_cli.provider_access import trusted_profile
+
+            if not trusted_profile(profile):
+                raise ValueError("API snapshot requires a trusted internal profile")
+            kind, provider, model = _CANONICAL_ROUTES[profile][0]
+            vendor = "anthropic" if kind == "claude_code" else "openai"
+            mode = {vendor: {"mode": "api", "api_provider": parsed[0].get("provider"), "api_model": parsed[0].get("model")}}
+            canonical = [dict(row) for row in parsed]
+            canonical[0] = {"kind": kind, "model": model}
+            if provider:
+                canonical[0]["provider"] = provider
+            if parsed[0].get("reasoning_effort"):
+                canonical[0]["reasoning_effort"] = parsed[0]["reasoning_effort"]
+            chain = resolve_role_chain({"enabled": True, "roles": {profile: canonical}}, profile, provider_access=mode)
+            if chain_as_dicts(chain) != parsed:
+                raise ValueError("Invalid explicit API route snapshot")
+            return chain
         return resolve_role_chain(
             {"enabled": True, "roles": {profile: parsed}},
             profile,
@@ -269,12 +290,9 @@ class _OwnershipLost(RuntimeError):
 
 
 def _claude_environment(base: dict[str, str]) -> dict[str, str]:
-    env = {key: value for key, value in base.items() if key in _BASE_ENV_KEYS}
-    # Subscription authentication remains in HOME/.claude.  Deliberately do
-    # not manufacture API credentials or inherit an Anthropic-compatible URL.
-    env.setdefault("HOME", str(Path.home()))
-    env.setdefault("USER", os.environ.get("USER", "root"))
-    return env
+    from hermes_cli.provider_access import claude_environment
+
+    return claude_environment(base)
 
 
 def _api_environment(base: dict[str, str]) -> dict[str, str]:
@@ -313,12 +331,31 @@ def _claude_cli_compatible(model: str, env: dict[str, str]) -> bool:
     )
 
 
+def _leg_access_policy(leg: BackendLeg) -> dict:
+    if leg.access_mode != "api":
+        return {}
+    vendor = "anthropic" if leg.provider == "anthropic" else "openai"
+    return {vendor: {"mode": "api", "api_provider": leg.provider, "api_model": leg.model}}
+
+
 def _leg_available(leg: BackendLeg, profile_home: Path | None = None) -> bool:
     """Preflight local auth/runtime availability without making a model call."""
     if leg.kind == "claude_code":
         if not shutil.which("claude"):
             return False
-        claude_env = _claude_environment(dict(os.environ))
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.provider_access import claude_source
+
+        home_token = set_hermes_home_override(profile_home) if profile_home else None
+        try:
+            claude_env = _claude_environment(dict(os.environ))
+            if claude_source()[1] == "none":
+                return False
+        except ValueError:
+            return False
+        finally:
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
         if not _claude_cli_compatible(leg.model, claude_env):
             return False
         try:
@@ -358,6 +395,7 @@ def _leg_available(leg: BackendLeg, profile_home: Path | None = None) -> bool:
             resolved = resolve_runtime_provider(
                 requested=leg.provider,
                 target_model=leg.model,
+                provider_access_snapshot=_leg_access_policy(leg),
             )
         finally:
             set_multiplex_active(previous_multiplex)
@@ -419,7 +457,8 @@ def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[s
     if leg.kind == "api":
         from agent.models_dev import get_model_capabilities
 
-        capabilities = get_model_capabilities(leg.provider or "", leg.model)
+        capability_provider = "openai" if leg.provider == "openai-direct" else (leg.provider or "")
+        capabilities = get_model_capabilities(capability_provider, leg.model)
         if capabilities is None:
             return ("capability_evidence",)
         missing: set[str] = set()
@@ -622,6 +661,7 @@ def _leg_command(
         cmd.append("-Q")
         env = _api_environment(base_env)
         env["HERMES_BACKEND_FAILOVER_CHILD"] = "1"
+        env["HERMES_PROVIDER_ACCESS_SNAPSHOT"] = json.dumps(_leg_access_policy(leg))
         return cmd, env
 
     if mcp_path is None or system_prompt_path is None:
@@ -894,7 +934,7 @@ def _run_leg(
             + ", ".join(mismatches),
         ):
             return 0
-        return EXIT_ELIGIBLE
+        return 1 if leg.access_mode == "api" else EXIT_ELIGIBLE
     profile_home = getattr(args, "profile_home", None)
     available = (
         _leg_available(leg, profile_home)
@@ -902,6 +942,9 @@ def _run_leg(
         else _leg_available(leg)
     )
     if not available:
+        if leg.access_mode == "api":
+            _comment(args.task, "Explicit API primary unavailable: configure a separate root vendor API key; funding/server usability unverified. No automatic mode change.")
+            return 1
         return EXIT_ELIGIBLE
     if not _comment(
         args.task,
