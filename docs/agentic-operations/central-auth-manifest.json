@@ -9,8 +9,8 @@
   "acting_lane": "Talos",
   "card": "t_ba92d6df",
   "run": 613,
-  "repair_card": "t_2cd0a51f",
-  "repair_run": 616,
+  "repair_card": "t_5a066f08",
+  "repair_run": 623,
   "work_packet": "/root/.hermes/work-packets/central-auth-explicit-api-switch.md",
   "baseline_commit": "fb739936576acc4b54f0244978a0201f56c96483",
   "self_excluded": true,
@@ -32,8 +32,8 @@
     },
     {
       "path": "docs/agentic-operations/central-auth-explicit-api.md",
-      "bytes": 12772,
-      "sha256": "b0235089c2328117aa368c0892e2aedac2ae625b1584361874f08241fc85822d"
+      "bytes": 14598,
+      "sha256": "e722174e4d7147242edd291dd2c6e60496e9c31e96e709d1e895077ab49ef534"
     },
     {
       "path": "docs/agentic-operations/central-auth-route-readback.json",
@@ -119,6 +119,11 @@
       "path": "tests/hermes_cli/test_worker_only_failover_e2e.py",
       "bytes": 11690,
       "sha256": "dd9fa26367f98ad52745300d7b36418d479a47bf1a617dd602f6db30ce7866fc"
+    },
+    {
+      "path": "tests/tui_gateway/test_protocol.py",
+      "bytes": 82386,
+      "sha256": "bc96f2c38a5f9825109f8d370fb1e2eaad74f2c435a0e065e1cd5b12bba90f24"
     }
   ]
 }

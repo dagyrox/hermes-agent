@@ -181,7 +181,8 @@ the new trust boundary. The first follow-up code change was that existing test
 fixture: temporary root trust and a 0600 synthetic native token, never runner or
 live auth. Production bytes stay identical to Athena's approved candidate.
 The repaired three E2E tests plus four new policy regressions passed (7/7).
-Slice6's separate exit143 was an infrastructure runner shutdown, not an assertion.
+Slice6 separately reported runner shutdown (exit143), not an assertion; its
+initiating signal and infrastructure attribution were not established.
 No local broad suite or new test harness was added. Updated manifest includes
 the repaired existing E2E file (21 listed files, self-excluded). The successor
 still requires narrow independent exact-head confirmation and hosted green CI.
@@ -199,3 +200,30 @@ and terminal hosted green CI; earlier approvals cannot substitute for it.
 Hermes/default release continuation card `t_fa44c5ab` owns authorized merge,
 installation and safe activation after those gates; it must never use an older
 approval for changed production bytes.
+
+## Diagnosed protocol fixture successor (t_5a066f08/run623)
+
+Hermes diagnostic `t_3c619957`/run619 independently reproduced a repository
+test-fixture hang on `a14e99f39f9`, after 44 protocol tests passed. The fixture
+replaced `hermes_constants` with a mock but did not concretize
+`get_default_hermes_root`. The new root-policy lookup consequently passed a
+mock stream to PyYAML whose reads never reached EOF. All three inspected hosted
+slice6 logs left this protocol file as the sole pending file. This establishes
+a fixture defect, not the identity of the hosted shutdown signal's sender.
+
+The narrow successor supplies a concrete isolated `tmp_path` root in the existing
+server fixture. Production parsing, fail-closed policy, assertions, test selection,
+and timeouts are unchanged. Existing canonical verification completed normally:
+`HERMES_PYTHON=/usr/local/lib/hermes-agent/venv/bin/python scripts/run_tests.sh
+tests/tui_gateway/test_protocol.py tests/hermes_cli/test_provider_access.py -q`
+returned exit0: 95 protocol tests plus 4 policy tests passed, zero failures, no
+retry reported. Focused ruff and `git diff --check` passed. No broad local suite
+or new harness was run. The refreshed manifest lists 22 files, self-excluded.
+
+Talos publishes an ordinary successor to the same PR21; production remains
+byte-identical to approved `a50f02a92528`. Independent Athena confirmation and
+genuine hosted green must bind that successor SHA before release. Release
+`t_fa44c5ab` retains F1/F2 and all merge/install/activation ownership. This repair
+does not change live configuration, credentials, installation, or services and
+makes no paid API call. Missing Anthropic API credentials remain a fail-closed
+capability status, not a subscription-release blocker.

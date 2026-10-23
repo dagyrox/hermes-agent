@@ -20,9 +20,13 @@ def _restore_stdout():
 
 
 @pytest.fixture()
-def server():
+def server(tmp_path):
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_constants": MagicMock(
+            get_hermes_home=MagicMock(return_value="/tmp/hermes_test"),
+            # Root policy reads need a real isolated path, not a mock stream.
+            get_default_hermes_root=MagicMock(return_value=tmp_path),
+        ),
         "hermes_cli.env_loader": MagicMock(),
         "hermes_cli.banner": MagicMock(),
         "hermes_state": MagicMock(),
