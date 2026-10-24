@@ -337,6 +337,23 @@ def test_healthy_worker_executes_useful_terminal_command(native_fixture):
     assert f["context_reads"].exists()
 
 
+def test_healthy_worker_admits_unavailable_optional_toolsets(native_fixture):
+    f = native_fixture
+    f["state"]["status"] = 200
+    f["config"]["platform_toolsets"]["cli"] = [
+        "terminal", "kanban", "web", "image_gen", "computer_use"
+    ]
+    f["launch"]()
+    assert f["await_terminal"]().status == "done"
+    proof = f["workspace"] / "preflight_proof.txt"
+    assert proof.read_text().strip() == str(f["workspace"])
+    events = f["kb"].list_events(f["conn"], f["task_id"])
+    kinds = [event.kind for event in events]
+    assert kinds.index("preflight_passed") < kinds.index("completed")
+    assert "preflight_failed" not in kinds
+    assert not f["requests"][0].get("tools")
+
+
 @pytest.mark.parametrize(
     "scenario,code,request_count",
     [

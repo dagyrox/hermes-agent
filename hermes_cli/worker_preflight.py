@@ -201,7 +201,7 @@ def dispatch_checks(workspace: str, *, branch: str | None, worktree: bool) -> No
 def _check_tools(args, settings: dict) -> None:
     from hermes_cli.config import load_config
     from model_tools import get_tool_definitions
-    from toolsets import resolve_toolset, validate_toolset
+    from toolsets import validate_toolset
 
     pinned = [
         name.strip()
@@ -217,11 +217,8 @@ def _check_tools(args, settings: dict) -> None:
             skip_tool_search_assembly=True,
         )
         available = {tool["function"]["name"] for tool in definitions}
-        missing = [
-            name
-            for name in pinned
-            if not validate_toolset(name) or not set(resolve_toolset(name)) & available
-        ]
+        # Pins bound allowed tools; required_tools defines mandatory availability.
+        missing = [name for name in pinned if not validate_toolset(name)]
         missing.extend(
             name for name in settings["required_tools"] if name not in available
         )
