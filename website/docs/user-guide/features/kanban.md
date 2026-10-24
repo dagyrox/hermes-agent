@@ -62,6 +62,9 @@ supervised worker, the primary is the frozen first route leg, not the profile's
 display name or direct-worker model default. Existing identity validation still
 checks that `SOUL.md` is nonempty; its contents never enter the probe.
 
+Enabled toolsets whose tools are unavailable in this environment do not block
+admission; list tool names in `required_tools` to make them mandatory.
+
 ```yaml
 kanban:
   worker_preflight:

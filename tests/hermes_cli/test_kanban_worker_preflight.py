@@ -191,6 +191,78 @@ def test_aggregator_probe_sends_the_workers_unchanged_model(monkeypatch, provide
     assert seen["model"] == model
 
 
+def test_unavailable_optional_toolsets_preserve_the_worker_tool_pin(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import config
+    from hermes_cli.worker_preflight import _check_tools
+    import model_tools
+
+    pinned = ["terminal", "web", "image_gen", "computer_use", "kanban"]
+    names = ("terminal", "kanban_complete", "kanban_block", "kanban_heartbeat")
+    disabled = ["tts"]
+    seen = {}
+
+    def definitions(**kwargs):
+        seen.update(kwargs)
+        return [{"function": {"name": name}} for name in names]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", definitions)
+    monkeypatch.setattr(
+        config, "load_config", lambda: {"agent": {"disabled_toolsets": disabled}}
+    )
+    _check_tools(
+        SimpleNamespace(toolsets=",".join(pinned)), {"required_tools": ["terminal"]}
+    )
+    assert seen["enabled_toolsets"] == pinned
+    assert seen["disabled_toolsets"] == disabled
+
+
+@pytest.mark.parametrize(
+    "pin,required,available,missing",
+    [
+        ("terminal,no_such_toolset", "terminal", ["terminal"], "no_such_toolset"),
+        ("terminal,web", "web_search", ["terminal"], "web_search"),
+        ("terminal,web", "terminal", [], "terminal"),
+    ],
+)
+def test_unknown_pins_and_unavailable_required_tools_still_block(
+    monkeypatch, pin, required, available, missing
+):
+    from types import SimpleNamespace
+    from hermes_cli.worker_preflight import WorkerPreflightBlocked, _check_tools
+    import model_tools
+
+    names = [*available, "kanban_complete", "kanban_block", "kanban_heartbeat"]
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kwargs: [{"function": {"name": name}} for name in names],
+    )
+    with pytest.raises(WorkerPreflightBlocked) as caught:
+        _check_tools(SimpleNamespace(toolsets=pin), {"required_tools": [required]})
+    assert caught.value.payload["stage"] == "tools"
+    assert caught.value.payload["code"] == "tool_unavailable"
+    assert caught.value.payload["missing"] == [missing]
+
+
+def test_tool_resolution_errors_still_fail_closed(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli.worker_preflight import WorkerPreflightBlocked, _check_tools
+    import model_tools
+
+    def unavailable(**kwargs):
+        raise RuntimeError("SECRET_RESOLVER_DETAIL")
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", unavailable)
+    with pytest.raises(WorkerPreflightBlocked) as caught:
+        _check_tools(
+            SimpleNamespace(toolsets="terminal,web"), {"required_tools": ["terminal"]}
+        )
+    assert caught.value.payload == {
+        "stage": "tools", "code": "tool_unavailable", "outcome": "failed"
+    }
+
+
 def test_operation_readiness_requires_callable_handler(monkeypatch):
     from types import SimpleNamespace
     from hermes_cli.worker_preflight import WorkerPreflightBlocked, _check_tools
