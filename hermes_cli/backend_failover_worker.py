@@ -307,13 +307,13 @@ def _api_environment(base: dict[str, str]) -> dict[str, str]:
     }
 
 
-def _claude_cli_compatible(model: str, env: dict[str, str]) -> bool:
+def _claude_cli_compatible(model: str, env: dict[str, str], *, runner=None) -> bool:
     """Fail closed when the installed CLI predates a requested model alias."""
     minimum = _CLAUDE_MINIMUM_VERSIONS.get(model)
     if minimum is None:
         return False
     try:
-        probe = subprocess.run(
+        probe = (runner or subprocess.run)(
             ["claude", "--version"],
             capture_output=True,
             text=True,
@@ -999,6 +999,13 @@ def run(argv: list[str] | None = None) -> int:
     )
     if len(legs) != 3:
         raise RuntimeError("backend failover supervisor requires one validated three-leg chain")
+
+    from hermes_cli.worker_preflight import run_supervisor_preflight
+
+    try:
+        run_supervisor_preflight(args, legs[0], profile_home)
+    except SystemExit as exc:
+        return int(exc.code or 0)
 
     ledger_path = _ledger_path(args.task)
     try:

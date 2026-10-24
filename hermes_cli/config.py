@@ -2899,11 +2899,12 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
-        # Opt-in early admission for HTTP workers. Unsupported native transports
-        # fail closed when enabled; activation is a separate operator decision.
+        # Opt-in early admission; unsupported transports fail closed.
+        # Live activation is a separate operator decision.
         "worker_preflight": {
             "enabled": False,
             "timeout_seconds": 15,
+            "native_timeout_seconds": 45,
             "max_output_tokens": 16,
             "required_tools": ["terminal"],
         },

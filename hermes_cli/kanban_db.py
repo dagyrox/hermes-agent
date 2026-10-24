@@ -8961,8 +8961,7 @@ def _default_spawn(
                 chain = load_profile_chain(profile_arg, dispatcher_hermes_home)
             except Exception:
                 raise WorkerPreflightBlocked("config_invalid") from None
-            if chain:
-                raise WorkerPreflightBlocked("transport_unsupported")
+
         env["HERMES_KANBAN_PREFLIGHT"] = "1"
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
@@ -9030,7 +9029,7 @@ def _default_spawn(
     # It inherits the exact same task/run/board/workspace identity assembled
     # above, and each child leg gets one attempt.  Profiles without an active
     # chain continue through the historical direct Hermes worker path.
-    supervisor_cmd = None if admission is not None else _backend_failover_worker_argv(
+    supervisor_cmd = _backend_failover_worker_argv(
         task,
         profile_arg,
         dispatcher_hermes_home,

@@ -212,3 +212,109 @@ def test_operation_readiness_requires_callable_handler(monkeypatch):
         )
     assert caught.value.payload["code"] == "operation_unavailable"
     assert caught.value.payload["missing"] == ["kanban_complete"]
+
+
+def test_native_budget_is_clamped_separately_from_http(tmp_path):
+    from hermes_cli.worker_preflight import dispatch_admission
+
+    tmp_path.joinpath("config.yaml").write_text(
+        "kanban:\n  worker_preflight:\n    enabled: true\n    native_timeout_seconds: 999\n"
+    )
+    settings = dispatch_admission(str(tmp_path))
+    assert settings["native_timeout_seconds"] == 45
+    assert settings["timeout_seconds"] == 15
+    assert settings["max_output_tokens"] == 16
+
+
+def test_outer_probe_rejects_output_flood_without_retaining_it(tmp_path):
+    import sys
+    from hermes_cli.worker_preflight import bounded_probe
+
+    result = bounded_probe(
+        [
+            sys.executable,
+            "-c",
+            "import sys,time; sys.stdout.write('SECRET' * 10000); sys.stdout.flush(); time.sleep(60)",
+        ],
+        cwd=str(tmp_path),
+        timeout=3,
+    )
+    assert result == {"stage": "probe", "code": "probe_failed", "outcome": "failed"}
+
+
+def test_supervisor_children_never_inherit_admission_flag(tmp_path):
+    from types import SimpleNamespace
+    from hermes_cli.backend_failover import BackendLeg
+    from hermes_cli.backend_failover_worker import _leg_command
+
+    args = SimpleNamespace(profile="talos", task="t_fixture", required_toolset=[])
+    _, env = _leg_command(
+        BackendLeg("api", "gpt-6.1-sol", "openai-codex"),
+        args,
+        {"HERMES_KANBAN_PREFLIGHT": "1", "HERMES_KANBAN_TASK": "t_fixture"},
+        None,
+        None,
+    )
+    assert "HERMES_KANBAN_PREFLIGHT" not in env
+    assert env["HERMES_KANBAN_TASK"] == "t_fixture"
+
+
+def test_native_version_and_auth_checks_use_bounded_capture(monkeypatch):
+    from hermes_cli import worker_preflight as preflight
+    from hermes_cli.backend_failover_worker import _claude_cli_compatible
+
+    calls = []
+
+    def capture(command, **kwargs):
+        calls.append((command, kwargs))
+        return 0, b"2.1.999", None
+
+    monkeypatch.setattr(preflight, "_capture_bounded", capture)
+    assert _claude_cli_compatible("claude-opus-5-5", {}, runner=preflight._native_check)
+    preflight._native_check(["claude", "auth", "status", "--json"], env={}, timeout=5)
+    assert [command for command, _ in calls] == [
+        ["claude", "--version"],
+        ["claude", "auth", "status", "--json"],
+    ]
+    assert all(
+        options["limit"] == 4096 and options["timeout"] <= 5 for _, options in calls
+    )
+
+
+@pytest.mark.skipif(
+    __import__("os").name != "posix", reason="POSIX process-group cancellation"
+)
+def test_outer_cancellation_kills_resistant_native_grandchild(tmp_path):
+    import os
+    from pathlib import Path
+    import sys
+    import time
+    from hermes_cli.worker_preflight import bounded_probe
+
+    marker = tmp_path / "native.pid"
+    child_code = (
+        "import os,signal,time; from pathlib import Path; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    parent_code = (
+        "from hermes_cli.worker_preflight import _capture_bounded; "
+        f"_capture_bounded([{sys.executable!r}, '-c', {child_code!r}], cwd={str(tmp_path)!r}, timeout=60)"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    result = bounded_probe(
+        [sys.executable, "-c", parent_code], cwd=str(tmp_path), timeout=3, env=env
+    )
+    assert result["code"] == "probe_timeout"
+    assert marker.exists()
+    pid = int(marker.read_text())
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("native grandchild survived outer cancellation")

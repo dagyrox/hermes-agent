@@ -475,16 +475,12 @@ def test_child_rejects_wrong_cwd_before_context(native_fixture):
     assert not f["requests"]
 
 
-def test_supervised_route_rejected_before_task_media(native_fixture, monkeypatch):
+def test_supervised_route_preserves_unrepresented_media_denial(native_fixture, monkeypatch):
     from hermes_cli import backend_failover
     from agent import image_routing
 
     f = native_fixture
-    monkeypatch.setattr(
-        image_routing,
-        "extract_image_refs",
-        lambda *args, **kwargs: pytest.fail("task body parsed before admission"),
-    )
+    monkeypatch.setattr(image_routing, "extract_image_refs", lambda *a: ([], ["https://example.invalid/image.png"]))
     monkeypatch.setattr(
         backend_failover,
         "load_profile_chain",
@@ -492,22 +488,12 @@ def test_supervised_route_rejected_before_task_media(native_fixture, monkeypatch
             backend_failover.BackendLeg("api", "fixture-model", "deepseek"),
         ),
     )
-    monkeypatch.setattr(
-        f["kb"],
-        "_native_image_attachment_evidence",
-        lambda *args, **kwargs: pytest.fail("task media loaded before admission"),
-    )
-    monkeypatch.setattr(
-        f["kb"],
-        "_backend_failover_worker_argv",
-        lambda *args, **kwargs: pytest.fail("supervisor entered before admission"),
-    )
+    monkeypatch.setattr(f["kb"], "_native_image_attachment_evidence", lambda *a, **k: ([], 0))
     result = f["launch"]()
     assert not result.spawned
     events = f["kb"].list_events(f["conn"], f["task_id"])
-    assert [e.payload["code"] for e in events if e.kind == "preflight_failed"] == [
-        "transport_unsupported"
-    ]
+    assert "spawn_failed" in [e.kind for e in events]
+    assert not any(e.kind.startswith("preflight_") for e in events)
     assert not f["requests"]
 
 
