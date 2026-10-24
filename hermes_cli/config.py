@@ -2899,6 +2899,14 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Opt-in early admission for HTTP workers. Unsupported native transports
+        # fail closed when enabled; activation is a separate operator decision.
+        "worker_preflight": {
+            "enabled": False,
+            "timeout_seconds": 15,
+            "max_output_tokens": 16,
+            "required_tools": ["terminal"],
+        },
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

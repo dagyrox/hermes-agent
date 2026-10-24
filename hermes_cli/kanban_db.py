@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.worker_preflight import WorkerPreflightBlocked
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -5385,6 +5386,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    preflight_payload: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5413,6 +5415,12 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    if preflight_payload is not None:
+        from hermes_cli.worker_preflight import sanitize_outcome
+
+        if expected_run_id is None or kind not in {"capability", "transient"}:
+            raise ValueError("preflight blocks require a run and capability/transient kind")
+        preflight_payload = sanitize_outcome(preflight_payload)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -5581,17 +5589,58 @@ def block_task(
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
             )
-        _blocked_task = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
-        "kanban_task_blocked",
-        task_id,
-        board=get_current_board(),
-        assignee=_blocked_task.assignee if _blocked_task else None,
-        run_id=run_id,
-        reason=reason,
-    )
+        if preflight_payload is not None:
+            _append_event(conn, task_id, "preflight_failed", preflight_payload, run_id=run_id)
+        _blocked_task = get_task(conn, task_id) if preflight_payload is None else None
+    if preflight_payload is None:
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=_blocked_task.assignee if _blocked_task else None,
+            run_id=run_id,
+            reason=reason,
+        )
     return True
 
+
+
+def record_preflight_outcome(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    passed: bool,
+    payload: dict,
+    kind: Optional[str] = None,
+) -> bool:
+    """Persist startup evidence only for the current run; failures close it.
+
+    The failure event joins block_task's existing transaction, so neither an
+    orphan event nor an unrecorded terminal transition can survive a crash.
+    """
+    from hermes_cli.worker_preflight import sanitize_outcome
+
+    safe = sanitize_outcome(payload)
+    safe["outcome"] = "passed" if passed else "failed"
+    if not passed:
+        reason = "preflight {} at {} ({}/{})".format(
+            safe["code"], safe["stage"], safe.get("profile", "unknown"),
+            safe.get("provider", "unknown"),
+        )
+        return block_task(
+            conn, task_id, reason=reason, kind=kind or "capability",
+            expected_run_id=run_id, preflight_payload=safe,
+        )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND current_run_id = ? AND status = 'running'",
+            (task_id, run_id),
+        ).fetchone()
+        if row is None:
+            return False
+        _append_event(conn, task_id, "preflight_passed", safe, run_id=run_id)
+    return True
 
 
 def promote_task(
@@ -8369,6 +8418,12 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except WorkerPreflightBlocked as exc:
+            record_preflight_outcome(
+                conn, claimed.id, run_id=claimed.current_run_id, passed=False,
+                payload={**exc.payload, "profile": claimed.assignee}, kind="capability",
+            )
+            result.auto_blocked.append(claimed.id)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -8466,6 +8521,12 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except WorkerPreflightBlocked as exc:
+            record_preflight_outcome(
+                conn, claimed.id, run_id=claimed.current_run_id, passed=False,
+                payload={**exc.payload, "profile": claimed.assignee}, kind="capability",
+            )
+            result.auto_blocked.append(claimed.id)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -8860,6 +8921,7 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    env.pop("HERMES_KANBAN_PREFLIGHT", None)
     # The long-lived dispatcher's config owns the single authoritative
     # role→chain map. Capture its home before HERMES_HOME is rewritten to the
     # assignee profile for the actual worker process.
@@ -8884,6 +8946,24 @@ def _default_spawn(
         assignee_hermes_home = None
     if assignee_hermes_home:
         env["HERMES_HOME"] = assignee_hermes_home
+    from hermes_cli.worker_preflight import dispatch_admission, dispatch_checks
+
+    admission = dispatch_admission(assignee_hermes_home)
+    if admission is not None:
+        dispatch_checks(
+            workspace, branch=task.branch_name or (f"wt/{task.id}" if task.workspace_kind == "worktree" else None),
+            worktree=task.workspace_kind == "worktree",
+        )
+        if not (task.model_override or task.provider_override or task.goal_mode):
+            from hermes_cli.backend_failover import load_profile_chain
+
+            try:
+                chain = load_profile_chain(profile_arg, dispatcher_hermes_home)
+            except Exception:
+                raise WorkerPreflightBlocked("config_invalid") from None
+            if chain:
+                raise WorkerPreflightBlocked("transport_unsupported")
+        env["HERMES_KANBAN_PREFLIGHT"] = "1"
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -8950,7 +9030,7 @@ def _default_spawn(
     # It inherits the exact same task/run/board/workspace identity assembled
     # above, and each child leg gets one attempt.  Profiles without an active
     # chain continue through the historical direct Hermes worker path.
-    supervisor_cmd = _backend_failover_worker_argv(
+    supervisor_cmd = None if admission is not None else _backend_failover_worker_argv(
         task,
         profile_arg,
         dispatcher_hermes_home,
@@ -9023,7 +9103,7 @@ def _default_spawn(
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=workspace if admission is not None or os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
