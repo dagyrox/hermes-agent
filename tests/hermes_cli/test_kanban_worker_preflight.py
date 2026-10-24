@@ -158,6 +158,39 @@ def test_invalid_diagnostic_values_do_not_escape():
     assert result == {"stage": "probe", "code": "probe_failed", "outcome": "failed"}
 
 
+@pytest.mark.parametrize("provider", ["openrouter", "nous", "kilocode"])
+def test_aggregator_probe_sends_the_workers_unchanged_model(monkeypatch, provider):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import openai
+    from hermes_cli import runtime_provider
+    from hermes_cli.worker_preflight import _probe
+
+    model = "claude-sonnet-4.6"
+    seen = {}
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": provider,
+            "api_mode": "chat_completions",
+            "base_url": "http://127.0.0.1",
+            "api_key": "sk-fixture-not-a-real-key",
+        },
+    )
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: seen.update(kwargs))
+        )
+    )
+    monkeypatch.setattr(openai, "OpenAI", lambda **kwargs: nullcontext(client))
+    result = _probe(
+        SimpleNamespace(provider=provider, model=model, timeout=15, max_tokens=16)
+    )
+    assert result["outcome"] == "passed"
+    assert seen["model"] == model
+
+
 def test_operation_readiness_requires_callable_handler(monkeypatch):
     from types import SimpleNamespace
     from hermes_cli.worker_preflight import WorkerPreflightBlocked, _check_tools

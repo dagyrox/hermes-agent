@@ -382,7 +382,10 @@ def _probe(args) -> dict:
             resolve_runtime_provider,
         )
         from hermes_cli.provider_access import load_provider_access, trusted_profile
-        from hermes_cli.model_normalize import normalize_model_for_provider
+        from hermes_cli.model_normalize import (
+            _AGGREGATOR_PROVIDERS,
+            normalize_model_for_provider,
+        )
         from hermes_cli.auth import has_usable_secret, LMSTUDIO_NOAUTH_PLACEHOLDER
 
         cfg = load_config().get("model") or {}
@@ -409,7 +412,8 @@ def _probe(args) -> dict:
         if not model:
             result.update(stage="identity", code="model_unresolved")
             return sanitize_outcome(result)
-        model = normalize_model_for_provider(model, provider)
+        if provider not in _AGGREGATOR_PROVIDERS:
+            model = normalize_model_for_provider(model, provider)
         result.update(
             provider=provider,
             model=model,
