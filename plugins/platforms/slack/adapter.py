@@ -2544,6 +2544,7 @@ class SlackAdapter(BasePlatformAdapter):
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
+            sent_receipts: list[str] = []
 
             # reply_broadcast: also post thread replies to the main channel.
             # Controlled via platform config: gateway.slack.reply_broadcast
@@ -2590,6 +2591,13 @@ class SlackAdapter(BasePlatformAdapter):
                         ).chat_postMessage(**retry_kwargs)
                     else:
                         raise
+                if last_result and last_result.get("ts"):
+                    sent_receipts.append(str(last_result["ts"]))
+                    owner_receipt = (metadata or {}).get(
+                        "_owner_delivery_receipt"
+                    )
+                    if callable(owner_receipt):
+                        owner_receipt(i, str(last_result["ts"]))
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -2612,6 +2620,7 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(
                 success=True,
                 message_id=sent_ts,
+                continuation_message_ids=tuple(sent_receipts[:-1]),
                 raw_response=last_result,
             )
 
@@ -2640,6 +2649,13 @@ class SlackAdapter(BasePlatformAdapter):
                 retryable=_retryable,
                 retry_after=_retry_after,
             )
+
+    def owner_delivery_parts(self, content: str) -> tuple[str, ...]:
+        """Return the exact Slack chunks used for receipt-bound delivery."""
+        formatted = self.format_message(content)
+        if not formatted or not formatted.strip():
+            return ("",)
+        return tuple(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
 
     async def send_private_notice(
         self,
