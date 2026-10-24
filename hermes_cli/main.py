@@ -2449,6 +2449,11 @@ def cmd_chat(args):
 
     _apply_safe_mode(args)
 
+    # Opt-in admission precedes task, memory, skills and agent construction.
+    from hermes_cli.worker_preflight import run_worker_preflight
+
+    run_worker_preflight(args)
+
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
     if continue_val and not getattr(args, "resume", None):

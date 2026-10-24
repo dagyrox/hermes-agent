@@ -52,6 +52,62 @@ They look similar; they are not the same primitive.
 
 They coexist: a kanban worker may call `delegate_task` internally during its run.
 
+## Opt-in worker startup preflight
+
+`kanban.worker_preflight` is disabled by default and belongs to the assigned
+worker profile, not the dispatcher's profile. Admission checks the assigned
+workspace/branch, required tools and lifecycle operations, then the worker's
+actual primary transport before loading task context, memory or skills. For a
+supervised worker, the primary is the frozen first route leg, not the profile's
+display name or direct-worker model default. Existing identity validation still
+checks that `SOUL.md` is nonempty; its contents never enter the probe.
+
+```yaml
+kanban:
+  worker_preflight:
+    enabled: false
+    timeout_seconds: 15
+    native_timeout_seconds: 45
+    max_output_tokens: 16
+    required_tools: [terminal]
+```
+
+| Resolved transport | Working-path diagnostic | Budget ceiling |
+| --- | --- | --- |
+| `chat_completions`, usable string key | One SDK request using the exact worker model | 15 seconds, 16 output tokens |
+| `anthropic_messages`, usable string key | One Messages request using the exact worker model | 15 seconds, 16 output tokens |
+| `codex_responses`, provider `openai-codex` | OAuth Responses stream, `store: false`, closed on first output event | 45 seconds; no unsupported output-token parameter |
+| Supervisor `claude_code` primary | Native subscription CLI, one turn, no tools or MCP, empty scratch cwd, safe mode | 45 seconds; CLI has no safe output-token cap |
+| Other Responses providers, Codex app-server, Bedrock, ACP, callable keys, keyless endpoints | Explicit unsupported-transport blocker | Never reported healthy |
+
+Limits are clamped down to these ceilings. Native budgets cover process/import
+startup, normal credential resolution and first output; the supervising process
+allows two additional seconds to stop/reap its owned probe group. Native output
+is bounded by time and retained bytes (64 KiB for Claude, 4 KiB for the final
+diagnostic), not a fictitious 16-token limit. Probe requests contain only a fixed
+diagnostic, never task/memory/skill text. The CLI uses the same credential-source
+and environment builder as the real native worker, without `--bare` (which would
+change OAuth behavior).
+
+Failure records a run-bound, allowlisted `preflight_failed` event and blocks the
+task through the existing lifecycle. It does not try another route, increment
+spawn-failure counters, repair credentials, force refresh, change billing or
+automatically retry. After a pass, normal worker execution and existing runtime
+failover policy continue unchanged. Disabling admission preserves legacy startup.
+
+Preflight does not waive capability parity. API primaries require real model
+catalog evidence; native read-only workers must expose only tools their existing
+bridge supports. In particular, a configuration whose automatically added Kanban
+tools exceed that bridge will correctly block with `tool_unavailable`, even if
+subscription authentication works. Reconcile such configurations separately;
+never loosen authority or change providers to make the diagnostic pass.
+
+Activation is a separate operator-approved configuration change. Use
+`hermes -p <approved-profile> config set kanban.worker_preflight.enabled true`
+only after checking that profile's actual tool/catalog compatibility. Roll back
+admission with the same command and `false`. Code installation, service restart,
+live activation and post-release verification are distinct operations.
+
 ## Core concepts
 
 - **Board** — a standalone queue of tasks with its own SQLite DB, workspaces
