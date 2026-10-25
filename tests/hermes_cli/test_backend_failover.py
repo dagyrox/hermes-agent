@@ -9,6 +9,16 @@ def _chain(*legs):
     return {"enabled": True, "max_attempts_per_leg": 1, "roles": {"talos": list(legs)}}
 
 
+def test_gateway_owner_bridge_requires_independent_explicit_gate():
+    from hermes_cli.backend_failover import gateway_owner_bridge_enabled
+
+    assert gateway_owner_bridge_enabled({"enabled": True}) is False
+    assert gateway_owner_bridge_enabled({"gateway_owner_bridge": True}) is False
+    assert gateway_owner_bridge_enabled(
+        {"enabled": True, "gateway_owner_bridge": True}
+    ) is True
+
+
 def test_canonical_chain_requires_exactly_three_legs_and_flash_final():
     from hermes_cli.backend_failover import ConfigError, resolve_role_chain
 
