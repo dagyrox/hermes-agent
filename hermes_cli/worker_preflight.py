@@ -92,7 +92,7 @@ def sanitize_outcome(payload: object) -> dict:
         # Input is already a hostname; never retain a URL's path/userinfo.
         if urlsplit("//" + host).hostname == host.lower():
             safe["base_url_host"] = host.lower()
-    for key in ("toolsets", "missing"):
+    for key in ("toolsets", "missing", "waived"):
         value = raw.get(key)
         if (
             isinstance(value, list)
@@ -125,12 +125,13 @@ def dispatch_admission(profile_home: str | None) -> dict | None:
     if not profile_home:
         return None
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-    from hermes_cli.config import load_config
+    from hermes_cli.config import read_raw_config
 
     token = set_hermes_home_override(profile_home)
     try:
         try:
-            raw = (load_config().get("kanban") or {}).get("worker_preflight", {})
+            # Merged defaults inject required_tools, losing explicit conflicts.
+            raw = (read_raw_config().get("kanban") or {}).get("worker_preflight", {})
         except Exception:
             # Legacy profiles with unreadable config have not opted in.
             return None
@@ -146,9 +147,14 @@ def dispatch_admission(profile_home: str | None) -> dict | None:
         "native_timeout_seconds",
         "max_output_tokens",
         "required_tools",
+        "role_contract",
     }:
         raise WorkerPreflightBlocked("config_invalid")
-    settings = {"enabled": True}
+    settings: dict = {"enabled": True}
+    if "role_contract" in raw:
+        if raw["role_contract"] != "reviewer" or "required_tools" in raw:
+            raise WorkerPreflightBlocked("config_invalid")
+        settings["role_contract"] = "reviewer"
     for key, ceiling in (
         ("timeout_seconds", 15),
         ("native_timeout_seconds", 45),
@@ -231,11 +237,13 @@ def _check_tools(args, settings: dict) -> None:
     _check_operations(available)
 
 
-def _check_operations(available) -> None:
+def _check_operations(available, *, reviewer=False) -> None:
     from tools.registry import registry
+    from hermes_cli.backend_failover_worker import _LIFECYCLE_TOOLS
 
     missing = []
-    for name in ("kanban_complete", "kanban_block", "kanban_heartbeat"):
+    required = _LIFECYCLE_TOOLS if reviewer else ("kanban_complete", "kanban_block", "kanban_heartbeat")
+    for name in required:
         entry = registry.get_entry(name)
         if name not in available or entry is None or not callable(entry.handler):
             missing.append(name)
@@ -245,23 +253,33 @@ def _check_operations(available) -> None:
         )
 
 
-def _check_native_tools(primary, args, settings):
+def _check_native_tools(primary, args, settings, *, reviewer=False):
     from importlib.util import find_spec
-    from hermes_cli.backend_failover_worker import _claude_bridged_tool_names
+    from hermes_cli.backend_failover_worker import (
+        _claude_bridged_tool_names, _REVIEWER_REQUIRED_TOOLS,
+        _resolved_required_tool_schemas,
+    )
 
     supported = _claude_bridged_tool_names(primary)
-    missing = sorted(set(settings["required_tools"]) - supported)
+    required = _REVIEWER_REQUIRED_TOOLS if reviewer else settings["required_tools"]
+    missing = sorted(set(required) - supported)
     if missing:
         raise WorkerPreflightBlocked("tool_unavailable", stage="tools", missing=missing)
-    _check_operations(supported)
+    if reviewer:
+        available, _ = _resolved_required_tool_schemas(args.required_toolset)
+        if available is None:
+            raise WorkerPreflightBlocked("capability_mismatch", stage="tools", missing=["tool_schema_evidence"])
+        _check_operations(available, reviewer=True)
+    else:
+        _check_operations(supported)
     if find_spec("agent.transports.hermes_tools_mcp_server") is None:
         raise WorkerPreflightBlocked("operation_unavailable", stage="operations")
 
 
-def _check_primary_capability(primary, args):
+def _check_primary_capability(primary, args, *, reviewer=False):
     from hermes_cli.backend_failover_worker import _capability_mismatches
 
-    mismatches = _capability_mismatches(primary, args)
+    mismatches = _capability_mismatches(primary, args, reviewer=reviewer)
     tools = [name[5:] for name in mismatches if name.startswith("tool:")]
     if tools:
         raise WorkerPreflightBlocked("tool_unavailable", stage="tools", missing=tools)
@@ -380,11 +398,11 @@ def bounded_probe(
         return {"stage": "probe", "code": "probe_failed", "outcome": "failed"}
 
 
-def run_supervisor_preflight(args, primary, profile_home: Path) -> None:
+def run_supervisor_preflight(args, primary, profile_home: Path) -> dict | None:
     """Admit the frozen primary before ledger, MCP, memory or task context."""
     from types import SimpleNamespace
 
-    run_worker_preflight(
+    return run_worker_preflight(
         SimpleNamespace(
             toolsets=",".join(args.required_toolset),
             provider=primary.provider,
@@ -395,7 +413,7 @@ def run_supervisor_preflight(args, primary, profile_home: Path) -> None:
     )
 
 
-def run_worker_preflight(args, *, primary=None) -> None:
+def run_worker_preflight(args, *, primary=None) -> dict | None:
     """Run before CLI/context construction; failed admission never retries."""
     if (
         not os.environ.get("HERMES_KANBAN_TASK")
@@ -412,6 +430,8 @@ def run_worker_preflight(args, *, primary=None) -> None:
     task_id = os.environ["HERMES_KANBAN_TASK"]
     profile = os.environ.get("HERMES_PROFILE", "")
     started = time.monotonic()
+    waived = None
+    settings = None
     try:
         with kb.connect_closing() as conn:
             row = conn.execute(
@@ -451,10 +471,18 @@ def run_worker_preflight(args, *, primary=None) -> None:
         ):
             raise WorkerPreflightBlocked("workspace_invalid", stage="workspace")
         native_claude = primary is not None and primary.kind == "claude_code"
+        reviewer = False
         if primary is not None:
-            _check_primary_capability(primary, args.supervisor_args)
+            from hermes_cli.backend_failover_worker import (
+                _reviewer_contract_applies, _reviewer_waived_tools,
+            )
+
+            reviewer = _reviewer_contract_applies(primary, args.supervisor_args, settings=settings)
+            _check_primary_capability(primary, args.supervisor_args, reviewer=reviewer)
+            if reviewer:
+                waived = list(_reviewer_waived_tools(primary, args.supervisor_args))
         if native_claude:
-            _check_native_tools(primary, args.supervisor_args, settings)
+            _check_native_tools(primary, args.supervisor_args, settings, reviewer=reviewer)
         else:
             _check_tools(args, settings)
         command = [
@@ -481,13 +509,27 @@ def run_worker_preflight(args, *, primary=None) -> None:
                 primary, args.supervisor_args, dict(os.environ), None, None
             )
         if native_claude:
+            from hermes_cli.backend_failover_worker import _mcp_config
+
             command.append("--native-claude")
-            scratch = get_hermes_home() / "cache" / "scratch"
-            scratch.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix="preflight-", dir=scratch) as cwd:
-                result = bounded_probe(
-                    command, cwd=cwd, timeout=settings["native_timeout_seconds"] + 2
-                )
+            mcp_path = None
+            try:
+                if reviewer:
+                    mcp_path = _mcp_config(get_hermes_home(), task_id, profile)
+                    command.extend(["--reviewer-contract", "--mcp-config", str(mcp_path)])
+                    for name in args.supervisor_args.required_toolset:
+                        command.extend(["--required-toolset", name])
+                    if getattr(args.supervisor_args, "skill", ()):
+                        command.append("--requires-skill")
+                scratch = get_hermes_home() / "cache" / "scratch"
+                scratch.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix="preflight-", dir=scratch) as cwd:
+                    result = bounded_probe(
+                        command, cwd=cwd, timeout=settings["native_timeout_seconds"] + 2
+                    )
+            finally:
+                if mcp_path is not None:
+                    mcp_path.unlink(missing_ok=True)
         else:
             result = bounded_probe(
                 command,
@@ -502,6 +544,7 @@ def run_worker_preflight(args, *, primary=None) -> None:
         result = {"stage": "probe", "code": "probe_failed", "outcome": "failed"}
     result = sanitize_outcome({
         **result,
+        **({"waived": waived} if waived is not None else {}),
         "profile": profile,
         "route": "supervisor" if primary is not None else "direct",
         "elapsed_ms": int((time.monotonic() - started) * 1000),
@@ -523,6 +566,7 @@ def run_worker_preflight(args, *, primary=None) -> None:
     if not recorded or not passed:
         raise SystemExit(2)
     os.environ.pop("HERMES_KANBAN_PREFLIGHT", None)
+    return settings
 
 
 def _probe(args) -> dict:
@@ -700,6 +744,50 @@ def _codex_probe(runtime: dict, model: str, key: str, timeout: float) -> dict:
     return {"code": "probe_failed", "outcome": "failed"}
 
 
+def _reviewer_init_failure(events: list[dict], args) -> dict | None:
+    """Validate actual native init evidence, not a claimed bridge allowlist."""
+    from hermes_cli.backend_failover import BackendLeg
+    from hermes_cli.backend_failover_worker import (
+        _claude_tool_limits, _LIFECYCLE_TOOLS, _PROFILE_TOOLS,
+    )
+
+    inits = [e for e in events if e.get("type") == "system" and e.get("subtype") == "init"]
+    if len(inits) != 1:
+        return {"stage": "operations", "code": "operation_unavailable"}
+    servers = inits[0].get("mcp_servers")
+    if not isinstance(servers, list) or not any(
+        isinstance(s, dict) and s.get("name") == "hermes-tools" and s.get("status") == "connected"
+        for s in servers
+    ):
+        return {"stage": "operations", "code": "operation_unavailable"}
+    tools = inits[0].get("tools")
+    if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+        return {"stage": "tools", "code": "tool_unavailable"}
+    names = set(tools)
+    missing = [n for n in _LIFECYCLE_TOOLS if f"mcp__hermes-tools__{n}" not in names]
+    if missing:
+        return {"stage": "operations", "code": "operation_unavailable", "missing": missing}
+    missing = []
+    if "Read" not in names:
+        missing.append("read_file")
+    if not {"Glob", "Grep"} <= names:
+        missing.append("search_files")
+    if getattr(args, "requires_skill", False) and "mcp__hermes-tools__skill_view" not in names:
+        missing.append("skill_view")
+    if missing:
+        return {"stage": "tools", "code": "tool_unavailable", "missing": missing}
+    leg = BackendLeg("claude_code", args.model, capability_mode="read_only")
+    builtins, _ = _claude_tool_limits(leg, args)
+    allowed = set(builtins) | {
+        f"mcp__hermes-tools__{n}" for n in (*_LIFECYCLE_TOOLS, *_PROFILE_TOOLS)
+    }
+    if names - allowed or len(names) != len(tools):
+        return {"stage": "tools", "code": "capability_mismatch"}
+    if any(e.get("permission_denials") for e in events):
+        return {"stage": "operations", "code": "operation_unavailable"}
+    return None
+
+
 def _native_claude_probe(args) -> dict:
     """Use native subscription auth, never the Anthropic HTTP API."""
     import shutil
@@ -766,6 +854,24 @@ def _native_claude_probe(args) -> dict:
         "--",
         "Reply with OK.",
     ]
+    reviewer = getattr(args, "reviewer_contract", False)
+    if reviewer:
+        from hermes_cli.backend_failover import BackendLeg
+        from hermes_cli.backend_failover_worker import _claude_tool_limits
+
+        if not getattr(args, "mcp_config", None):
+            return {**result, "stage": "operations", "code": "operation_unavailable"}
+        builtins, _ = _claude_tool_limits(
+            BackendLeg("claude_code", args.model, capability_mode="read_only"), args
+        )
+        command = [
+            "claude", "-p", "--model", args.model, "--max-turns", "1",
+            "--no-session-persistence", "--setting-sources", "",
+            "--restricted", "--strict-mcp-config", "--mcp-config", args.mcp_config,
+            "--tools", ",".join(builtins), "--permission-mode", "dontAsk",
+            "--permission-prompts", "none", "--output-format", "stream-json",
+            "--verbose", "--", "Reply with OK.",
+        ]
     result.update(stage="probe", code="probe_failed")
     rc, output, failure = _capture_bounded(
         command,
@@ -794,6 +900,10 @@ def _native_claude_probe(args) -> dict:
             ):
                 return {**result, "code": "probe_transient"}
         results = [event for event in events if event.get("type") == "result"]
+        if reviewer:
+            failure = _reviewer_init_failure(events, args)
+            if failure:
+                return {**result, **failure}
         if (
             rc == 0
             and len(results) == 1
@@ -842,6 +952,10 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--native-timeout", type=int, default=45)
     parser.add_argument("--native-claude", action="store_true")
+    parser.add_argument("--reviewer-contract", action="store_true")
+    parser.add_argument("--mcp-config")
+    parser.add_argument("--required-toolset", action="append", default=[])
+    parser.add_argument("--requires-skill", action="store_true")
     args = parser.parse_args()
     args.timeout = max(1, min(15, args.timeout))
     args.native_timeout = max(1, min(45, args.native_timeout))

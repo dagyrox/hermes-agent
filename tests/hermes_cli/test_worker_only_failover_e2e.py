@@ -201,7 +201,7 @@ def _run_synthetic_supervisor(tmp_path, monkeypatch, *, complete_on_claude: bool
     assert supervisor_argv is not None
     module_index = supervisor_argv.index("hermes_cli.backend_failover_worker")
 
-    monkeypatch.setattr(worker, "_capability_mismatches", lambda *_args: ())
+    monkeypatch.setattr(worker, "_capability_mismatches", lambda *_args, **_kwargs: ())
     monkeypatch.setattr(worker, "_leg_available", lambda *_args: True)
     monkeypatch.setattr(worker, "_resolve_hermes_argv", lambda: [str(fixture)])
 
@@ -298,7 +298,7 @@ def test_restart_with_started_ledger_denies_duplicate_action(tmp_path, monkeypat
     from hermes_cli.backend_failover import EXIT_AMBIGUOUS
 
     kb, profile, workspace, db_path, task = _claimed_board(tmp_path, monkeypatch)
-    monkeypatch.setattr(worker, "_capability_mismatches", lambda *_args: ())
+    monkeypatch.setattr(worker, "_capability_mismatches", lambda *_args, **_kwargs: ())
     ledger = worker._ledger_path(task.id)
     assert ledger is not None
     worker._write_ledger(ledger, {

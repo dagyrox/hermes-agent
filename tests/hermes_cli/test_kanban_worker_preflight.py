@@ -298,6 +298,95 @@ def test_native_budget_is_clamped_separately_from_http(tmp_path):
     assert settings["max_output_tokens"] == 16
 
 
+@pytest.mark.parametrize("role,extra,valid", [
+    ("reviewer", {}, True),
+    ("builder", {}, False),
+    (None, {}, False),
+    ("reviewer", {"required_tools": ["terminal"]}, False),
+])
+def test_reviewer_role_config_is_explicit_and_code_owned(tmp_path, role, extra, valid):
+    import yaml
+    from hermes_cli.worker_preflight import WorkerPreflightBlocked, dispatch_admission
+
+    config = {"enabled": True, "role_contract": role, **extra}
+    tmp_path.joinpath("config.yaml").write_text(
+        yaml.safe_dump({"kanban": {"worker_preflight": config}})
+    )
+    if not valid:
+        with pytest.raises(WorkerPreflightBlocked) as caught:
+            dispatch_admission(str(tmp_path))
+        assert caught.value.payload["code"] == "config_invalid"
+    else:
+        settings = dispatch_admission(str(tmp_path))
+        assert settings["role_contract"] == "reviewer"
+        assert settings["required_tools"] == ["terminal"]
+
+
+def test_generic_preflight_settings_remain_unchanged(tmp_path):
+    from hermes_cli.worker_preflight import dispatch_admission
+
+    tmp_path.joinpath("config.yaml").write_text(
+        "kanban:\n  worker_preflight:\n    enabled: true\n"
+    )
+    assert dispatch_admission(str(tmp_path)) == {
+        "enabled": True, "timeout_seconds": 15, "native_timeout_seconds": 45,
+        "max_output_tokens": 16, "required_tools": ["terminal"],
+    }
+
+
+@pytest.mark.parametrize("name", [
+    "kanban_show", "kanban_comment", "kanban_heartbeat", "kanban_complete", "kanban_block",
+])
+def test_reviewer_requires_every_lifecycle_handler(monkeypatch, name):
+    from hermes_cli.backend_failover_worker import _LIFECYCLE_TOOLS
+    from hermes_cli.worker_preflight import WorkerPreflightBlocked, _check_operations
+    from tools.registry import registry
+    import model_tools
+
+    model_tools.get_tool_definitions(enabled_toolsets=["kanban"], quiet_mode=True)
+    entry = registry.get_entry(name)
+    assert entry is not None
+    monkeypatch.setattr(entry, "handler", None)
+    with pytest.raises(WorkerPreflightBlocked) as caught:
+        _check_operations(set(_LIFECYCLE_TOOLS), reviewer=True)
+    assert caught.value.payload["missing"] == [name]
+
+
+@pytest.mark.parametrize("scenario,code", [
+    ("healthy", None), ("no-init", "operation_unavailable"),
+    ("duplicate-init", "operation_unavailable"), ("no-tools", "tool_unavailable"),
+    ("no-Read", "tool_unavailable"), ("no-Glob", "tool_unavailable"),
+    ("no-Grep", "tool_unavailable"), ("extra", "capability_mismatch"),
+    ("denial", "operation_unavailable"), ("web-not-pinned", "capability_mismatch"),
+])
+def test_synthetic_reviewer_init_evidence_is_fail_closed(scenario, code):
+    from types import SimpleNamespace
+    from hermes_cli.backend_failover_worker import _LIFECYCLE_TOOLS
+    from hermes_cli.worker_preflight import _reviewer_init_failure
+
+    # Synthetic native event fixture; not installed-vendor acceptance evidence.
+    tools = ["Read", "Glob", "Grep"] + [f"mcp__hermes-tools__{n}" for n in _LIFECYCLE_TOOLS]
+    init = {"type": "system", "subtype": "init", "tools": tools,
+            "mcp_servers": [{"name": "hermes-tools", "status": "connected"}]}
+    events = [init]
+    if scenario == "no-init":
+        events = []
+    elif scenario == "duplicate-init":
+        events.append(dict(init))
+    elif scenario == "no-tools":
+        init.pop("tools")
+    elif scenario.startswith("no-"):
+        tools.remove(scenario[3:])
+    elif scenario == "extra":
+        tools.append("Bash")
+    elif scenario == "web-not-pinned":
+        tools.append("WebFetch")
+    elif scenario == "denial":
+        events.append({"permission_denials": [{"tool_name": "Read"}]})
+    failure = _reviewer_init_failure(events, SimpleNamespace(model="claude-opus-5-5"))
+    assert (failure["code"] if failure else None) == code
+
+
 def test_outer_probe_rejects_output_flood_without_retaining_it(tmp_path):
     import sys
     from hermes_cli.worker_preflight import bounded_probe
