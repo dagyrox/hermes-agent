@@ -61,6 +61,9 @@ _LIFECYCLE_TOOLS = (
     "kanban_complete",
     "kanban_block",
 )
+_REVIEWER_CONTRACT_ROLES = frozenset({"athena"})
+_REVIEWER_REQUIRED_TOOLS = ("read_file", "search_files", *_LIFECYCLE_TOOLS)
+_REVIEWER_NATIVE_BUILTINS = ("Read", "Glob", "Grep")
 _PROFILE_TOOLS = ("skills_list", "skill_view")
 _ORCHESTRATOR_TOOLS = ("kanban_list", "kanban_create", "kanban_link")
 _CLAUDE_CONTEXT_CHAR_LIMIT = 600_000
@@ -446,7 +449,44 @@ def _claude_bridged_tool_names(leg: BackendLeg) -> set[str]:
     return names
 
 
-def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[str, ...]:
+def _reviewer_contract_applies(
+    leg: BackendLeg, args: argparse.Namespace, *, index: int = 0,
+    settings: dict | None = None,
+) -> bool:
+    """Use the passed admission snapshot, never re-read mutable profile config."""
+    opted_in = (
+        settings.get("role_contract") == "reviewer"
+        if settings is not None else getattr(args, "reviewer_contract", False) is True
+    )
+    return bool(
+        opted_in and getattr(args, "profile", None) in _REVIEWER_CONTRACT_ROLES
+        and index == 0 and leg.kind == "claude_code"
+        and leg.access_mode == "subscription" and leg.capability_mode == "read_only"
+    )
+
+
+def _reviewer_waived_tools(
+    leg: BackendLeg, args: argparse.Namespace, *, resolved: set[str] | None = None,
+) -> tuple[str, ...]:
+    """Audit the full real schema delta; never filter the resolved definitions."""
+    if resolved is None:
+        resolved, _ = _resolved_required_tool_schemas(
+            list(getattr(args, "required_toolset", ()) or ())
+        )
+    if resolved is None:
+        raise ValueError("tool_schema_evidence")
+    waived = resolved - _claude_bridged_tool_names(leg)
+    if (
+        len(waived) > 64 or waived.intersection(_LIFECYCLE_TOOLS)
+        or any(re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) is None for name in waived)
+    ):
+        raise ValueError("reviewer_waiver_evidence")
+    return tuple(sorted(waived))
+
+
+def _capability_mismatches(
+    leg: BackendLeg, args: argparse.Namespace, *, reviewer: bool = False,
+) -> tuple[str, ...]:
     """Compare this task's effective tool/context contract to one route leg."""
     required_toolsets = [
         str(name) for name in (getattr(args, "required_toolset", ()) or ())
@@ -454,6 +494,16 @@ def _capability_mismatches(leg: BackendLeg, args: argparse.Namespace) -> tuple[s
     required_tools, _schema_chars = _resolved_required_tool_schemas(required_toolsets)
     if required_tools is None:
         return ("tool_schema_evidence",)
+    if reviewer:
+        # Callers bind reviewer to the primary/profile and a passed preflight.
+        try:
+            _reviewer_waived_tools(leg, args, resolved=required_tools)
+        except ValueError as exc:
+            return (str(exc),)
+        missing_requirements = set(_REVIEWER_REQUIRED_TOOLS) - required_tools
+        if missing_requirements:
+            return tuple(sorted(f"tool:{name}" for name in missing_requirements))
+        required_tools = set(_REVIEWER_REQUIRED_TOOLS)
     if leg.kind == "api":
         from agent.models_dev import get_model_capabilities
 
@@ -622,6 +672,21 @@ def _run_child(
     return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
 
 
+def _claude_tool_limits(leg: BackendLeg, args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    """Shared worker/probe derivation; this does not grant any new tools."""
+    builtins: list[str] = list(_REVIEWER_NATIVE_BUILTINS)
+    if "web" in set(getattr(args, "required_toolset", ()) or ()):
+        builtins.extend(["WebFetch", "WebSearch"])
+    if leg.capability_mode == "full":
+        builtins.extend(["Edit", "Write", "Bash"])
+    allowed = list(builtins)
+    allowed.extend(f"mcp__hermes-tools__{name}" for name in _LIFECYCLE_TOOLS)
+    allowed.extend(f"mcp__hermes-tools__{name}" for name in _PROFILE_TOOLS)
+    if leg.capability_mode == "orchestrator":
+        allowed.extend(f"mcp__hermes-tools__{name}" for name in _ORCHESTRATOR_TOOLS)
+    return builtins, allowed
+
+
 def _leg_command(
     leg: BackendLeg,
     args: argparse.Namespace,
@@ -666,24 +731,7 @@ def _leg_command(
 
     if mcp_path is None or system_prompt_path is None:
         raise RuntimeError("Claude Code leg requires MCP and system prompt files")
-    builtins = ["Read", "Glob", "Grep"]
-    if "web" in set(getattr(args, "required_toolset", ()) or ()):
-        builtins.extend(["WebFetch", "WebSearch"])
-    if leg.capability_mode == "full":
-        # Claude's restricted sandbox confines file and shell execution to the
-        # assigned workspace. The child environment omits Kanban identity and
-        # credentials; lifecycle mutation remains available only through the
-        # task-fenced MCP server.
-        builtins.extend(["Edit", "Write", "Bash"])
-    allowed = ["Read", "Glob", "Grep"]
-    if "web" in set(getattr(args, "required_toolset", ()) or ()):
-        allowed.extend(["WebFetch", "WebSearch"])
-    if leg.capability_mode == "full":
-        allowed.extend(["Edit", "Write", "Bash"])
-    allowed.extend(f"mcp__hermes-tools__{name}" for name in _LIFECYCLE_TOOLS)
-    allowed.extend(f"mcp__hermes-tools__{name}" for name in _PROFILE_TOOLS)
-    if leg.capability_mode == "orchestrator":
-        allowed.extend(f"mcp__hermes-tools__{name}" for name in _ORCHESTRATOR_TOOLS)
+    builtins, allowed = _claude_tool_limits(leg, args)
     command = [
         "claude",
         "-p",
@@ -926,7 +974,8 @@ def _run_leg(
     system_prompt_path: Path | None,
     timeout_seconds: int | None = None,
 ) -> int:
-    mismatches = _capability_mismatches(leg, args)
+    reviewer = _reviewer_contract_applies(leg, args, index=index)
+    mismatches = _capability_mismatches(leg, args, reviewer=reviewer)
     if mismatches:
         if not _comment(
             args.task,
@@ -946,6 +995,17 @@ def _run_leg(
             _comment(args.task, "Explicit API primary unavailable: configure a separate root vendor API key; funding/server usability unverified. No automatic mode change.")
             return 1
         return EXIT_ELIGIBLE
+    if reviewer:
+        try:
+            waived = _reviewer_waived_tools(leg, args)
+        except ValueError:
+            return EXIT_AMBIGUOUS
+        if not _comment(
+            args.task,
+            "Reviewer contract (athena/read_only): Read/Glob/Grep + 5 task-fenced "
+            "lifecycle tools; not provided on this leg: " + (", ".join(waived) or "none"),
+        ):
+            return 0
     if not _comment(
         args.task,
         f"Backend route attempt {index + 1}/3: kind={leg.kind}, "
@@ -1003,9 +1063,12 @@ def run(argv: list[str] | None = None) -> int:
     from hermes_cli.worker_preflight import run_supervisor_preflight
 
     try:
-        run_supervisor_preflight(args, legs[0], profile_home)
+        passed_settings = run_supervisor_preflight(args, legs[0], profile_home)
     except SystemExit as exc:
         return int(exc.code or 0)
+    args.reviewer_contract = bool(
+        passed_settings and passed_settings.get("role_contract") == "reviewer"
+    )
 
     ledger_path = _ledger_path(args.task)
     try:

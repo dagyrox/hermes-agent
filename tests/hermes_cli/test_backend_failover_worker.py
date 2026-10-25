@@ -290,6 +290,46 @@ def test_task_specific_capability_gate_rejects_oversized_context():
     ) == ("context_window",)
 
 
+def test_reviewer_contract_uses_real_unfiltered_profile_schemas(monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_reviewer_fixture")
+    args = argparse.Namespace(
+        profile="athena", required_toolset=["hermes-cli"],
+        required_context_chars=1000,
+    )
+    leg = _leg(kind="claude_code", provider=None, capability_mode="read_only")
+    resolved, _ = worker._resolved_required_tool_schemas(args.required_toolset)
+    assert resolved is not None
+    assert {"terminal", "write_file", "patch", *worker._LIFECYCLE_TOOLS} <= resolved
+    assert worker._capability_mismatches(leg, args, reviewer=True) == ()
+    waived = worker._reviewer_waived_tools(leg, args)
+    assert {"terminal", "write_file", "patch", "kanban_create", "kanban_link",
+            "kanban_attach", "kanban_attach_url", "kanban_attachments"} <= set(waived)
+    assert not set(worker._LIFECYCLE_TOOLS).intersection(waived)
+    assert worker._capability_mismatches(leg, args) == tuple(
+        sorted("tool:" + name for name in waived)
+    )
+
+
+@pytest.mark.parametrize("profile,kind,mode,access,index,passed,applies", [
+    ("athena", "claude_code", "read_only", "subscription", 0, True, True),
+    ("athena", "claude_code", "read_only", "subscription", 0, False, False),
+    ("talos", "claude_code", "read_only", "subscription", 0, True, False),
+    ("athena", "claude_code", "full", "subscription", 0, True, False),
+    ("athena", "claude_code", "read_only", "subscription", 1, True, False),
+    ("athena", "api", "read_only", "api", 0, True, False),
+])
+def test_reviewer_contract_is_primary_role_and_pass_bound(
+    profile, kind, mode, access, index, passed, applies
+):
+    from hermes_cli import backend_failover_worker as worker
+
+    leg = _leg(kind=kind, model="fixture", capability_mode=mode, access_mode=access)
+    args = argparse.Namespace(profile=profile, reviewer_contract=passed)
+    assert worker._reviewer_contract_applies(leg, args, index=index) is applies
+
+
 def test_api_capability_gate_uses_model_evidence_for_context_and_images(monkeypatch):
     from hermes_cli import backend_failover_worker as worker
 
@@ -1116,3 +1156,53 @@ def test_dispatcher_selects_supervisor_only_for_enabled_role(monkeypatch):
     assert kb._backend_failover_worker_argv(
         task, "athena", "/dispatcher", "/profiles/athena"
     ) is None
+
+
+@pytest.mark.parametrize("snapshot,expected", [
+    (None, False), ({"enabled": True}, False),
+    ({"enabled": True, "role_contract": "reviewer"}, True),
+])
+def test_supervisor_uses_only_returned_preflight_snapshot(monkeypatch, tmp_path, snapshot, expected):
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import worker_preflight as preflight
+
+    primary = _leg(kind="claude_code", provider=None, capability_mode="read_only")
+    monkeypatch.setattr(worker, "_validate_dispatch_context", lambda args: tmp_path)
+    monkeypatch.setattr(worker, "_load_chain", lambda profile: (primary, _leg(), _leg()))
+    monkeypatch.setattr(preflight, "run_supervisor_preflight", lambda *a: snapshot)
+    monkeypatch.setattr(preflight, "dispatch_admission", lambda *a: pytest.fail("config re-read after admission"))
+    monkeypatch.setattr(worker, "_ledger_path", lambda task: None)
+    monkeypatch.setattr(worker, "_mcp_config", lambda *a: tmp_path / "mcp")
+    monkeypatch.setattr(worker, "_system_prompt", lambda *a: tmp_path / "system")
+    monkeypatch.setattr(worker, "_effective_context_chars", lambda *a, **kw: 0)
+    monkeypatch.setattr(worker, "_task_status", lambda task: "done")
+    seen = []
+
+    def leg(leg, index, args, *rest):
+        seen.append(worker._reviewer_contract_applies(leg, args, index=index))
+        return 0
+
+    monkeypatch.setattr(worker, "_run_leg", leg)
+    assert worker.run(["--profile", "athena", "--task", "t_fixture", "--timeout-seconds", "60"]) == 0
+    assert seen == [expected]
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("schema-failed", "tool_schema_evidence"),
+    ("waiver-overflow", "reviewer_waiver_evidence"),
+    ("lifecycle-waived", "reviewer_waiver_evidence"),
+])
+def test_reviewer_never_hides_unprovable_waivers(monkeypatch, scenario, expected):
+    from hermes_cli import backend_failover_worker as worker
+
+    leg = _leg(kind="claude_code", provider=None, capability_mode="read_only")
+    names = set(worker._REVIEWER_REQUIRED_TOOLS)
+    if scenario == "schema-failed":
+        names = None
+    elif scenario == "waiver-overflow":
+        names.update(f"extra_{n}" for n in range(65))
+    else:
+        supported = worker._claude_bridged_tool_names(leg) - {"kanban_show"}
+        monkeypatch.setattr(worker, "_claude_bridged_tool_names", lambda leg: supported)
+    monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda pins: (names, 0))
+    assert worker._capability_mismatches(leg, argparse.Namespace(), reviewer=True) == (expected,)

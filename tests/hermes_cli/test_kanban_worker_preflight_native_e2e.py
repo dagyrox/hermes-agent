@@ -135,21 +135,6 @@ provider_access.native_home = lambda: Path(os.environ["HOME"])
 from hermes_cli import auth
 auth.DEFAULT_CODEX_BASE_URL = Path(os.environ["HOME"]).joinpath("codex-url").read_text()
 
-if (Path(os.environ["HOME"]) / "synthetic-athena-schemas").exists() and os.environ.get("HERMES_PROFILE") == "athena":
-    import json
-    import model_tools
-    from hermes_cli.backend_failover import BackendLeg
-    from hermes_cli.backend_failover_worker import _claude_bridged_tool_names
-    original_definitions = model_tools.get_tool_definitions
-    supported = _claude_bridged_tool_names(BackendLeg("claude_code", "claude-opus-5-5", capability_mode="read_only"))
-    def synthetic_schemas(*args, **kwargs):
-        definitions = original_definitions(*args, **kwargs)
-        filtered = [d for d in definitions if d["function"]["name"] in supported]
-        removed = sorted(d["function"]["name"] for d in definitions if d not in filtered)
-        assert all(d in definitions and d["function"]["name"] in supported for d in filtered)
-        Path(os.environ["HOME"]).joinpath("removed-schemas.json").write_text(json.dumps(removed))
-        return filtered
-    model_tools.get_tool_definitions = synthetic_schemas
 _original = socket.socket.connect
 def local_only(sock, address):
     if isinstance(address, tuple) and address[0] not in ("127.0.0.1", "::1", "localhost"):
@@ -295,16 +280,17 @@ with (home / 'claude-calls.jsonl').open('a') as f:
     f.write(json.dumps(dict(argv=sys.argv[1:], cwd=os.getcwd(), env_names=sorted(os.environ), probe=probe, pid=os.getpid())) + '\\n')
 scenario = (home / 'claude-scenario').read_text() if (home / 'claude-scenario').exists() else 'healthy'
 if probe:
-    assert '--safe-mode' in sys.argv and '--bare' not in sys.argv
+    assert '--restricted' in sys.argv and '--allowedTools' not in sys.argv
+    assert '--bare' not in sys.argv
     if scenario == 'flood':
         print('SECRET_RESPONSE' * 6000); raise SystemExit(0)
     if scenario == 'timeout': time.sleep(60)
     if scenario == 'reject':
         print(json.dumps(dict(type='result', subtype='error', is_error=True, error='authentication_error', api_error_status=401, message='SECRET_RESPONSE'))); raise SystemExit(1)
-    print(json.dumps(dict(type='result', subtype='success', is_error=False, result='OK'))); raise SystemExit(0)
 assert '--restricted' in sys.argv and '--strict-mcp-config' in sys.argv
-assert sys.argv[sys.argv.index('--tools') + 1] == 'Read,Glob,Grep'
-subprocess.run(['git', 'rev-parse', '--show-toplevel'], stdout=open('preflight_proof.txt', 'w'), check=True)
+builtins = sys.argv[sys.argv.index('--tools') + 1].split(',')
+assert builtins == ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']
+assert not {{'Bash', 'Write', 'Edit'}}.intersection(builtins)
 server = json.loads(pathlib.Path(sys.argv[sys.argv.index('--mcp-config') + 1]).read_text())['mcpServers']['hermes-tools']
 # Real MCP stdio transport and fenced production lifecycle, not a fake completion.
 from mcp import ClientSession, StdioServerParameters
@@ -315,8 +301,21 @@ async def complete():
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            if probe:
+                listed = await session.list_tools()
+                tools = builtins + ['mcp__hermes-tools__' + t.name for t in listed.tools]
+                if scenario == 'missing-grep': tools.remove('Grep')
+                if scenario == 'extra-bash': tools.append('Bash')
+                if scenario == 'missing-lifecycle': tools.remove('mcp__hermes-tools__kanban_show')
+                if scenario == 'missing-skill': tools.remove('mcp__hermes-tools__skill_view')
+                connected = 'failed' if scenario == 'disconnected' else 'connected'
+                print(json.dumps(dict(type='system', subtype='init', tools=tools, mcp_servers=[dict(name='hermes-tools', status=connected)])))
+                return
             shown = await session.call_tool('kanban_show', {{}})
             assert not shown.isError
+            canary = pathlib.Path('review-canary.txt').read_text()
+            assert canary == '{CANARIES[0]}'
+            pathlib.Path('preflight_proof.txt').write_text(canary)
             result = await session.call_tool('kanban_complete', {{'summary': 'native fixture verified'}})
             assert not result.isError
 asyncio.run(complete())
@@ -339,28 +338,27 @@ print(json.dumps(dict(type='result', subtype='success', is_error=False)))
     tasks = []
 
     def launch(
-        profile="talos", *, direct=False, required_tools=None, toolsets=None, timeout=45
+        profile="talos", *, direct=False, required_tools=None, toolsets=None, timeout=45,
+        reviewer=True, enabled=True,
     ):
         # The auth seatbelt compares HOME/.hermes to "real" home under pytest.
         # Only these subprocesses use the wholly disposable HOME and auth store.
         monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-        if profile == "athena" and toolsets is None:
-            tmp_path.joinpath("synthetic-athena-schemas").touch()
+        workspace.joinpath("review-canary.txt").write_text(CANARIES[0])
+        preflight = {"enabled": enabled, "native_timeout_seconds": timeout}
+        if profile == "athena" and reviewer:
+            preflight["role_contract"] = "reviewer"
+        else:
+            preflight["required_tools"] = required_tools if required_tools is not None else ["terminal"]
         config = {
             "model": {"provider": "openai-codex", "default": "gpt-6.1-sol"},
             "kanban": {
-                "worker_preflight": {
-                    "enabled": True,
-                    "native_timeout_seconds": timeout,
-                    "required_tools": required_tools
-                    if required_tools is not None
-                    else (["kanban_show"] if profile == "athena" else ["terminal"]),
-                }
+                "worker_preflight": preflight,
             },
             "platform_toolsets": {
                 "cli": toolsets
                 if toolsets is not None
-                else (["kanban"] if profile == "athena" else ["terminal", "kanban"])
+                else (["hermes-cli"] if profile == "athena" else ["terminal", "kanban"])
             },
             "curator": {"enabled": False},
             "memory": {"provider": "none"},
@@ -473,13 +471,11 @@ def test_claude_primary_rejection_before_context(native_protocol):
     assert not f["requests"]
 
 
-def test_synthetic_schema_healthy_claude_uses_real_mcp_lifecycle(native_protocol):
+def test_synthetic_reviewer_uses_unfiltered_schemas_and_real_mcp(native_protocol):
     f = native_protocol
     task, events = f["launch"]("athena")
     assert task.status == "done", f["kb"].worker_log_path(task.id).read_text()[-5000:]
-    assert (f["workspace"] / "preflight_proof.txt").read_text().strip() == str(
-        f["workspace"]
-    )
+    assert (f["workspace"] / "preflight_proof.txt").read_text() == CANARIES[0]
     calls = [
         json.loads(line)
         for line in (f["home"].parent / "claude-calls.jsonl").read_text().splitlines()
@@ -488,14 +484,14 @@ def test_synthetic_schema_healthy_claude_uses_real_mcp_lifecycle(native_protocol
     probe = calls[0]
     assert probe["cwd"] != str(f["workspace"])
     assert probe["argv"][-1] == "Reply with OK."
-    assert probe["argv"][probe["argv"].index("--tools") + 1] == ""
+    assert probe["argv"][probe["argv"].index("--tools") + 1] == "Read,Glob,Grep,WebFetch,WebSearch"
+    assert "--allowedTools" not in probe["argv"]
     assert "--append-system-prompt-file" not in probe["argv"]
     assert all("HERMES_KANBAN_PREFLIGHT" not in call["env_names"] for call in calls)
     assert not any(c in json.dumps(probe) for c in (*CANARIES, TOKEN, f["jwt"]))
-    removed = json.loads(f["home"].parent.joinpath("removed-schemas.json").read_text())
-    assert "kanban_attach" in removed and "kanban_create" in removed
     passed = next(e for e in events if e.kind == "preflight_passed")
     assert passed.payload["api_mode"] == "claude_native"
+    assert {"terminal", "write_file", "patch", "kanban_attach", "kanban_create"} <= set(passed.payload["waived"])
     assert (
         passed.id
         < next(e.id for e in events if e.kind == "commented")
@@ -515,6 +511,11 @@ def test_synthetic_schema_healthy_claude_uses_real_mcp_lifecycle(native_protocol
         ("athena", "flood", "probe_failed"),
         ("athena", "cli", "transport_unsupported"),
         ("athena", "tools", "tool_unavailable"),
+        ("athena", "missing-grep", "tool_unavailable"),
+        ("athena", "extra-bash", "capability_mismatch"),
+        ("athena", "disconnected", "operation_unavailable"),
+        ("athena", "missing-lifecycle", "operation_unavailable"),
+        ("athena", "missing-skill", "tool_unavailable"),
     ],
 )
 def test_native_failure_matrix(native_protocol, monkeypatch, profile, scenario, code):
@@ -539,6 +540,7 @@ def test_native_failure_matrix(native_protocol, monkeypatch, profile, scenario, 
         profile,
         timeout=4 if scenario == "timeout" else 45,
         toolsets=["hermes-cli"] if scenario == "tools" else None,
+        reviewer=scenario != "tools",
     )
     assert_failure(f, task, events, code)
     if scenario == "tools":
@@ -564,3 +566,15 @@ def test_direct_codex_override_proceeds_after_probe(native_protocol):
     assert (f["workspace"] / "preflight_proof.txt").read_text().strip() == str(
         f["workspace"]
     )
+
+
+def test_reviewer_opt_in_without_preflight_keeps_legacy_fallback(native_protocol):
+    f = native_protocol
+    f["state"]["status"] = 200
+    task, events = f["launch"]("athena", enabled=False)
+    assert task.status == "done", f["kb"].worker_log_path(task.id).read_text()[-5000:]
+    assert not any(e.kind == "preflight_passed" for e in events)
+    assert not f["home"].parent.joinpath("claude-calls.jsonl").exists()
+    comments = f["kb"].list_comments(f["conn"], task.id)
+    assert any("refused by capability parity gate" in c.body for c in comments)
+    assert any("Backend route attempt 2/3" in c.body for c in comments)

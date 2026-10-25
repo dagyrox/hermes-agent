@@ -80,7 +80,8 @@ kanban:
 | `chat_completions`, usable string key | One SDK request using the exact worker model | 15 seconds, 16 output tokens |
 | `anthropic_messages`, usable string key | One Messages request using the exact worker model | 15 seconds, 16 output tokens |
 | `codex_responses`, provider `openai-codex` | OAuth Responses stream, `store: false`, closed on first output event | 45 seconds; no unsupported output-token parameter |
-| Supervisor `claude_code` primary | Native subscription CLI, one turn, no tools or MCP, empty scratch cwd, safe mode | 45 seconds; CLI has no safe output-token cap |
+| Supervisor `claude_code` primary, generic contract | Native subscription CLI, one turn, no tools or MCP, empty scratch cwd, safe mode | 45 seconds; CLI has no safe output-token cap |
+| Athena subscription `claude_code` primary, read-only reviewer contract | Native subscription CLI, one turn, real task-fenced MCP, exact read-only init tools, empty scratch cwd | Same 45-second ceiling |
 | Other Responses providers, Codex app-server, Bedrock, ACP, callable keys, keyless endpoints | Explicit unsupported-transport blocker | Never reported healthy |
 
 Limits are clamped down to these ceilings. Native budgets cover process/import
@@ -98,12 +99,41 @@ spawn-failure counters, repair credentials, force refresh, change billing or
 automatically retry. After a pass, normal worker execution and existing runtime
 failover policy continue unchanged. Disabling admission preserves legacy startup.
 
-Preflight does not waive capability parity. API primaries require real model
-catalog evidence; native read-only workers must expose only tools their existing
-bridge supports. In particular, a configuration whose automatically added Kanban
-tools exceed that bridge will correctly block with `tool_unavailable`, even if
-subscription authentication works. Reconcile such configurations separately;
-never loosen authority or change providers to make the diagnostic pass.
+Generic preflight does not waive capability parity. API primaries require real
+model catalog evidence; native read-only workers whose profile requirements
+exceed the bridge block with `tool_unavailable`, even if authentication works.
+
+Athena has a separate, explicit `role_contract: reviewer` opt-in. Its code-owned
+requirements are `read_file` / `search_files` (native Read / Glob / Grep) and all
+five task-fenced lifecycle tools: show, comment, heartbeat, complete and block.
+Do not combine `role_contract` with `required_tools`; that is `config_invalid`.
+The contract applies only to Athena's subscription, read-only, frozen primary
+after this supervisor passes preflight. Direct overrides, API/full legs, other
+profiles and preflight-off startup retain generic behavior.
+
+The reviewer probe uses the real MCP config and native init event: the server
+must be connected, all reviewer tools must be present, and no extra tools may
+appear except the existing profile skill tools and WebFetch/WebSearch when web
+is pinned. A task requiring a skill also requires `skill_view`. Every lifecycle
+registry handler must be callable. There are no shell/write grants, extra board
+tools, schema filters, auth/provider changes or fallback on admission failure.
+The full resolved profile tool delta remains visible as a bounded `waived` list
+in `preflight_passed` and in a card comment before the route attempt. Missing
+schema evidence, overlarge waivers or waived lifecycle tools fail closed.
+
+For a separately authorized Athena trial, configure only:
+
+```yaml
+kanban:
+  worker_preflight:
+    enabled: true
+    role_contract: reviewer
+```
+
+Keep Athena off until installed native compatibility and real useful read-only
+review plus negative fail-before-context trials pass. Synthetic protocol tests
+are regression coverage, not vendor acceptance. Disabling admission or removing
+the role opt-in restores legacy generic parity checks, not reviewer admission.
 
 Activation is a separate operator-approved configuration change. Use
 `hermes -p <approved-profile> config set kanban.worker_preflight.enabled true`
