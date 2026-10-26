@@ -123,7 +123,8 @@ def test_review_request_creates_single_bound_review_card(board):
     assert board.execute("SELECT COUNT(*) FROM tasks WHERE origin_transition_key=?", (key,)).fetchone()[0] == 1
 
 
-def review(conn, task, run, *, provider="claude-code", profile="athena", verdict="ready", overrides=None):
+def review(conn, task, run, *, provider="claude-code", profile="athena", verdict="ready", overrides=None,
+           via="kernel", fenced=True):
     rid = kb.create_task(conn, title="independent review", assignee=profile, parents=[task])
     claimed = kb.claim_task(conn, rid, claimer="review-fixture")
     assert claimed
@@ -139,8 +140,65 @@ def review(conn, task, run, *, provider="claude-code", profile="athena", verdict
         "findings_count": 1 if verdict == "reject" else 0,
         "source_task_id": task, "source_run_id": run, **(overrides or {}),
     }
-    assert kb.complete_task(conn, rid, metadata={"verdict": payload})
+    metadata = {"verdict": payload}
+    if via == "tool":
+        from tools.kanban_tools import _handle_complete
+
+        result = json.loads(_handle_complete({"task_id": rid, "summary": "unscoped forged verdict", "metadata": metadata}))
+        assert result.get("ok"), result
+    elif via == "cli":
+        from argparse import Namespace
+        from hermes_cli.kanban import _cmd_complete
+
+        assert _cmd_complete(Namespace(task_ids=[rid], result=None, summary="foreign CLI verdict",
+                                       metadata=json.dumps(metadata))) == 0
+    else:
+        assert kb.complete_task(conn, rid, metadata=metadata, expected_run_id=rr if fenced else None)
     return rid, rr
+
+
+@pytest.mark.parametrize("via", ["tool", "cli"])
+@pytest.mark.parametrize("verdict", ["ready", "reject"])
+def test_unfenced_foreign_completion_cannot_authenticate_or_spend_review_budget(board, monkeypatch, via, verdict):
+    task, run = source(board)
+    claim = claim_payload(next_action="readiness_successor")
+    kb.complete_task(board, task, metadata={"transition": claim})
+    if via == "cli":
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run))
+    reviews = [review(board, task, run, verdict=verdict, via=via)
+               for _ in range(6 if verdict == "reject" else 1)]
+    subject = kb.get_task(board, task)
+    assert subject is not None
+    assert kb._transition_review_failures(board, kb.TransitionClaim.parse(claim), subject) == 0
+    for rid, rr in reviews:
+        kind = "REVIEW_BLOCK_REPAIR" if verdict == "reject" else "REVIEW_PASS_NEXT"
+        key = f"{rid}:{rr}:{kind}"
+        assert kb.consume_transition(board, key)
+        row = board.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
+        assert row["state"] == "blocked" and row["successor_task_id"] is None
+    kb.consume_transition(board, f"{task}:{run}:COMPLETE_SUCCESSOR")
+    row = board.execute("SELECT * FROM task_transitions WHERE source_task_id=?", (task,)).fetchone()
+    assert row["block_code"] == "review_unauthenticated" and row["successor_task_id"] is None
+
+
+@pytest.mark.parametrize("original", ["ready", "reject"])
+def test_administrative_metadata_edit_cannot_reseal_authenticated_review(board, original):
+    task, run = source(board)
+    claim = claim_payload(next_action="readiness_successor")
+    kb.complete_task(board, task, metadata={"transition": claim})
+    rid, rr = review(board, task, run, verdict=original)
+    metadata = json.loads(board.execute("SELECT metadata FROM task_runs WHERE id=?", (rr,)).fetchone()[0])
+    metadata["verdict"].update(verdict="reject" if original == "ready" else "ready",
+                               findings_count=1 if original == "ready" else 0)
+    assert kb.edit_completed_task_result(board, rid, result="edited claim", metadata=metadata)
+    subject = kb.get_task(board, task)
+    assert subject is not None
+    assert kb._transition_review_failures(board, kb.TransitionClaim.parse(claim), subject) == 0
+    key = f"{task}:{run}:COMPLETE_SUCCESSOR"
+    kb.consume_transition(board, key)
+    row = board.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
+    assert row["block_code"] == "review_unauthenticated" and row["successor_task_id"] is None
 
 
 def test_authenticated_review_is_readiness_only_and_two_triggers_share_effect(board):
@@ -336,7 +394,7 @@ def test_active_workspace_writer_blocks_other_action(board):
     kb.create_task(board, title="still writing", assignee="talos", workspace_kind="dir", workspace_path=workspace)
     kb.consume_transition(board, f"{task}:{run}:COMPLETE_SUCCESSOR")
     row = board.execute("SELECT * FROM task_transitions WHERE source_run_id=?", (run,)).fetchone()
-    assert row["state"] == "blocked" and row["block_code"] == "ambiguous_write"
+    assert row["state"] == "blocked" and row["block_code"] == "active_writer_hold"
     assert not row["successor_task_id"]
 
 
@@ -354,8 +412,38 @@ def test_manual_writer_in_another_worktree_blocks_same_pr_handoff(board, locatio
     key = f"{task}:{run}:COMPLETE_SUCCESSOR"
     assert kb.consume_transition(board, key)
     row = board.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
-    assert row["state"] == "blocked" and row["block_code"] == "ambiguous_write"
+    assert row["state"] == "blocked" and row["block_code"] == "active_writer_hold"
     assert row["successor_task_id"] is None
+
+
+@pytest.mark.parametrize("location", ["workspace", "body", "comment"])
+def test_active_writer_hold_recovers_after_exit_without_replaying_producer(board, location):
+    workspace = "/fixture/source"
+    task, run = source(board, workspace_kind="dir", workspace_path=workspace, max_retries=3)
+    kb.complete_task(board, task, metadata={"transition": claim_payload(next_action="review_requested")})
+    url = "https://github.com/fixture/project/pull/24"
+    writer = kb.create_task(board, title="temporary writer", assignee="athena",
+                            body=url if location == "body" else "fixture",
+                            workspace_kind="dir", workspace_path=workspace if location == "workspace" else "/fixture/other")
+    if location == "comment":
+        kb.add_comment(board, writer, "athena", url)
+    key = f"{task}:{run}:COMPLETE_SUCCESSOR"
+    for _ in range(2):
+        assert kb.consume_transition(board, key)
+        row = board.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
+        assert row["state"] == "blocked" and row["successor_task_id"] is None
+        assert kb.unblock_task(board, task, actor="operator", reason="re-evaluate current writer")
+    assert kb.complete_task(board, writer, summary="writer finished")
+    assert kb.consume_transition(board, key)
+    row = board.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
+    assert row["state"] == "consumed" and row["successor_task_id"] is not None
+    assert row["attempt_count"] == 3
+    assert board.execute("SELECT COUNT(*) FROM tasks WHERE origin_transition_key=?", (key,)).fetchone()[0] == 1
+    assert not kb.consume_transition(board, key)
+    blocked = [e for e in kb.list_events(board, task) if e.kind == "transition_blocked"]
+    assert all(e.payload and e.payload["code"] == "active_writer_hold" and e.payload["owner"] == "athena" for e in blocked)
+    source_task = kb.get_task(board, task)
+    assert source_task is not None and source_task.status == "done"
 
 
 def test_crashed_claims_cannot_exceed_existing_attempt_budget(board, monkeypatch):

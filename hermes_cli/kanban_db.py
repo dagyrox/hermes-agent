@@ -4775,6 +4775,12 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        # Administrative/foreign completions can close a run but cannot attest
+        # that its worker authored the verdict. Never derive this from metadata.
+        if expected_run_id is not None and run_id == expected_run_id:
+            completed_payload["fenced_run_id"] = run_id
+            if run_id is not None and isinstance(metadata, dict) and "verdict" in metadata:
+                completed_payload["review_sha256"] = _transition_review_digest(_transition_metadata(conn, run_id))
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -5090,6 +5096,12 @@ class TransitionEvidence:
     failed_reviews: int = 0
 
 
+def _transition_review_digest(metadata: Mapping[str, object]) -> str:
+    """Seal the completed claims without copying untrusted content into events."""
+    claims = {key: metadata.get(key) for key in ("verdict", "gate")}
+    return hashlib.sha256(json.dumps(claims, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def _authenticate_transition_review(
     conn: sqlite3.Connection, review_run: sqlite3.Row, task: Task, source_run: sqlite3.Row,
     claim: TransitionClaim, *, require_current: bool = True,
@@ -5109,9 +5121,13 @@ def _authenticate_transition_review(
             or preflight.get("provider") != "claude-code" or preflight.get("outcome") != "passed"
             or preflight.get("api_mode") != "claude_native"):
         raise TransitionValidationError("review_unauthenticated")
-    completed_event = conn.execute("SELECT id FROM task_events WHERE task_id=? AND run_id=? AND kind='completed'",
+    completed_event = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? AND kind='completed'",
                                    (review_run["task_id"], review_run["id"])).fetchone()
     if not completed_event or preflights[0]["id"] >= completed_event["id"]:
+        raise TransitionValidationError("review_unauthenticated")
+    completion = json.loads(completed_event["payload"] or "{}")
+    if (not isinstance(completion, dict) or type(completion.get("fenced_run_id")) is not int
+            or completion["fenced_run_id"] != review_run["id"]):
         raise TransitionValidationError("review_unauthenticated")
     if require_current:
         latest = conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id=?", (review_run["task_id"],)).fetchone()[0]
@@ -5133,6 +5149,8 @@ def _authenticate_transition_review(
             raise TransitionValidationError("binding_mismatch")
     review_metadata = _transition_metadata(conn, review_run["id"])
     _raise_transition_gate(review_metadata)
+    if completion.get("review_sha256") != _transition_review_digest(review_metadata):
+        raise TransitionValidationError("review_unauthenticated")
     verdict = TransitionVerdict.parse(review_metadata.get("verdict"))
     if (verdict.source_task_id != task.id or verdict.source_run_id != source_run["id"]
             or review_run["ended_at"] < source_run["started_at"]):
@@ -5378,8 +5396,9 @@ def _apply_transition_decision(
         successor_id = None
         if decision.kind == "create_successor":
             successor_id = _existing_transition_successor(conn, row, decision)
-            if successor_id is None and _transition_active_writer(conn, row, decision):
-                decision = TransitionDecision("gate", "ambiguous_write")
+            active_owner = _transition_active_writer(conn, row, decision) if successor_id is None else None
+            if active_owner is not None:
+                decision = TransitionDecision("gate", "active_writer_hold", active_owner)
             elif successor_id is None:
                 successor_id = _insert_transition_successor(conn, row, decision)
         blocked = decision.kind == "gate"
@@ -5426,20 +5445,20 @@ def _existing_transition_successor(
     return str(previous["successor_task_id"]) if previous else None
 
 
-def _transition_active_writer(conn: sqlite3.Connection, row: sqlite3.Row, decision: TransitionDecision) -> bool:
+def _transition_active_writer(conn: sqlite3.Connection, row: sqlite3.Row, decision: TransitionDecision) -> Optional[str]:
     task = get_task(conn, decision.source_task_id or row["source_task_id"])
     for active in conn.execute(
-        "SELECT t.id, t.title, t.body, t.workspace_path, x.decision_json FROM tasks t LEFT JOIN task_transitions x "
+        "SELECT t.id, t.title, t.body, t.assignee, t.workspace_path, x.decision_json FROM tasks t LEFT JOIN task_transitions x "
         "ON x.transition_key=t.origin_transition_key WHERE t.status IN ('ready','running')",
     ):
         if (task and task.workspace_path and active["workspace_path"]
                 and os.path.realpath(active["workspace_path"]) == os.path.realpath(task.workspace_path)):
-            return True
+            return active["assignee"] or "hyperion"
         if active["decision_json"] and decision.claim:
             previous = json.loads(active["decision_json"])
             bound = previous.get("claim") or {}
             if bound.get("repo") == decision.claim.repo and bound.get("pr") == decision.claim.pr:
-                return True
+                return active["assignee"] or "hyperion"
         if decision.claim and decision.claim.pr is not None:
             # Ordinary/manual writers have no transition-origin row. Retain a
             # conservative PR-URL hold across their different worktrees too;
@@ -5451,8 +5470,8 @@ def _transition_active_writer(conn: sqlite3.Connection, row: sqlite3.Row, decisi
             ))
             if any(url.split("://", 1)[1].casefold() == target
                    for text in texts for url in _RESPAWN_GUARD_PR_URL_RE.findall(text)):
-                return True
-    return False
+                return active["assignee"] or "hyperion"
+    return None
 
 
 def _insert_transition_successor(

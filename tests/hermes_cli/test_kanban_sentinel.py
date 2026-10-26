@@ -158,7 +158,7 @@ def seed_authenticated_review(f, *, verdict="ready"):
     })
     payload = verdict_payload(f, run)
     payload.update(verdict=verdict, findings_count=1 if verdict == "reject" else 0)
-    kb.complete_task(conn, rid, metadata={"verdict": payload})
+    kb.complete_task(conn, rid, metadata={"verdict": payload}, expected_run_id=rr)
     return rr
 
 

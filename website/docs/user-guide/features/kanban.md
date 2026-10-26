@@ -108,8 +108,11 @@ Review completions use `metadata.verdict` with `v`, `verdict` (`ready`, `reject`
 array. **This JSON is a claim, not an authorization token.** Eligibility requires
 the linked latest completed Athena run, a prior kernel-recorded successful
 `claude-code` / `claude_native` preflight, and matching source run, tenant/project,
-repository, PR, packet, and head. Fixture-provider or synthetic administrative
-completions cannot authenticate a review. Historical authenticated rejects remain
+repository, PR, packet, and head. The completion must be fenced to that worker's
+current run; the kernel records the fence and a digest of its verdict/gate in the
+completion event, never from claimed metadata. Unfenced administrative/foreign
+completions and later metadata edits cannot authenticate or spend review budget.
+Fixture-provider completions cannot authenticate a review. Historical authenticated rejects remain
 in the bounded review-failure count across repaired heads; failures one through
 five route bounded repair, while failure six requires Jason.
 
@@ -135,6 +138,12 @@ ambiguous-write, refusal, data-loss, self-approval, and exhausted intents cannot
 cleared into authority by an unblock. Resolve them through the existing owner and
 produce a newly completed source run where required. Do not copy claimed
 `approved`, reviewer, or CI strings into authority fields.
+
+Kernel-observed concurrency uses the separate `active_writer_hold` gate, owned by
+the existing writer's assignee. It can recover through an audited unblock after
+the writer exits, within the unchanged attempt budget. It is not the immutable
+`ambiguous_write` intent declared in source/review metadata; unchanged active
+writer evidence still reblocks.
 
 Process-death acceptance tests use the inert-by-default, test-only
 `HERMES_KANBAN_TEST_CRASHPOINT` seam under disposable homes/boards. It is not a
