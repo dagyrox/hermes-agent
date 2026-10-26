@@ -4820,6 +4820,8 @@ def complete_task(
             (transition_key, task_id, transition_run_id, transition_kind, now, now),
         )
         _append_event(conn, task_id, "transition_pending", {"transition_key": transition_key}, run_id=run_id)
+        if expected_run_id is not None and run_id == expected_run_id and isinstance(verdict, dict):
+            _record_transition_review_admission(conn, transition_key)
     _transition_crashpoint("after_complete_commit")
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
@@ -5104,7 +5106,7 @@ def _transition_review_digest(metadata: Mapping[str, object]) -> str:
 
 def _authenticate_transition_review(
     conn: sqlite3.Connection, review_run: sqlite3.Row, task: Task, source_run: sqlite3.Row,
-    claim: TransitionClaim, *, require_current: bool = True,
+    claim: TransitionClaim, *, require_current: bool = True, require_admission: bool = True,
 ) -> TransitionVerdict:
     """Only kernel-fenced events authenticate a model's verdict claim."""
     if (review_run["profile"] != "athena" or review_run["status"] != "done"
@@ -5167,43 +5169,72 @@ def _authenticate_transition_review(
             or (verdict.claim.tree_sha is not None and claim.tree_sha is not None
                 and verdict.claim.tree_sha != claim.tree_sha) or verdict.ci_head != claim.head_sha):
         raise TransitionValidationError("binding_mismatch")
+    if require_admission:
+        admitted = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='transition_review_authenticated'",
+            (review_run["task_id"], review_run["id"]),
+        ).fetchone()
+        if not admitted or json.loads(admitted["payload"]).get("review_sha256") != completion.get("review_sha256"):
+            raise TransitionValidationError("review_unauthenticated")
     return verdict
 
 
 def _transition_review_failures(conn: sqlite3.Connection, claim: TransitionClaim, subject: Task) -> int:
-    # Bound input work as well as output work. Excessive/unknown history holds
-    # rather than dropping old failures and accidentally replenishing a budget.
+    # Count immutable, authenticated completion receipts, not editable metadata.
+    # Excessive/unknown history holds instead of replenishing a repair budget.
     reviews = conn.execute(
-        "SELECT * FROM task_runs WHERE profile='athena' AND status='done' "
-        "AND outcome='completed' AND ended_at IS NOT NULL ORDER BY id LIMIT 1001",
+        "SELECT e.payload FROM task_events e JOIN task_runs r ON r.id=e.run_id "
+        "WHERE e.kind='transition_review_authenticated' AND r.profile='athena' "
+        "AND r.status='done' AND r.outcome='completed' AND r.ended_at IS NOT NULL ORDER BY e.id LIMIT 1001",
     ).fetchall()
     if len(reviews) > 1000:
         raise TransitionValidationError("ambiguous_input")
     count = 0
-    for rr in reviews:
+    for row in reviews:
         try:
-            verdict = TransitionVerdict.parse(_transition_metadata(conn, rr["id"]).get("verdict"))
-            if (verdict.verdict != "reject" or verdict.claim.repo != claim.repo
-                    or verdict.claim.pr != claim.pr or verdict.claim.work_packet != claim.work_packet):
-                continue
-            task = get_task(conn, verdict.source_task_id)
-            sr = conn.execute("SELECT * FROM task_runs WHERE id=? AND task_id=?",
-                              (verdict.source_run_id, verdict.source_task_id)).fetchone()
-            if task is None or sr is None or task.tenant != subject.tenant:
-                continue
-            original = TransitionClaim.parse(_transition_metadata(conn, sr["id"]).get("transition"))
-            _authenticate_transition_review(conn, rr, task, sr, original, require_current=False)
-            if verdict.findings_count > 0:
-                count += 1
-        except (TransitionValidationError, json.JSONDecodeError):
-            # Invalid/incomplete/other-lane records are not completed Athena
-            # REVIEW_BLOCK verdicts and therefore cannot spend this budget.
+            admitted = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise TransitionValidationError("ambiguous_input") from exc
+        if not isinstance(admitted, dict):
+            raise TransitionValidationError("ambiguous_input")
+        if (admitted.get("repo"), admitted.get("pr"), admitted.get("work_packet"), admitted.get("tenant")) != (claim.repo, claim.pr, claim.work_packet, subject.tenant):
             continue
+        if admitted.get("verdict") == "reject" and _transition_int(admitted.get("findings_count"), 0) > 0:
+            count += 1
     return count
 
 
+def _record_transition_review_admission(conn: sqlite3.Connection, key: str) -> None:
+    """Seal budget evidence during fenced completion; edits cannot erase it."""
+    row = conn.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
+    if row is None:
+        raise RuntimeError("missing atomic review transition")
+    try:
+        evidence = _resolve_transition_evidence(
+            conn, row, _transition_metadata(conn, row["source_run_id"]), admitting_completion=True,
+        )
+    except TransitionValidationError as exc:
+        # Invalid claims cannot roll back the worker's truthful completion.
+        _append_event(conn, row["source_task_id"], "transition_review_not_admitted", {"code": str(exc)}, run_id=row["source_run_id"])
+        return
+    if evidence is None or evidence.verdict is None:
+        return
+    task = get_task(conn, evidence.source_task_id)
+    completed = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='completed'",
+                             (row["source_task_id"], row["source_run_id"])).fetchone()
+    if task is None or completed is None:
+        raise RuntimeError("missing atomic review evidence")
+    _append_event(conn, row["source_task_id"], "transition_review_authenticated", {
+        "repo": evidence.claim.repo, "pr": evidence.claim.pr, "work_packet": evidence.claim.work_packet,
+        "tenant": task.tenant, "project_id": task.project_id,
+        "source_task_id": evidence.source_task_id, "source_run_id": evidence.source_run_id,
+        "verdict": evidence.verdict.verdict, "findings_count": evidence.verdict.findings_count,
+        "review_sha256": json.loads(completed["payload"])["review_sha256"],
+    }, run_id=row["source_run_id"])
+
+
 def _resolve_transition_evidence(
-    conn: sqlite3.Connection, row: sqlite3.Row, metadata: Mapping[str, object],
+    conn: sqlite3.Connection, row: sqlite3.Row, metadata: Mapping[str, object], *, admitting_completion: bool = False,
 ) -> Optional[TransitionEvidence]:
     if "transition" in metadata and "verdict" in metadata:
         raise TransitionValidationError("schema_invalid")
@@ -5262,7 +5293,7 @@ def _resolve_transition_evidence(
         raise TransitionValidationError("review_stale")
     if review_run is None:
         raise TransitionValidationError("review_missing")
-    verdict = _authenticate_transition_review(conn, review_run, task, sr, claim)
+    verdict = _authenticate_transition_review(conn, review_run, task, sr, claim, require_admission=not admitting_completion)
     return TransitionEvidence(source_id, source_run_id, task.assignee or "talos", claim,
                               review_run["id"], verdict, _transition_review_failures(conn, claim, task))
 

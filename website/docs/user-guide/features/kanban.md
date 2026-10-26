@@ -116,6 +116,14 @@ Fixture-provider completions cannot authenticate a review. Historical authentica
 in the bounded review-failure count across repaired heads; failures one through
 five route bounded repair, while failure six requires Jason.
 
+Fenced reviews are admitted against the completed source in their completion
+transaction. An immutable kernel admission receipt preserves the historical
+repair count even if an administrator later edits the source or verdict claims.
+Reviews completed before their source is eligible, and older history without an
+admission receipt, are not backfilled or granted authority: obtain a new fenced
+review of the finished source. The feature remains default-off; old unfenced
+history never spends a review budget.
+
 A ready verdict additionally needs successful CI at the exact head. Its Talos
 successor is **readiness-only** and must use the existing exact-head merge lane;
 it grants no merge, deployment, credentials, permissions, or external commitment.

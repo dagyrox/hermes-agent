@@ -194,11 +194,49 @@ def test_administrative_metadata_edit_cannot_reseal_authenticated_review(board, 
     assert kb.edit_completed_task_result(board, rid, result="edited claim", metadata=metadata)
     subject = kb.get_task(board, task)
     assert subject is not None
-    assert kb._transition_review_failures(board, kb.TransitionClaim.parse(claim), subject) == 0
+    assert kb._transition_review_failures(board, kb.TransitionClaim.parse(claim), subject) == (1 if original == "reject" else 0)
     key = f"{task}:{run}:COMPLETE_SUCCESSOR"
     kb.consume_transition(board, key)
     row = board.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
     assert row["block_code"] == "review_unauthenticated" and row["successor_task_id"] is None
+
+
+@pytest.mark.parametrize("edit", ["verdict", "scope", "source"])
+def test_historical_authenticated_failure_budget_survives_administrative_edit(board, edit):
+    task, run = source(board)
+    claim = claim_payload(next_action="readiness_successor")
+    kb.complete_task(board, task, metadata={"transition": claim})
+    rid, rr = review(board, task, run, verdict="reject")
+    subject = kb.get_task(board, task)
+    assert subject is not None
+    assert kb._transition_review_failures(board, kb.TransitionClaim.parse(claim), subject) == 1
+    metadata = json.loads(board.execute("SELECT metadata FROM task_runs WHERE id=?", (rr,)).fetchone()[0])
+    if edit == "verdict":
+        metadata["verdict"].update(verdict="ready", findings_count=0)
+    elif edit == "scope":
+        metadata["verdict"]["work_packet"] = "/different/packet.md"
+    else:
+        assert kb.edit_completed_task_result(board, task, result="edited source", metadata={"transition": claim_payload(work_packet="/other/source.md")})
+    assert kb.edit_completed_task_result(board, rid, result="edited claim", metadata=metadata)
+    assert kb._transition_review_failures(board, kb.TransitionClaim.parse(claim), subject) == 1
+
+
+def test_administrative_edits_cannot_replenish_sixth_repair_budget(board):
+    for _ in range(6):
+        task, run = source(board)
+        kb.complete_task(board, task, metadata={"transition": claim_payload(next_action="repair_requested")})
+        rid, rr = review(board, task, run, verdict="reject")
+        metadata = json.loads(board.execute("SELECT metadata FROM task_runs WHERE id=?", (rr,)).fetchone()[0])
+        metadata["verdict"].update(verdict="ready", findings_count=0)
+        assert kb.edit_completed_task_result(board, rid, result="edited reject", metadata=metadata)
+    task, run = source(board)
+    kb.complete_task(board, task, metadata={"transition": claim_payload(next_action="repair_requested")})
+    review(board, task, run, verdict="reject")
+    key = f"{task}:{run}:COMPLETE_SUCCESSOR"
+    kb.consume_transition(board, key)
+    row = board.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
+    assert row["state"] == "blocked" and row["successor_task_id"] is None
+    assert row["block_code"] == "review_ceiling" and json.loads(row["decision_json"])["owner"] == "Jason"
 
 
 def test_authenticated_review_is_readiness_only_and_two_triggers_share_effect(board):
