@@ -446,6 +446,7 @@ def _handle_show(args: dict, **kw) -> str:
 
             return json.dumps({
                 "task": _task_dict(task),
+                "transitions": kb.list_transitions(conn, tid),
                 "parents": parents,
                 "children": children,
                 "comments": [
@@ -1373,7 +1374,10 @@ def _handle_unblock(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            ok = kb.unblock_task(conn, str(tid))
+            reason = args.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                return tool_error("reason must be text")
+            ok = kb.unblock_task(conn, str(tid), reason=reason)
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
             task = kb.get_task(conn, str(tid))
@@ -1993,6 +1997,7 @@ KANBAN_UNBLOCK_SCHEMA = {
                 "type": "string",
                 "description": "Blocked task id to move to ready or parent-gated todo.",
             },
+            "reason": {"type": "string", "description": "Audit note only; never grants permission or waives handoff gates."},
             "board": _board_schema_prop(),
         },
         "required": ["task_id"],

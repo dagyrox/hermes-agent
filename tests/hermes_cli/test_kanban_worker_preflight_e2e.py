@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import threading
@@ -120,6 +121,7 @@ sys.addaudithook(record_context)
                 # execute real tools; the fixture is not an agent substitute.
                 if request.get("tools"):
                     calls = [m for m in request["messages"] if m.get("role") == "tool"]
+                    task = json.loads(calls[0]["content"])["task"] if calls and state.get("handoff") else None
                     if not calls:
                         tool = ("kanban_show", {})
                     elif len(calls) == 1:
@@ -135,7 +137,60 @@ sys.addaudithook(record_context)
                             "kanban_complete",
                             {"summary": "fixture command verified"},
                         )
-                message = {"role": "assistant", "content": "OK"}
+                    if task is not None:
+                        tid = task["id"]
+                        if len(calls) == 1:
+                            # The terminal executes this, not the fixture server.
+                            # Proof is per-task, so duplicate useful executions
+                            # are observable in both artifacts and git notes.
+                            script = (
+                                "import json,os,sqlite3,subprocess; from pathlib import Path; "
+                                "record=" + repr({"task_id": tid, "body": task["body"]}) + "; "
+                                "record['workspace']=subprocess.check_output(['git','rev-parse','--show-toplevel'],text=True).strip(); "
+                                "record['head_sha']=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(); "
+                                "ref=json.loads(record['body'].splitlines()[1]) if record['body'].startswith('Kernel handoff;') else {}; "
+                                "record['review_ref']=ref.get('review_run_id'); "
+                                "db=sqlite3.connect(os.environ['HERMES_KANBAN_DB']); "
+                                "rr=db.execute('SELECT metadata FROM task_runs WHERE id=?',(record['review_ref'] or 0,)).fetchone(); "
+                                "record['ci_ref']=json.loads(rr[0])['verdict']['ci'] if rr else None; db.close(); "
+                                "Path('merge-readiness-" + tid + ".json').write_text(json.dumps(record)); "
+                                "subprocess.run(['git','-c','user.name=Fixture','-c','user.email=fixture@example.invalid',"
+                                "'notes','--ref=fixture','append','-m'," + repr(tid) + "],check=True)"
+                            )
+                            tool = ("terminal", {"command": "python -c " + shlex.quote(script), "timeout": 10})
+                            state.setdefault("fixture_commands", set()).add(tool[1]["command"])
+                        elif len(calls) == 2:
+                            tool = ("kanban_heartbeat", {})
+                        elif len(calls) == 3:
+                            before = state.get("before_complete")
+                            if before is not None:
+                                before.set()
+                                release.wait(state.get("hold_complete", 0))
+                            tool = ("kanban_complete", {
+                                "summary": "fixture command and git note verified",
+                                "metadata": {
+                                    **state.get("metadata_by_task", {}).get(tid,
+                                        state.get("metadata_by_profile", {}).get(task["assignee"], {})),
+                                    "artifact_path": str(Path(task["workspace_path"]) / ("merge-readiness-" + tid + ".json")),
+                                },
+                            })
+                        else:
+                            after = state.get("after_complete")
+                            if after is not None:
+                                after.set()
+                                release.wait(state.get("hold_after_complete", 0))
+                content = "OK"
+                messages = request.get("messages", [])
+                if (state.get("handoff") and messages
+                        and "You are a security reviewer" in str(messages[0].get("content", ""))):
+                    # Exercise the real approval path too. Only the exact
+                    # fixture-generated, disposable command gets an approval.
+                    text = str(messages[-1].get("content", ""))
+                    content = "APPROVE" if any(
+                        "<command>\n" + command + "\n</command>" in text
+                        for command in state.get("fixture_commands", set())
+                    ) else "DENY"
+                message = {"role": "assistant", "content": content}
                 if tool:
                     message.update(
                         content=None,

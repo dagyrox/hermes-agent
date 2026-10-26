@@ -52,6 +52,94 @@ They look similar; they are not the same primitive.
 
 They coexist: a kanban worker may call `delegate_task` internally during its run.
 
+## Opt-in durable completion handoffs
+
+Completion records one durable transition in the same transaction as the completed
+run and event. The board is authoritative; chat delivery is not a continuation
+mechanism. Existing tasks with no typed action never acquire an automatic successor.
+Legacy administrative completions without a run use the reserved run identity `0`,
+which cannot authenticate a worker or review.
+
+Automatic effects are **off by default**. Configure each relevant dispatcher/worker
+profile explicitly; profiles do not inherit live configuration from one another:
+
+```yaml
+kanban:
+  handoff:
+    typed_guard: "off"     # off | shadow | enforce
+    batch_size: 32         # 1..1000 transition candidates per tick
+    lease_seconds: 1200    # positive integer; defaults to the existing claim TTL
+```
+
+`shadow` records bounded eligibility decisions without claiming transitions or
+creating successors. `enforce` enables the completion fast path and dispatcher
+recovery sweep through the same consumer. Dispatcher `--dry-run` never consumes.
+Setting the mode back to `off` stops further effects but preserves intent, history,
+and existing successors; it does not cancel already-running work. Do not delete or
+edit transition rows to recover work.
+
+An opted-in worker passes `metadata.transition` to `kanban_complete`, with exactly
+these fields (no approval or authority fields are accepted):
+
+```json
+{
+  "v": 1,
+  "repo": "owner/repo",
+  "pr": 24,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "tree_sha": null,
+  "work_packet": "/absolute/path/to/approved-packet.md",
+  "next_action": "review_requested",
+  "review_task_id": null,
+  "notes": "Bounded non-secret context"
+}
+```
+
+`pr` may be null, `tree_sha` is optional/null, and `notes` is limited to 2,000
+characters. The action is one of `none`, `review_requested`, `repair_requested`, or
+`readiness_successor`. SHA values are full lowercase 40-character hashes. The
+work-packet path must be absolute and normalized. Malformed claims fail closed
+without undoing the original completion.
+
+Review completions use `metadata.verdict` with `v`, `verdict` (`ready`, `reject`, or
+`needs_input`), `repo`, `pr`, `head_sha`, optional `tree_sha`, `work_packet`,
+`source_task_id`, `source_run_id`, `findings_count`, and `ci` containing `head_sha`,
+`conclusion` (`success`, `failure`, `pending`, or `absent`), and a `checks` string
+array. **This JSON is a claim, not an authorization token.** Eligibility requires
+the linked latest completed Athena run, a prior kernel-recorded successful
+`claude-code` / `claude_native` preflight, and matching source run, tenant/project,
+repository, PR, packet, and head. Fixture-provider or synthetic administrative
+completions cannot authenticate a review. Historical authenticated rejects remain
+in the bounded review-failure count across repaired heads; failures one through
+five route bounded repair, while failure six requires Jason.
+
+A ready verdict additionally needs successful CI at the exact head. Its Talos
+successor is **readiness-only** and must use the existing exact-head merge lane;
+it grants no merge, deployment, credentials, permissions, or external commitment.
+Hard gates in either source or review metadata hold the transition. A successor
+does not start while an immediate parent worker process is still alive.
+
+Inspect `hermes kanban show TASK --json` or `kanban_show` for `transitions`, including
+state, attempt count, gate code, and successor identity. Expired consumer leases
+can be reclaimed by a later real dispatcher tick; unexpired leases cannot be
+stolen. An effect and its consumed state commit atomically, with owner fencing and
+one origin-bound successor. Transient failures use the existing failure limit or
+task `max_retries`; exhaustion blocks instead of looping.
+
+For a blocked intent, an operator can use
+`hermes kanban unblock TASK --reason "new evidence is available"`. This emits an
+audit record and re-evaluates the same immutable source run. It does **not** reopen
+the completed worker, waive a gate, or grant approval. Unchanged evidence reblocks;
+repeated blocks emit `transition_triage`. Approval, auth/credential, sensitive,
+ambiguous-write, refusal, data-loss, self-approval, and exhausted intents cannot be
+cleared into authority by an unblock. Resolve them through the existing owner and
+produce a newly completed source run where required. Do not copy claimed
+`approved`, reviewer, or CI strings into authority fields.
+
+Process-death acceptance tests use the inert-by-default, test-only
+`HERMES_KANBAN_TEST_CRASHPOINT` seam under disposable homes/boards. It is not a
+production setting. No live configuration or entrypoint bypass is needed for tests.
+
 ## Opt-in worker startup preflight
 
 `kanban.worker_preflight` is disabled by default and belongs to the assigned
