@@ -85,9 +85,9 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, cast
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.worker_preflight import WorkerPreflightBlocked
@@ -1221,8 +1221,36 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    origin_transition_key TEXT
 );
+
+-- Completion intent is committed with its source run, never by a hook alone.
+CREATE TABLE IF NOT EXISTS task_transitions (
+    transition_key TEXT PRIMARY KEY,
+    source_task_id TEXT NOT NULL,
+    source_run_id INTEGER NOT NULL,
+    effect_key TEXT,
+    transition_kind TEXT NOT NULL CHECK (transition_kind IN
+        ('COMPLETE_SUCCESSOR', 'REVIEW_BLOCK_REPAIR', 'REVIEW_PASS_NEXT')),
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'consuming', 'consumed', 'blocked')),
+    outcome TEXT CHECK (outcome IN ('successor_created', 'no_successor')),
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    decision_json TEXT,
+    successor_task_id TEXT,
+    block_code TEXT,
+    last_error TEXT,
+    block_recurrences INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (source_task_id, source_run_id, transition_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_transitions_sweep
+    ON task_transitions(state, created_at, transition_key);
+CREATE INDEX IF NOT EXISTS idx_transitions_effect ON task_transitions(effect_key, state);
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
@@ -2247,6 +2275,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
+    if "origin_transition_key" not in cols:
+        _add_column_if_missing(conn, "tasks", "origin_transition_key", "origin_transition_key TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_transition_origin "
+        "ON tasks(origin_transition_key) WHERE origin_transition_key IS NOT NULL"
+    )
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
@@ -3082,42 +3116,21 @@ def create_task(
                         except Exception:
                             branch_name = None
 
-                conn.execute(
-                    """
-                    INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
-                        max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_id,
-                        title.strip(),
-                        body,
-                        assignee,
-                        task_status,
-                        priority,
-                        created_by,
-                        now,
-                        workspace_kind,
-                        workspace_path,
-                        branch_name,
-                        project_id,
-                        tenant,
-                        idempotency_key,
-                        int(max_runtime_seconds) if max_runtime_seconds is not None else None,
-                        json.dumps(skills_list) if skills_list is not None else None,
-                        int(max_retries) if max_retries is not None else None,
-                        model_override,
-                        provider_override,
-                        1 if goal_mode else 0,
-                        int(goal_max_turns) if goal_max_turns is not None else None,
-                        session_id,
-                    ),
-                )
+                _insert_task_record(conn, {
+                    "id": task_id, "title": title.strip(), "body": body,
+                    "assignee": assignee, "status": task_status, "priority": priority,
+                    "created_by": created_by, "created_at": now,
+                    "workspace_kind": workspace_kind, "workspace_path": workspace_path,
+                    "branch_name": branch_name, "project_id": project_id, "tenant": tenant,
+                    "idempotency_key": idempotency_key,
+                    "max_runtime_seconds": int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                    "skills": json.dumps(skills_list) if skills_list is not None else None,
+                    "max_retries": int(max_retries) if max_retries is not None else None,
+                    "model_override": model_override, "provider_override": provider_override,
+                    "goal_mode": 1 if goal_mode else 0,
+                    "goal_max_turns": int(goal_max_turns) if goal_max_turns is not None else None,
+                    "session_id": session_id,
+                })
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -3149,6 +3162,24 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def _insert_task_record(conn: sqlite3.Connection, values: Mapping[str, object]) -> None:
+    """Insert kernel values inside the caller's transaction, without nesting."""
+    columns = {
+        "id", "title", "body", "assignee", "status", "priority", "created_by",
+        "created_at", "workspace_kind", "workspace_path", "branch_name", "project_id",
+        "tenant", "idempotency_key", "max_runtime_seconds", "skills", "max_retries",
+        "model_override", "provider_override", "goal_mode", "goal_max_turns", "session_id",
+        "origin_transition_key",
+    }
+    if not conn.in_transaction or not values.keys() <= columns:
+        raise ValueError("invalid task insertion boundary")
+    names = tuple(values)
+    conn.execute(
+        "INSERT INTO tasks (" + ",".join(names) + ") VALUES (" + ",".join("?" for _ in names) + ")",
+        tuple(values[name] for name in names),
+    )
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -4744,6 +4775,12 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        # Administrative/foreign completions can close a run but cannot attest
+        # that its worker authored the verdict. Never derive this from metadata.
+        if expected_run_id is not None and run_id == expected_run_id:
+            completed_payload["fenced_run_id"] = run_id
+            if run_id is not None and isinstance(metadata, dict) and "verdict" in metadata:
+                completed_payload["review_sha256"] = _transition_review_digest(_transition_metadata(conn, run_id))
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -4765,6 +4802,27 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        transition_kind = "COMPLETE_SUCCESSOR"
+        verdict = metadata.get("verdict") if isinstance(metadata, dict) else None
+        if isinstance(verdict, dict):
+            transition_kind = (
+                "REVIEW_BLOCK_REPAIR" if verdict.get("verdict") == "reject"
+                else "REVIEW_PASS_NEXT"
+            )
+        # A legacy administrative completion without handoff has no worker run.
+        # Zero is an explicit non-worker sentinel, never authenticated evidence.
+        transition_run_id = run_id or 0
+        transition_key = f"{task_id}:{transition_run_id}:{transition_kind}"
+        conn.execute(
+            "INSERT INTO task_transitions "
+            "(transition_key, source_task_id, source_run_id, transition_kind, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            (transition_key, task_id, transition_run_id, transition_kind, now, now),
+        )
+        _append_event(conn, task_id, "transition_pending", {"transition_key": transition_key}, run_id=run_id)
+        if expected_run_id is not None and run_id == expected_run_id and isinstance(verdict, dict):
+            _record_transition_review_admission(conn, transition_key)
+    _transition_crashpoint("after_complete_commit")
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -4804,7 +4862,734 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    if isinstance(metadata, dict) and ("transition" in metadata or "verdict" in metadata):
+        _nudge_transition(conn, transition_key)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Durable completion transitions
+# ---------------------------------------------------------------------------
+
+
+def _transition_crashpoint(name: str) -> None:
+    """Named process-death seams; absent the test-only setting this is inert."""
+    if os.getenv("HERMES_KANBAN_TEST_CRASHPOINT") == name:
+        os._exit(137)
+
+
+def _transition_parent_process_alive(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Completion closes a run, not necessarily its OS process. Do not overlap.
+
+    This is only the new transition lane's immediate-parent exit guard, not a
+    cross-repository/workspace lease implementation (Feature4 is separate).
+    """
+    for parent in parent_ids(conn, task_id):
+        run = conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id=?", (parent,)).fetchone()[0]
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='spawned' ORDER BY id DESC LIMIT 1",
+            (parent, run),
+        ).fetchone()
+        if event:
+            try:
+                pid = json.loads(event[0])["pid"]
+            except (KeyError, TypeError, ValueError):
+                return True
+            if type(pid) is not int or pid <= 0 or _pid_alive(pid):
+                return True
+    return False
+
+
+@dataclass(frozen=True)
+class TransitionSettings:
+    mode: str = "off"
+    batch_size: int = 32
+    lease_seconds: Optional[int] = None
+    failure_limit: int = 2
+
+
+def _transition_settings() -> TransitionSettings:
+    from hermes_cli.config import load_config
+
+    config = load_config()
+    kanban = config.get("kanban", {})
+    if not isinstance(kanban, dict):
+        return TransitionSettings()
+    handoff = kanban.get("handoff", {})
+    if not isinstance(handoff, dict):
+        return TransitionSettings()
+    mode = handoff.get("typed_guard", "off")
+    if mode not in ("off", "shadow", "enforce"):
+        logging.getLogger(__name__).warning("kanban handoff invalid mode; enforcing off")
+        mode = "off"
+    batch = handoff.get("batch_size", 32)
+    lease = handoff.get("lease_seconds")
+    limit = kanban.get("failure_limit", DEFAULT_FAILURE_LIMIT)
+    return TransitionSettings(
+        mode, batch if type(batch) is int and 0 < batch <= 1000 else 32,
+        lease if type(lease) is int and lease > 0 else None,
+        limit if type(limit) is int and limit > 0 else DEFAULT_FAILURE_LIMIT,
+    )
+
+
+def _nudge_transition(conn: sqlite3.Connection, key: str) -> None:
+    settings = _transition_settings()
+    if settings.mode != "enforce":
+        return
+    try:
+        consume_transition(conn, key, ttl_seconds=settings.lease_seconds, failure_limit=settings.failure_limit)
+    except RuntimeError:
+        # Completion is already committed. The separately persisted retry/error
+        # is recovered by the dispatcher; never repeat completed worker effects.
+        logging.getLogger(__name__).error("kanban handoff nudge consumer_error; dispatcher recovery required")
+
+
+def sweep_transitions(
+    conn: sqlite3.Connection, *, dry_run: bool = False,
+    ttl_seconds: Optional[int] = None, failure_limit: Optional[int] = None,
+) -> int:
+    settings = _transition_settings()
+    if dry_run or settings.mode == "off":
+        return 0
+    rows = conn.execute(
+        "SELECT * FROM task_transitions WHERE (state='pending' OR "
+        "(state='consuming' AND lease_expires_at < ?)) "
+        + ("AND decision_json IS NULL " if settings.mode == "shadow" else "")
+        + "ORDER BY created_at, transition_key LIMIT ?",
+        (int(time.time()), settings.batch_size),
+    ).fetchall()
+    count = 0
+    for row in rows:
+        if settings.mode == "shadow":
+            decision = _evaluate_transition(conn, row)
+            with write_txn(conn):
+                changed = conn.execute(
+                    "UPDATE task_transitions SET decision_json=? WHERE transition_key=? "
+                    "AND state='pending' AND decision_json IS NULL",
+                    (json.dumps(asdict(decision), sort_keys=True), row["transition_key"]),
+                ).rowcount
+                if changed:
+                    _append_event(conn, row["source_task_id"], "transition_shadow", {
+                        "transition_key": row["transition_key"], "code": decision.code, "owner": decision.owner,
+                    }, run_id=row["source_run_id"])
+        elif consume_transition(
+            conn, row["transition_key"], ttl_seconds=settings.lease_seconds or ttl_seconds,
+            failure_limit=failure_limit or settings.failure_limit,
+        ):
+            count += 1
+    return count
+
+
+class TransitionValidationError(ValueError):
+    """Invalid untrusted evidence; never include submitted values in the error."""
+
+
+def _transition_object(value: object, keys: set[str], optional: frozenset[str] = frozenset()) -> dict[str, object]:
+    if not isinstance(value, dict) or not keys.difference(optional) <= set(value) or set(value).difference(keys):
+        raise TransitionValidationError("schema_invalid")
+    data = cast(Mapping[str, object], value)
+    return {key: data.get(key) for key in keys}
+
+
+def _transition_string(value: object, pattern: str = r"[^\x00-\x1f]{1,4096}") -> str:
+    if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+        raise TransitionValidationError("schema_invalid")
+    return value
+
+
+def _transition_int(value: object, minimum: int = 1) -> int:
+    if type(value) is not int or value < minimum:
+        raise TransitionValidationError("schema_invalid")
+    return value
+
+
+@dataclass(frozen=True)
+class TransitionClaim:
+    repo: str
+    pr: Optional[int]
+    head_sha: str
+    tree_sha: Optional[str]
+    work_packet: str
+    next_action: str
+    review_task_id: Optional[str]
+    notes: str
+
+    @classmethod
+    def parse(cls, value: object) -> TransitionClaim:
+        data = _transition_object(value, {
+            "v", "repo", "pr", "head_sha", "tree_sha", "work_packet",
+            "next_action", "review_task_id", "notes",
+        }, frozenset({"tree_sha"}))
+        if _transition_int(data["v"]) != 1:
+            raise TransitionValidationError("schema_invalid")
+        packet = _transition_string(data["work_packet"])
+        if not os.path.isabs(packet) or os.path.normpath(packet) != packet:
+            raise TransitionValidationError("schema_invalid")
+        notes = data["notes"]
+        if not isinstance(notes, str) or len(notes) > 2000 or "\x00" in notes:
+            raise TransitionValidationError("schema_invalid")
+        return cls(
+            repo=_transition_string(data["repo"], r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"),
+            pr=None if data["pr"] is None else _transition_int(data["pr"]),
+            head_sha=_transition_string(data["head_sha"], r"[0-9a-f]{40}"),
+            tree_sha=None if data["tree_sha"] is None else _transition_string(data["tree_sha"], r"[0-9a-f]{40}"),
+            work_packet=packet,
+            next_action=_transition_string(data["next_action"], r"review_requested|repair_requested|readiness_successor|none"),
+            review_task_id=None if data["review_task_id"] is None else _transition_string(data["review_task_id"], r"t_[0-9a-f]{8,}"),
+            notes=notes,
+        )
+
+
+@dataclass(frozen=True)
+class TransitionDecision:
+    kind: str
+    code: str
+    owner: str = "hyperion"
+    source_task_id: Optional[str] = None
+    source_run_id: Optional[int] = None
+    claim: Optional[TransitionClaim] = None
+    review_run_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class TransitionVerdict:
+    claim: TransitionClaim
+    verdict: str
+    ci_head: str
+    ci_conclusion: str
+    checks: tuple[str, ...]
+    findings_count: int
+    source_task_id: str
+    source_run_id: int
+
+    @classmethod
+    def parse(cls, value: object) -> TransitionVerdict:
+        data = _transition_object(value, {
+            "v", "verdict", "repo", "pr", "head_sha", "tree_sha", "work_packet",
+            "ci", "findings_count", "source_task_id", "source_run_id",
+        }, frozenset({"tree_sha"}))
+        claim = TransitionClaim.parse({
+            **{k: data[k] for k in ("v", "repo", "pr", "head_sha", "tree_sha", "work_packet")},
+            "next_action": "none", "review_task_id": None, "notes": "",
+        })
+        ci = _transition_object(data["ci"], {"head_sha", "conclusion", "checks"})
+        checks = ci["checks"]
+        if not isinstance(checks, list) or len(checks) > 50:
+            raise TransitionValidationError("schema_invalid")
+        return cls(
+            claim, _transition_string(data["verdict"], r"ready|reject|needs_input"),
+            _transition_string(ci["head_sha"], r"[0-9a-f]{40}"),
+            _transition_string(ci["conclusion"], r"success|failure|pending|absent"),
+            tuple(_transition_string(check, r"[^\x00-\x1f]{1,200}") for check in checks),
+            _transition_int(data["findings_count"], 0),
+            _transition_string(data["source_task_id"], r"t_[0-9a-f]{8,}"),
+            _transition_int(data["source_run_id"]),
+        )
+
+
+@dataclass(frozen=True)
+class TransitionEvidence:
+    source_task_id: str
+    source_run_id: int
+    source_assignee: str
+    claim: TransitionClaim
+    review_run_id: Optional[int] = None
+    verdict: Optional[TransitionVerdict] = None
+    failed_reviews: int = 0
+
+
+def _transition_review_digest(metadata: Mapping[str, object]) -> str:
+    """Seal the completed claims without copying untrusted content into events."""
+    claims = {key: metadata.get(key) for key in ("verdict", "gate")}
+    return hashlib.sha256(json.dumps(claims, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _authenticate_transition_review(
+    conn: sqlite3.Connection, review_run: sqlite3.Row, task: Task, source_run: sqlite3.Row,
+    claim: TransitionClaim, *, require_current: bool = True, require_admission: bool = True,
+) -> TransitionVerdict:
+    """Only kernel-fenced events authenticate a model's verdict claim."""
+    if (review_run["profile"] != "athena" or review_run["status"] != "done"
+            or review_run["outcome"] != "completed" or review_run["ended_at"] is None):
+        raise TransitionValidationError("review_unauthenticated")
+    preflights = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? AND kind='preflight_passed'",
+        (review_run["task_id"], review_run["id"]),
+    ).fetchall()
+    if len(preflights) != 1:
+        raise TransitionValidationError("review_unauthenticated")
+    preflight = json.loads(preflights[0]["payload"] or "{}")
+    if (not isinstance(preflight, dict) or preflight.get("profile") != "athena"
+            or preflight.get("provider") != "claude-code" or preflight.get("outcome") != "passed"
+            or preflight.get("api_mode") != "claude_native"):
+        raise TransitionValidationError("review_unauthenticated")
+    completed_event = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? AND kind='completed'",
+                                   (review_run["task_id"], review_run["id"])).fetchone()
+    if not completed_event or preflights[0]["id"] >= completed_event["id"]:
+        raise TransitionValidationError("review_unauthenticated")
+    completion = json.loads(completed_event["payload"] or "{}")
+    if (not isinstance(completion, dict) or type(completion.get("fenced_run_id")) is not int
+            or completion["fenced_run_id"] != review_run["id"]):
+        raise TransitionValidationError("review_unauthenticated")
+    if require_current:
+        latest = conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id=?", (review_run["task_id"],)).fetchone()[0]
+        if latest != review_run["id"]:
+            raise TransitionValidationError("review_stale")
+    if (review_run["task_id"] == task.id or source_run["profile"] == "athena"
+            or task.assignee == "athena"):
+        raise TransitionValidationError("review_not_independent")
+    linked = conn.execute(
+        "SELECT 1 FROM task_links WHERE (parent_id=? AND child_id=?) OR (parent_id=? AND child_id=?)",
+        (task.id, review_run["task_id"], review_run["task_id"], task.id),
+    ).fetchone()
+    if not linked:
+        completed = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='completed'",
+            (task.id, source_run["id"]),
+        ).fetchall()
+        if not any(review_run["task_id"] in json.loads(e["payload"] or "{}").get("verified_cards", []) for e in completed):
+            raise TransitionValidationError("binding_mismatch")
+    review_metadata = _transition_metadata(conn, review_run["id"])
+    _raise_transition_gate(review_metadata)
+    if completion.get("review_sha256") != _transition_review_digest(review_metadata):
+        raise TransitionValidationError("review_unauthenticated")
+    verdict = TransitionVerdict.parse(review_metadata.get("verdict"))
+    if (verdict.source_task_id != task.id or verdict.source_run_id != source_run["id"]
+            or review_run["ended_at"] < source_run["started_at"]):
+        raise TransitionValidationError("review_stale")
+    review_task = get_task(conn, review_run["task_id"])
+    if review_task is None or review_task.tenant != task.tenant:
+        raise TransitionValidationError("binding_mismatch")
+    if require_current and review_task.status != "done":
+        raise TransitionValidationError("review_stale")
+    if task.project_id and review_task.project_id and task.project_id != review_task.project_id:
+        raise TransitionValidationError("binding_mismatch")
+    if (verdict.claim.repo != claim.repo or verdict.claim.pr != claim.pr
+            or verdict.claim.head_sha != claim.head_sha or verdict.claim.work_packet != claim.work_packet
+            or (verdict.claim.tree_sha is not None and claim.tree_sha is not None
+                and verdict.claim.tree_sha != claim.tree_sha) or verdict.ci_head != claim.head_sha):
+        raise TransitionValidationError("binding_mismatch")
+    if require_admission:
+        admitted = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='transition_review_authenticated'",
+            (review_run["task_id"], review_run["id"]),
+        ).fetchone()
+        if not admitted or json.loads(admitted["payload"]).get("review_sha256") != completion.get("review_sha256"):
+            raise TransitionValidationError("review_unauthenticated")
+    return verdict
+
+
+def _transition_review_failures(conn: sqlite3.Connection, claim: TransitionClaim, subject: Task) -> int:
+    # Count immutable, authenticated completion receipts, not editable metadata.
+    # Excessive/unknown history holds instead of replenishing a repair budget.
+    reviews = conn.execute(
+        "SELECT e.payload FROM task_events e JOIN task_runs r ON r.id=e.run_id "
+        "WHERE e.kind='transition_review_authenticated' AND r.profile='athena' "
+        "AND r.status='done' AND r.outcome='completed' AND r.ended_at IS NOT NULL ORDER BY e.id LIMIT 1001",
+    ).fetchall()
+    if len(reviews) > 1000:
+        raise TransitionValidationError("ambiguous_input")
+    count = 0
+    for row in reviews:
+        try:
+            admitted = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise TransitionValidationError("ambiguous_input") from exc
+        if not isinstance(admitted, dict):
+            raise TransitionValidationError("ambiguous_input")
+        if (admitted.get("repo"), admitted.get("pr"), admitted.get("work_packet"), admitted.get("tenant")) != (claim.repo, claim.pr, claim.work_packet, subject.tenant):
+            continue
+        if admitted.get("verdict") == "reject" and _transition_int(admitted.get("findings_count"), 0) > 0:
+            count += 1
+    return count
+
+
+def _record_transition_review_admission(conn: sqlite3.Connection, key: str) -> None:
+    """Seal budget evidence during fenced completion; edits cannot erase it."""
+    row = conn.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
+    if row is None:
+        raise RuntimeError("missing atomic review transition")
+    try:
+        evidence = _resolve_transition_evidence(
+            conn, row, _transition_metadata(conn, row["source_run_id"]), admitting_completion=True,
+        )
+    except TransitionValidationError as exc:
+        # Invalid claims cannot roll back the worker's truthful completion.
+        _append_event(conn, row["source_task_id"], "transition_review_not_admitted", {"code": str(exc)}, run_id=row["source_run_id"])
+        return
+    if evidence is None or evidence.verdict is None:
+        return
+    task = get_task(conn, evidence.source_task_id)
+    completed = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='completed'",
+                             (row["source_task_id"], row["source_run_id"])).fetchone()
+    if task is None or completed is None:
+        raise RuntimeError("missing atomic review evidence")
+    _append_event(conn, row["source_task_id"], "transition_review_authenticated", {
+        "repo": evidence.claim.repo, "pr": evidence.claim.pr, "work_packet": evidence.claim.work_packet,
+        "tenant": task.tenant, "project_id": task.project_id,
+        "source_task_id": evidence.source_task_id, "source_run_id": evidence.source_run_id,
+        "verdict": evidence.verdict.verdict, "findings_count": evidence.verdict.findings_count,
+        "review_sha256": json.loads(completed["payload"])["review_sha256"],
+    }, run_id=row["source_run_id"])
+
+
+def _resolve_transition_evidence(
+    conn: sqlite3.Connection, row: sqlite3.Row, metadata: Mapping[str, object], *, admitting_completion: bool = False,
+) -> Optional[TransitionEvidence]:
+    if "transition" in metadata and "verdict" in metadata:
+        raise TransitionValidationError("schema_invalid")
+    review_run = None
+    source_id, source_run_id = row["source_task_id"], row["source_run_id"]
+    if "verdict" in metadata:
+        verdict = TransitionVerdict.parse(metadata["verdict"])
+        source_id, source_run_id = verdict.source_task_id, verdict.source_run_id
+        review_run = conn.execute("SELECT * FROM task_runs WHERE id=?", (row["source_run_id"],)).fetchone()
+        if not conn.execute("SELECT 1 FROM task_runs WHERE task_id=? AND id=?", (source_id, source_run_id)).fetchone():
+            raise TransitionValidationError("review_stale")
+    source_metadata = _transition_metadata(conn, source_run_id)
+    if "transition" not in source_metadata:
+        if review_run is not None:
+            raise TransitionValidationError("ambiguous_input")
+        return None
+    claim = TransitionClaim.parse(source_metadata["transition"])
+    task = get_task(conn, source_id)
+    sr = conn.execute("SELECT * FROM task_runs WHERE id=? AND task_id=?", (source_run_id, source_id)).fetchone()
+    latest = conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id=?", (source_id,)).fetchone()[0]
+    if (task is None or sr is None or latest != source_run_id or task.status != "done"
+            or sr["status"] != "done" or sr["outcome"] != "completed" or sr["ended_at"] is None):
+        raise TransitionValidationError("review_stale")
+    _raise_transition_gate(source_metadata)
+    _raise_transition_gate(metadata)
+    if review_run is None and claim.next_action in {"none", "review_requested"}:
+        return TransitionEvidence(source_id, source_run_id, task.assignee or "talos", claim)
+    triggered_review = review_run
+    if triggered_review is not None and triggered_review["profile"] != "athena":
+        raise TransitionValidationError("review_unauthenticated")
+    # The triggering row never chooses its own authority. Both trigger types
+    # resolve the same source-scoped review, including cross-card supersession.
+    review_run = conn.execute(
+        "SELECT r.* FROM task_runs r WHERE EXISTS (SELECT 1 FROM task_links l "
+        "WHERE (l.parent_id=? AND l.child_id=r.task_id) OR (l.child_id=? AND l.parent_id=r.task_id)) "
+        "AND r.profile='athena' ORDER BY r.id DESC LIMIT 1", (source_id, source_id),
+    ).fetchone()
+    completed_events = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='completed'",
+        (source_id, source_run_id),
+    ).fetchall()
+    for event in completed_events:
+        verified = json.loads(event["payload"] or "{}").get("verified_cards", [])
+        if not isinstance(verified, list) or len(verified) > 256:
+            raise TransitionValidationError("ambiguous_input")
+        for reviewed_task in verified:
+            if not isinstance(reviewed_task, str):
+                raise TransitionValidationError("ambiguous_input")
+            candidate = conn.execute("SELECT * FROM task_runs WHERE task_id=? AND profile='athena' ORDER BY id DESC LIMIT 1",
+                                     (reviewed_task,)).fetchone()
+            if candidate is not None and (review_run is None or candidate["id"] > review_run["id"]):
+                review_run = candidate
+    if claim.review_task_id and (review_run is None or review_run["task_id"] != claim.review_task_id):
+        raise TransitionValidationError("review_stale")
+    if triggered_review is not None and (review_run is None or review_run["id"] != triggered_review["id"]):
+        raise TransitionValidationError("review_stale")
+    if review_run is None:
+        raise TransitionValidationError("review_missing")
+    verdict = _authenticate_transition_review(conn, review_run, task, sr, claim, require_admission=not admitting_completion)
+    return TransitionEvidence(source_id, source_run_id, task.assignee or "talos", claim,
+                              review_run["id"], verdict, _transition_review_failures(conn, claim, task))
+
+
+def _raise_transition_gate(metadata: Mapping[str, object]) -> None:
+    hard_gate = metadata.get("gate")
+    if hard_gate is not None:
+        allowed = {"approval_required", "human_approval_required", "auth_or_credential", "sensitive_action",
+                   "ambiguous_write", "ambiguous_input", "refusal", "data_loss", "self_approval"}
+        raise TransitionValidationError(hard_gate if isinstance(hard_gate, str) and hard_gate in allowed else "ambiguous_input")
+
+
+def _transition_metadata(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    if row is None:
+        raise TransitionValidationError("ambiguous_input")
+    value = json.loads(row["metadata"] or "{}")
+    if not isinstance(value, dict):
+        raise TransitionValidationError("ambiguous_input")
+    return value
+
+
+def list_transitions(conn: sqlite3.Connection, task_id: str) -> list[dict[str, object]]:
+    """Read-only control-plane diagnostics; lease credentials stay internal."""
+    return [dict(row) for row in conn.execute(
+        "SELECT transition_key, source_task_id, source_run_id, transition_kind, state, "
+        "lease_expires_at, attempt_count, outcome, successor_task_id, block_code, "
+        "last_error, block_recurrences FROM task_transitions WHERE source_task_id=? ORDER BY source_run_id",
+        (task_id,),
+    )]
+
+
+def transition_eligibility(
+    metadata: Mapping[str, object], evidence: Optional[TransitionEvidence] = None,
+) -> TransitionDecision:
+    """Pure policy. Missing evidence never becomes permission."""
+    if evidence is None and "transition" not in metadata:
+        return TransitionDecision("no_successor", "no_next_action")
+    claim = evidence.claim if evidence else TransitionClaim.parse(metadata["transition"])
+    if claim.next_action == "none":
+        return TransitionDecision("no_successor", "no_next_action")
+    if claim.next_action == "review_requested" and (evidence is None or evidence.verdict is None):
+        return TransitionDecision("create_successor", "review_requested", "athena", claim=claim)
+    if evidence is None or evidence.verdict is None:
+        return TransitionDecision("gate", "review_missing")
+    verdict = evidence.verdict
+    if verdict.verdict == "needs_input":
+        return TransitionDecision("gate", "verdict_needs_input", "Jason")
+    if verdict.verdict == "reject":
+        if evidence.failed_reviews > 5:
+            return TransitionDecision("gate", "review_ceiling", "Jason")
+        if verdict.findings_count == 0:
+            return TransitionDecision("gate", "verdict_reject")
+        action = "repair_requested"
+    else:
+        if verdict.ci_conclusion != "success":
+            return TransitionDecision("gate", "ci_not_success")
+        if verdict.findings_count:
+            return TransitionDecision("gate", "verdict_reject")
+        action = "readiness_successor"
+    return TransitionDecision("create_successor", action, "talos" if action == "readiness_successor" else evidence.source_assignee,
+                              evidence.source_task_id, evidence.source_run_id, claim, evidence.review_run_id)
+
+
+def _transition_attempt_limit(conn: sqlite3.Connection, row: sqlite3.Row, failure_limit: Optional[int]) -> int:
+    task = get_task(conn, row["source_task_id"])
+    return max(1, task.max_retries if task and task.max_retries else (failure_limit or DEFAULT_FAILURE_LIMIT))
+
+
+def _evaluate_transition(
+    conn: sqlite3.Connection, row: sqlite3.Row, failure_limit: Optional[int] = None,
+) -> TransitionDecision:
+    try:
+        if row["source_run_id"] == 0:
+            return TransitionDecision("no_successor", "administrative_completion")
+        immutable = {"approval_required", "human_approval_required", "auth_or_credential", "sensitive_action",
+                     "ambiguous_write", "refusal", "data_loss", "self_approval", "retry_exhausted"}
+        if row["block_code"] in immutable:
+            return TransitionDecision("gate", row["block_code"], "Jason")
+        metadata = _transition_metadata(conn, row["source_run_id"])
+        decision = transition_eligibility(metadata, _resolve_transition_evidence(conn, row, metadata))
+        if decision.kind == "create_successor" and row["attempt_count"] > _transition_attempt_limit(conn, row, failure_limit):
+            return TransitionDecision("gate", "retry_exhausted")
+        return decision
+    except (TransitionValidationError, json.JSONDecodeError) as exc:
+        code = str(exc) if isinstance(exc, TransitionValidationError) else "schema_invalid"
+        return TransitionDecision("gate", code)
+
+
+def claim_transition(
+    conn: sqlite3.Connection, key: str, *, owner: str, ttl_seconds: Optional[int] = None,
+) -> bool:
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_transitions SET state='consuming', lease_owner=?, "
+            "lease_expires_at=?, attempt_count=attempt_count+1, updated_at=? "
+            "WHERE transition_key=? AND (state='pending' OR "
+            "(state='consuming' AND lease_expires_at < ?))",
+            (owner, now + _resolve_claim_ttl_seconds(ttl_seconds), now, key, now),
+        )
+        if cur.rowcount != 1:
+            return False
+        row = conn.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
+        _append_event(conn, row["source_task_id"], "transition_claimed", {
+            "transition_key": key, "attempt_count": row["attempt_count"],
+        }, run_id=row["source_run_id"])
+    return True
+
+
+def _transition_owned(conn: sqlite3.Connection, key: str, owner: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM task_transitions WHERE transition_key=? AND state='consuming' "
+        "AND lease_owner=? AND lease_expires_at >= ?",
+        (key, owner, int(time.time())),
+    ).fetchone()
+
+
+def _apply_transition_decision(
+    conn: sqlite3.Connection, key: str, owner: str, decision: TransitionDecision,
+    failure_limit: Optional[int] = None,
+) -> bool:
+    with write_txn(conn):
+        row = _transition_owned(conn, key, owner)
+        if row is None:
+            return False
+        # Bind effects to current durable evidence, not the earlier snapshot.
+        current = _evaluate_transition(conn, row, failure_limit)
+        if current != decision:
+            decision = current if current.kind == "gate" else TransitionDecision("gate", "review_stale")
+        successor_id = None
+        if decision.kind == "create_successor":
+            successor_id = _existing_transition_successor(conn, row, decision)
+            active_owner = _transition_active_writer(conn, row, decision) if successor_id is None else None
+            if active_owner is not None:
+                decision = TransitionDecision("gate", "active_writer_hold", active_owner)
+            elif successor_id is None:
+                successor_id = _insert_transition_successor(conn, row, decision)
+        blocked = decision.kind == "gate"
+        conn.execute(
+            "UPDATE task_transitions SET state=?, outcome=?, block_code=?, successor_task_id=?, decision_json=?, effect_key=?, "
+            "lease_owner=NULL, lease_expires_at=NULL, updated_at=?, "
+            "block_recurrences=block_recurrences+? WHERE transition_key=?",
+            ("blocked" if blocked else "consumed", None if blocked else ("successor_created" if successor_id else "no_successor"),
+             decision.code if blocked else None, successor_id, json.dumps(asdict(decision), sort_keys=True),
+             _transition_effect_key(row, decision), int(time.time()), int(blocked), key),
+        )
+        _append_event(conn, row["source_task_id"], "transition_blocked" if blocked else "transition_consumed", {
+            "transition_key": key, "code": decision.code, "owner": decision.owner,
+        }, run_id=row["source_run_id"])
+        if blocked and row["block_recurrences"] + 1 >= BLOCK_RECURRENCE_LIMIT:
+            _append_event(conn, row["source_task_id"], "transition_triage", {
+                "transition_key": key, "code": decision.code, "owner": "Jason",
+            }, run_id=row["source_run_id"])
+        _transition_crashpoint("in_effect_before_commit")
+    _transition_crashpoint("after_effect_commit")
+    return True
+
+
+def _transition_effect_key(row: sqlite3.Row, decision: TransitionDecision) -> str:
+    return "{}:{}:{}:{}".format(decision.source_task_id or row["source_task_id"],
+                                decision.source_run_id or row["source_run_id"],
+                                decision.review_run_id or 0, decision.code)
+
+
+def _existing_transition_successor(
+    conn: sqlite3.Connection, row: sqlite3.Row, decision: TransitionDecision,
+) -> Optional[str]:
+    existing = conn.execute("SELECT id FROM tasks WHERE origin_transition_key=?", (row["transition_key"],)).fetchone()
+    if existing is not None:
+        return str(existing["id"])
+    # Source-complete and review-complete can describe the very same effect.
+    # Serialize this semantic dedupe with the effect txn, including archived
+    # successors, so a second trigger cannot recreate already-finished work.
+    previous = conn.execute(
+        "SELECT successor_task_id FROM task_transitions WHERE effect_key=? "
+        "AND state='consumed' AND successor_task_id IS NOT NULL LIMIT 1",
+        (_transition_effect_key(row, decision),),
+    ).fetchone()
+    return str(previous["successor_task_id"]) if previous else None
+
+
+def _transition_active_writer(conn: sqlite3.Connection, row: sqlite3.Row, decision: TransitionDecision) -> Optional[str]:
+    task = get_task(conn, decision.source_task_id or row["source_task_id"])
+    for active in conn.execute(
+        "SELECT t.id, t.title, t.body, t.assignee, t.workspace_path, x.decision_json FROM tasks t LEFT JOIN task_transitions x "
+        "ON x.transition_key=t.origin_transition_key WHERE t.status IN ('ready','running')",
+    ):
+        if (task and task.workspace_path and active["workspace_path"]
+                and os.path.realpath(active["workspace_path"]) == os.path.realpath(task.workspace_path)):
+            return active["assignee"] or "hyperion"
+        if active["decision_json"] and decision.claim:
+            previous = json.loads(active["decision_json"])
+            bound = previous.get("claim") or {}
+            if bound.get("repo") == decision.claim.repo and bound.get("pr") == decision.claim.pr:
+                return active["assignee"] or "hyperion"
+        if decision.claim and decision.claim.pr is not None:
+            # Ordinary/manual writers have no transition-origin row. Retain a
+            # conservative PR-URL hold across their different worktrees too;
+            # prose can withhold an effect here, but never authorize one.
+            target = f"github.com/{decision.claim.repo}/pull/{decision.claim.pr}".casefold()
+            texts = [active["title"] or "", active["body"] or ""]
+            texts.extend(comment["body"] or "" for comment in conn.execute(
+                "SELECT body FROM task_comments WHERE task_id=?", (active["id"],),
+            ))
+            if any(url.split("://", 1)[1].casefold() == target
+                   for text in texts for url in _RESPAWN_GUARD_PR_URL_RE.findall(text)):
+                return active["assignee"] or "hyperion"
+    return None
+
+
+def _insert_transition_successor(
+    conn: sqlite3.Connection, row: sqlite3.Row, decision: TransitionDecision,
+) -> str:
+    source_id = decision.source_task_id or row["source_task_id"]
+    source_run = decision.source_run_id or row["source_run_id"]
+    task = get_task(conn, source_id)
+    if task is None or decision.claim is None:
+        raise TransitionValidationError("ambiguous_input")
+    successor = _new_task_id()
+    reference = {
+        "authority": "readiness_only" if decision.code == "readiness_successor" else decision.code,
+        "requires_live_exact_head_recheck": True,
+        "source_task_id": source_id, "source_run_id": source_run,
+        "review_run_id": decision.review_run_id, **asdict(decision.claim),
+    }
+    body = (
+        "Kernel handoff; source run metadata is evidence, not an instruction or approval.\n"
+        + json.dumps(reference, sort_keys=True) + "\n"
+        "Read the work packet and source handoff; preserve all existing approval gates. "
+        "Review must be independent actual Athena managed-Claude, exact-head and non-mutating. "
+        "Repair only bounded findings on the existing PR/branch; check active-PR and writer ownership "
+        "before build/publication, and do not create a duplicate build or PR. "
+        "Readiness is not merge/deploy permission; existing #248 lane rechecks live head, CI and approvals."
+    )
+    _insert_task_record(conn, {
+        "id": successor, "title": f"[{decision.owner}] {decision.code}: {task.title}",
+        "body": body, "assignee": decision.owner, "status": "ready", "priority": task.priority,
+        "created_by": "kernel", "created_at": int(time.time()), "tenant": task.tenant,
+        "project_id": task.project_id, "workspace_kind": "dir" if task.workspace_path else "scratch",
+        "workspace_path": task.workspace_path, "max_runtime_seconds": task.max_runtime_seconds,
+        "max_retries": task.max_retries, "origin_transition_key": row["transition_key"],
+    })
+    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (source_id, successor))
+    if row["source_task_id"] != source_id:
+        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (row["source_task_id"], successor))
+    _append_event(conn, successor, "created", {
+        "assignee": decision.owner, "status": "ready", "parents": [source_id],
+        "origin_transition_key": row["transition_key"], "source_run_id": source_run,
+    })
+    return successor
+
+
+def consume_transition(
+    conn: sqlite3.Connection, key: str, *, ttl_seconds: Optional[int] = None,
+    failure_limit: Optional[int] = None,
+) -> bool:
+    """Shared hook/sweep path. All effects are DB-local and lease-fenced."""
+    owner = secrets.token_hex(16)
+    if not claim_transition(conn, key, owner=owner, ttl_seconds=ttl_seconds):
+        return False
+    _transition_crashpoint("after_claim")
+    row = conn.execute("SELECT * FROM task_transitions WHERE transition_key=?", (key,)).fetchone()
+    try:
+        decision = _evaluate_transition(conn, row, failure_limit)
+        with write_txn(conn):
+            if _transition_owned(conn, key, owner) is None:
+                return False
+            conn.execute(
+                "UPDATE task_transitions SET decision_json=?, updated_at=? WHERE transition_key=?",
+                (json.dumps(asdict(decision), sort_keys=True), int(time.time()), key),
+            )
+            _append_event(conn, row["source_task_id"], "transition_decided", {
+                "transition_key": key, **asdict(decision),
+            }, run_id=row["source_run_id"])
+        _transition_crashpoint("after_decision")
+        return _apply_transition_decision(conn, key, owner, decision, failure_limit)
+    except Exception:
+        # Rollback happened inside write_txn. Persist only a fixed classification,
+        # never exception text (SQLite/provider errors can carry submitted secrets).
+        with write_txn(conn):
+            held = _transition_owned(conn, key, owner)
+            if held is not None:
+                task = get_task(conn, row["source_task_id"])
+                limit = task.max_retries if task and task.max_retries else (failure_limit or DEFAULT_FAILURE_LIMIT)
+                exhausted = held["attempt_count"] >= max(1, limit)
+                conn.execute(
+                    "UPDATE task_transitions SET state=?, block_code=?, last_error='consumer_error', "
+                    "lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE transition_key=?",
+                    ("blocked" if exhausted else "pending", "retry_exhausted" if exhausted else None,
+                     int(time.time()), key),
+                )
+                _append_event(conn, row["source_task_id"], "transition_error", {
+                    "transition_key": key, "code": "retry_exhausted" if exhausted else "consumer_error",
+                }, run_id=row["source_run_id"])
+        raise RuntimeError("kanban transition consumer_error") from None
 
 
 # ---------------------------------------------------------------------------
@@ -5090,6 +5875,23 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+def _transition_retains_workspace(conn: sqlite3.Connection, task_id: str) -> bool:
+    # Before the sweep creates a child, the durable intent is the only owner of
+    # the producer's scratch artifacts. Plain legacy completions still clean up.
+    for row in conn.execute(
+        "SELECT r.metadata FROM task_transitions x JOIN task_runs r ON r.id=x.source_run_id "
+        "WHERE x.source_task_id=? AND x.state IN ('pending','consuming','blocked')", (task_id,),
+    ):
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except json.JSONDecodeError:
+            _log.warning("Retaining scratch workspace for invalid transition metadata")
+            return True
+        if isinstance(metadata, dict) and ("transition" in metadata or "verdict" in metadata):
+            return True
+    return False
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -5112,6 +5914,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # completion may still unblock a deferred parent scratch cleanup
             # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
             _try_cleanup_parent_workspaces(conn, task_id)
+            return
+        if _transition_retains_workspace(conn, task_id):
             return
         # Check if this task has children that still need the workspace.
         # If any child is not yet done/archived, defer cleanup so the
@@ -5178,6 +5982,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 (parent_id,),
             ).fetchone()
             if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+                continue
+            if _transition_retains_workspace(conn, parent_id):
                 continue
             # Check if ALL children of this parent are terminal
             active = conn.execute(
@@ -5713,7 +6519,9 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, actor: Optional[str] = None, reason: Optional[str] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -5725,6 +6533,25 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        transitions = conn.execute(
+            "SELECT * FROM task_transitions WHERE source_task_id=? AND state='blocked'",
+            (task_id,),
+        ).fetchall()
+        if transitions:
+            from hermes_cli.profiles import get_active_profile_name
+
+            for transition in transitions:
+                conn.execute("UPDATE task_transitions SET state='pending', updated_at=? WHERE transition_key=?",
+                             (now, transition["transition_key"]))
+                _append_event(conn, task_id, "transition_unblocked", {
+                    "transition_key": transition["transition_key"], "actor": actor or get_active_profile_name(),
+                    "reason": reason, "prior_gate_code": transition["block_code"],
+                }, run_id=transition["source_run_id"])
+            # Never re-run a completed producer to reconsider its handoff.
+            # Only fresh durable evidence, not reason text, can resolve a gate.
+            task = get_task(conn, task_id)
+            if task and task.status == "done":
+                return True
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -8169,6 +8996,7 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    sweep_transitions(conn, dry_run=dry_run, ttl_seconds=ttl_seconds, failure_limit=failure_limit)
 
     # Both global knobs are live-worker caps. Normalize unsafe direct callers
     # here (not only at config resolution) so invalid/non-positive values retain
@@ -8195,7 +9023,7 @@ def _dispatch_once_locked(
     running_count = local_running_count + max(0, int(external_running_count or 0))
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, origin_transition_key FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -8251,6 +9079,8 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if worker_cap is not None and running_count + spawned >= worker_cap:
             break
+        if row["origin_transition_key"] and _transition_parent_process_alive(conn, row["id"]):
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
