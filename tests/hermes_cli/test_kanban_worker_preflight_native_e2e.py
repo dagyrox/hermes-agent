@@ -504,10 +504,8 @@ def test_synthetic_reviewer_uses_unfiltered_schemas_and_real_mcp(native_protocol
     "profile,scenario,code",
     [
         ("talos", "missing", "credential_missing"),
-        ("talos", "timeout", "probe_timeout"),
         ("talos", "catalog", "capability_mismatch"),
         ("athena", "missing", "credential_missing"),
-        ("athena", "timeout", "probe_timeout"),
         ("athena", "flood", "probe_failed"),
         ("athena", "cli", "transport_unsupported"),
         ("athena", "tools", "tool_unavailable"),
@@ -528,17 +526,14 @@ def test_native_failure_matrix(native_protocol, monkeypatch, profile, scenario, 
         f["home"].joinpath("profiles/talos/models_dev_cache.json").write_text(
             '{"fixture": {}}'
         )
-    elif scenario == "timeout" and profile == "talos":
-        f["state"]["delay"] = True
     elif scenario == "cli":
         f["fake"].unlink()
         monkeypatch.setenv("PATH", str(f["fake"].parent) + ":/usr/bin:/bin")
     else:
         f["home"].parent.joinpath("claude-scenario").write_text(scenario)
-    started = time.monotonic()
     task, events = f["launch"](
         profile,
-        timeout=4 if scenario == "timeout" else 45,
+        timeout=45,
         toolsets=["hermes-cli"] if scenario == "tools" else None,
         reviewer=scenario != "tools",
     )
@@ -548,12 +543,38 @@ def test_native_failure_matrix(native_protocol, monkeypatch, profile, scenario, 
             e.payload["missing"] for e in events if e.kind == "preflight_failed"
         )
         assert "terminal" in missing and "kanban_attach" in missing
-    if scenario == "timeout":
-        assert time.monotonic() - started < 12
     if profile == "athena" or scenario in {"missing", "catalog"}:
         assert not f["requests"]
     if profile == "talos":
         assert not f["home"].parent.joinpath("claude-calls.jsonl").exists()
+
+
+def test_availability_timeout_advances_supervisor_to_next_leg(native_protocol):
+    f = native_protocol
+    f["state"]["delay"] = True
+    started = time.monotonic()
+    task, events = f["launch"]("talos", timeout=4)
+    assert time.monotonic() - started < 20
+    # The codex primary probe times out (an availability/capacity condition), so
+    # admission must NOT block the card: no preflight_failed event is recorded
+    # and the supervisor advances through the chain with auditable provenance.
+    assert not any(e.kind == "preflight_failed" for e in events)
+    comments = [c.body for c in f["kb"].list_comments(f["conn"], task.id)]
+    # The primary leg is recorded as degraded with stage and code.
+    assert any(
+        "Backend degraded before tool execution: kind=api, provider=openai-codex, "
+        "model=gpt-6.1-sol, stage=probe, code=probe_timeout" in body
+        for body in comments
+    )
+    # The supervisor advanced to the Claude subscription leg.
+    assert any(
+        "Backend degraded before tool execution: kind=claude_code, "
+        "provider=claude-code-subscription" in body
+        for body in comments
+    )
+    # The chain exhausted (all three legs degraded/refused by the fixture), so
+    # the card blocks on exhaustion — not on the primary's admission failure.
+    assert task.status == "blocked"
 
 
 def test_direct_codex_override_proceeds_after_probe(native_protocol):

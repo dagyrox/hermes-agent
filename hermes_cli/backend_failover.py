@@ -187,6 +187,30 @@ def classify_failed_result(result: dict[str, Any]) -> int:
     return 1
 
 
+_ADMISSION_ELIGIBLE_CODES = frozenset({"probe_timeout", "probe_transient"})
+
+
+def classify_admission_failure(result: dict[str, Any]) -> int:
+    """Map one supervisor admission (preflight) failure to the protocol.
+
+    ``classify_failed_result`` maps a *completed* failed turn; admission and
+    preflight failures have no turn to inspect, so replay-safety is implicit:
+    admission runs before any tool execution, output, or approval activity.
+
+    Only an unambiguous availability/capacity condition of the current leg is
+    eligible to advance to the next frozen leg: a usage-limit/429 credential
+    rejection, a probe timeout, or a transient provider failure. Everything
+    else — refusals, capability/tool mismatches, config/workspace/model
+    failures, and a missing credential that is not a quota condition — stays
+    fail-closed.
+    """
+
+    code = str(result.get("code") or "").strip().lower()
+    if code in _ADMISSION_ELIGIBLE_CODES:
+        return EXIT_ELIGIBLE
+    return 1
+
+
 def resolve_role_chain(config: dict[str, Any] | None, profile: str, *, provider_access: dict | None = None) -> tuple[BackendLeg, ...]:
     """Validate and return one profile's exact three-leg canonical chain."""
 

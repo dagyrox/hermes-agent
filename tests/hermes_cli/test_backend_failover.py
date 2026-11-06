@@ -188,6 +188,45 @@ def test_partial_assistant_output_dominates_eligible_api_failure():
     assert classify_failed_result(result) == EXIT_AMBIGUOUS
 
 
+def test_admission_failure_advances_only_on_availability_capacity():
+    from hermes_cli.backend_failover import EXIT_ELIGIBLE, classify_admission_failure
+
+    # A usage-limit/429 credential rejection, a probe timeout, and a transient
+    # provider failure all surface as probe_transient / probe_timeout and are
+    # the only admission failures eligible to advance to the next frozen leg.
+    assert classify_admission_failure({"code": "probe_transient"}) == EXIT_ELIGIBLE
+    assert classify_admission_failure({"code": "probe_timeout"}) == EXIT_ELIGIBLE
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "credential_missing",   # missing credential that is NOT a quota condition
+        "credential_rejected",  # invalid credential (401/403)
+        "capability_mismatch",
+        "tool_unavailable",
+        "config_invalid",
+        "workspace_invalid",
+        "model_unresolved",
+        "operation_unavailable",
+        "probe_failed",
+        "transport_unsupported",
+    ],
+)
+def test_admission_failure_stays_fail_closed_for_non_availability(code):
+    from hermes_cli.backend_failover import EXIT_ELIGIBLE, classify_admission_failure
+
+    assert classify_admission_failure({"code": code}) != EXIT_ELIGIBLE
+
+
+def test_admission_failure_requires_evidence_and_is_case_insensitive():
+    from hermes_cli.backend_failover import EXIT_ELIGIBLE, classify_admission_failure
+
+    assert classify_admission_failure({}) != EXIT_ELIGIBLE
+    assert classify_admission_failure({"code": ""}) != EXIT_ELIGIBLE
+    assert classify_admission_failure({"code": "PROBE_TRANSIENT"}) == EXIT_ELIGIBLE
+
+
 def test_current_attempt_progress_excludes_history_and_detects_live_output():
     from hermes_cli.backend_failover import build_current_attempt_progress
 

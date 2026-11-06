@@ -1134,6 +1134,64 @@ def test_worker_refusal_blocks_without_restart_or_fallback(monkeypatch):
     assert blocked and "refusal" in blocked[0][1].lower()
 
 
+def test_degrade_comment_carries_admission_stage_and_code():
+    from hermes_cli import backend_failover_worker as worker
+
+    leg = _leg(model="gpt-6.1-sol")
+    plain = worker._degrade_comment(leg)
+    assert "kind=api, provider=openai-codex, model=gpt-6.1-sol" in plain
+    assert "stage=" not in plain and "code=" not in plain
+
+    audited = worker._degrade_comment(
+        leg, {"stage": "probe", "code": "probe_transient"}
+    )
+    assert "stage=probe, code=probe_transient" in audited
+
+
+def test_quota_exhausted_primary_admission_advances_without_blocking(monkeypatch, tmp_path):
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import worker_preflight as preflight
+
+    legs = (
+        _leg(model="codex-primary"),  # quota-exhausted openai-codex primary
+        _leg(kind="claude_code", provider=None, model="claude-sonnet-5-5"),
+        _leg(provider="deepseek", model="deepseek-flash"),
+    )
+    attempted = []
+    blocked = []
+
+    def fake_run_leg(leg, *_args, **_kwargs):
+        attempted.append(leg.model)
+        return 0  # the Claude fallback leg succeeds
+
+    monkeypatch.setattr(worker, "_load_chain", lambda _profile: legs)
+    monkeypatch.setattr(worker, "_run_leg", fake_run_leg)
+    monkeypatch.setattr(worker, "_task_status", lambda _task: "running")
+    monkeypatch.setattr(worker, "_comment", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(worker, "_block_task", lambda task, reason: blocked.append((task, reason)))
+    monkeypatch.setattr(worker, "_validate_dispatch_context", lambda _args: tmp_path)
+    monkeypatch.setattr(worker, "_mcp_config", lambda *a: tmp_path / "mcp")
+    monkeypatch.setattr(worker, "_system_prompt", lambda *a: tmp_path / "system")
+    monkeypatch.setattr(worker, "_effective_context_chars", lambda *a, **kw: 0)
+    monkeypatch.setattr(
+        preflight,
+        "run_supervisor_preflight",
+        lambda _args, _primary, _home: (_ for _ in ()).throw(
+            preflight.SupervisorAdmissionEligible(
+                {"stage": "probe", "code": "probe_transient"}
+            )
+        ),
+    )
+
+    rc = worker.run(["--profile", "talos", "--task", "t_probe", "--timeout-seconds", "60"])
+
+    assert rc == 0
+    # The quota-exhausted primary was admission-degraded (never spawned a child)
+    # and the supervisor advanced to the Claude fallback leg, which succeeded.
+    assert attempted == ["claude-sonnet-5-5"]
+    assert blocked == []
+
+
 def test_dispatcher_selects_supervisor_only_for_enabled_role(monkeypatch):
     from hermes_cli import kanban_db as kb
 
