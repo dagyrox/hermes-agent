@@ -120,6 +120,22 @@ class WorkerPreflightBlocked(RuntimeError):
         super().__init__(self.payload["code"])
 
 
+class SupervisorAdmissionEligible(Exception):
+    """A frozen-primary admission failed on an availability/capacity condition.
+
+    Raised only from the supervisor preflight path (``primary`` is set) when the
+    admission result is an unambiguous transient condition — a usage-limit/429
+    credential rejection, a probe timeout, or a transient provider failure.
+    Re-authenticating cannot resolve it, so the supervisor must advance to the
+    next frozen leg exactly once instead of blocking the card. Carries the
+    sanitized result for auditable provenance.
+    """
+
+    def __init__(self, result: dict):
+        self.result = result
+        super().__init__(result.get("code") or "admission_eligible")
+
+
 def dispatch_admission(profile_home: str | None) -> dict | None:
     """Read opt-in from the resolved assignee only; never inherit admission."""
     if not profile_home:
@@ -553,11 +569,22 @@ def run_worker_preflight(args, *, primary=None) -> dict | None:
         result.get("outcome") == "passed" and result.get("code") == "startup_passed"
     )
     result["outcome"] = "passed" if passed else "failed"
+    from hermes_cli.backend_failover import EXIT_ELIGIBLE, classify_admission_failure
+
     kind = (
         "transient"
-        if result["code"] in {"probe_timeout", "probe_transient"}
+        if classify_admission_failure(result) == EXIT_ELIGIBLE
         else "capability"
     )
+    if not passed and primary is not None and kind == "transient":
+        # A frozen-primary admission that failed on an availability/capacity
+        # condition (usage-limit/429 rejection, probe timeout, transient
+        # provider failure) must not block the card. Surface the sanitized
+        # classification to the supervisor so it advances to the next frozen
+        # leg exactly once; the direct worker path stays fail-closed.
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        os.environ.pop("HERMES_KANBAN_PREFLIGHT", None)
+        raise SupervisorAdmissionEligible(result)
     with kb.connect_closing() as conn:
         recorded = kb.record_preflight_outcome(
             conn, task_id, run_id=run_id, passed=passed, payload=result, kind=kind
@@ -672,8 +699,16 @@ def _probe(args) -> dict:
                 )
         result.update(code="startup_passed", outcome="passed")
     except Exception as exc:
+        from hermes_cli.auth import is_rate_limited_auth_error
+
         status = getattr(exc, "status_code", None)
-        if type(status) is int:
+        if is_rate_limited_auth_error(exc):
+            # Codex OAuth quota exhaustion (HTTP 429 usage_limit) surfaces as an
+            # AuthError during credential resolution, before any wire request.
+            # Re-authenticating cannot resolve it; classify it as a transient
+            # availability condition so the supervisor can advance the leg.
+            result.update(stage="probe", code="probe_transient")
+        elif type(status) is int:
             result["http_status"] = status
             result["code"] = (
                 "credential_rejected"

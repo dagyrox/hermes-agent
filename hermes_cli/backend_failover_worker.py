@@ -966,6 +966,32 @@ def _classify_claude_failure(returncode: int, stdout: str, stderr: str) -> int:
     return EXIT_AMBIGUOUS
 
 
+def _degrade_comment(leg: BackendLeg, admission: dict[str, Any] | None = None) -> str:
+    """Auditable degrade provenance for the Kanban card.
+
+    ``admission`` is the sanitized supervisor admission result when the leg was
+    degraded by a preflight availability/capacity failure; it appends the stage
+    and code so the transition is auditable (kind/provider/model are always
+    present).
+    """
+
+    detail = (
+        f"kind={leg.kind}, provider={leg.provider or 'claude-code-subscription'}, "
+        f"model={leg.model}"
+    )
+    if admission:
+        stage = admission.get("stage")
+        code = admission.get("code")
+        if stage:
+            detail += f", stage={stage}"
+        if code:
+            detail += f", code={code}"
+    return (
+        f"Backend degraded before tool execution: {detail}; "
+        "continuing to the next frozen route leg with the Kanban card as the durable handoff."
+    )
+
+
 def _run_leg(
     leg: BackendLeg,
     index: int,
@@ -1060,12 +1086,16 @@ def run(argv: list[str] | None = None) -> int:
     if len(legs) != 3:
         raise RuntimeError("backend failover supervisor requires one validated three-leg chain")
 
-    from hermes_cli.worker_preflight import run_supervisor_preflight
+    from hermes_cli.worker_preflight import run_supervisor_preflight, SupervisorAdmissionEligible
 
+    admission = None
     try:
         passed_settings = run_supervisor_preflight(args, legs[0], profile_home)
     except SystemExit as exc:
         return int(exc.code or 0)
+    except SupervisorAdmissionEligible as exc:
+        passed_settings = None
+        admission = exc.result
     args.reviewer_contract = bool(
         passed_settings and passed_settings.get("role_contract") == "reviewer"
     )
@@ -1146,7 +1176,12 @@ def run(argv: list[str] | None = None) -> int:
         }
         attempts.append(record)
         _write_ledger(ledger_path, ledger)
-        returncode = _run_leg(leg, index, args, mcp_path, system_path, remaining)
+        admission_here = admission if index == 0 else None
+        returncode = (
+            EXIT_ELIGIBLE
+            if admission_here is not None
+            else _run_leg(leg, index, args, mcp_path, system_path, remaining)
+        )
         record["outcome"] = "finished"
         record["returncode"] = returncode
         if returncode == EXIT_ELIGIBLE:
@@ -1155,12 +1190,12 @@ def run(argv: list[str] | None = None) -> int:
                 "provider": leg.provider or "claude-code-subscription",
                 "model": leg.model,
             }
-            if not _comment(
-                args.task,
-                f"Backend degraded before tool execution: kind={leg.kind}, "
-                f"provider={leg.provider or 'claude-code-subscription'}, model={leg.model}; "
-                "continuing to the next frozen route leg with the Kanban card as the durable handoff.",
-            ):
+            if admission_here is not None:
+                record["degraded_source"]["admission"] = {
+                    "stage": admission_here.get("stage"),
+                    "code": admission_here.get("code"),
+                }
+            if not _comment(args.task, _degrade_comment(leg, admission_here)):
                 returncode = 0
                 record["returncode"] = 0
         _write_ledger(ledger_path, ledger)

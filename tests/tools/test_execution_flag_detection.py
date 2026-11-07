@@ -32,6 +32,22 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     assert completed.stdout == expected_output
 
 
+def _is_gnu_coreutils_sort() -> bool:
+    """True when ``sort`` is GNU coreutils, the only implementation whose
+    ``--compress-program`` consumes the next argv verbatim — including a
+    leading-dash program name. uutils coreutils ``sort`` (0.8.x) re-parses a
+    leading-dash value as a short option, so the leading-dash payload premise
+    does not hold there and the subcase must skip rather than fail spuriously.
+    """
+    try:
+        version = subprocess.run(
+            ["sort", "--version"], text=True, capture_output=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "GNU coreutils" in version
+
+
 @pytest.mark.parametrize(
     ("tool", "args", "stdin", "needs_tty"),
     [
@@ -49,6 +65,11 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if tool == "sort" and not _is_gnu_coreutils_sort():
+        pytest.skip(
+            "sort is not GNU coreutils; --compress-program does not consume a "
+            "leading-dash program name (uutils coreutils re-parses it as an option)"
+        )
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
