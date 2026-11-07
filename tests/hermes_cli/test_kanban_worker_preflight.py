@@ -165,6 +165,34 @@ def test_probe_classifies_codex_quota_exhaustion_as_transient(monkeypatch):
     assert result["stage"] == "probe"
 
 
+def test_probe_classifies_relogin_required_auth_error_as_missing_credential(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import provider_access, runtime_provider
+    from hermes_cli.auth import AuthError, CODEX_RATE_LIMITED_CODE
+    from hermes_cli.worker_preflight import _probe
+
+    monkeypatch.setattr(provider_access, "trusted_profile", lambda: False)
+    monkeypatch.setattr(provider_access, "load_provider_access", lambda: {})
+
+    def resolve(**kwargs):
+        raise AuthError(
+            "Codex credential is no longer valid; re-login required.",
+            provider="openai-codex",
+            code=CODEX_RATE_LIMITED_CODE,
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", resolve)
+    result = _probe(
+        SimpleNamespace(provider="openai-codex", model="gpt-6.1-sol", timeout=15, max_tokens=16)
+    )
+    # A relogin-required auth error is a missing/invalid credential, NOT a
+    # transient availability condition: it must stay fail-closed
+    # (credential_missing), never surface as probe_transient.
+    assert result["code"] == "credential_missing"
+    assert result["stage"] == "credential"
+
+
 def test_invalid_diagnostic_values_do_not_escape():
     from hermes_cli.worker_preflight import sanitize_outcome
 

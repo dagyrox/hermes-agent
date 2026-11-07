@@ -577,6 +577,34 @@ def test_availability_timeout_advances_supervisor_to_next_leg(native_protocol):
     assert task.status == "blocked"
 
 
+def test_athena_native_primary_timeout_advances(native_protocol):
+    f = native_protocol
+    f["home"].parent.joinpath("claude-scenario").write_text("timeout")
+    started = time.monotonic()
+    task, events = f["launch"]("athena", timeout=4)
+    assert time.monotonic() - started < 20
+    # (a) The native Claude primary probe times out (an availability/capacity
+    # condition), so admission must NOT block the card: no preflight_failed
+    # event is recorded and the supervisor advances with auditable provenance.
+    assert not any(e.kind == "preflight_failed" for e in events)
+    comments = [c.body for c in f["kb"].list_comments(f["conn"], task.id)]
+    # (b) The native primary leg is recorded as degraded with stage and code.
+    assert any(
+        "Backend degraded before tool execution: kind=claude_code, "
+        "provider=claude-code-subscription" in body
+        and "stage=probe, code=probe_timeout" in body
+        for body in comments
+    )
+    # (c) Leg 0 spawned no child: claude-calls.jsonl carries only the admission
+    # probe (probe=True); no non-probe execution call was ever made.
+    calls = [
+        json.loads(line)
+        for line in (f["home"].parent / "claude-calls.jsonl").read_text().splitlines()
+    ]
+    assert calls
+    assert all(call["probe"] is True for call in calls)
+
+
 def test_direct_codex_override_proceeds_after_probe(native_protocol):
     f = native_protocol
     f["state"]["status"] = 200

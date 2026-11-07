@@ -1192,6 +1192,43 @@ def test_quota_exhausted_primary_admission_advances_without_blocking(monkeypatch
     assert blocked == []
 
 
+def test_non_eligible_primary_admission_blocks_without_spawning(monkeypatch, tmp_path):
+    """A non-eligible primary admission failure (credential_missing → SystemExit(2))
+    blocks the card with no leg spawned: the supervisor returns 2 and never runs
+    the chain, so no child leg is attempted."""
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import worker_preflight as preflight
+
+    spawned, blocked = _supervisor_run_setup(
+        monkeypatch, tmp_path, _degraded_three_leg_chain()
+    )
+
+    def fake_run_leg(leg, index, *_args, **_kwargs):
+        spawned.append((index, leg.model))
+        return 0
+
+    monkeypatch.setattr(worker, "_run_leg", fake_run_leg)
+    # A non-eligible admission failure (e.g. credential_missing) surfaces as
+    # SystemExit(2) from the preflight layer; the supervisor must propagate it
+    # without running any leg.
+    monkeypatch.setattr(
+        preflight,
+        "run_supervisor_preflight",
+        lambda _args, _primary, _home: (_ for _ in ()).throw(SystemExit(2)),
+    )
+
+    rc = worker.run(
+        ["--profile", "talos", "--task", "t_probe", "--timeout-seconds", "60"]
+    )
+
+    assert rc == 2
+    # No leg was spawned: the supervisor returned before running the chain.
+    assert spawned == []
+    # The supervisor itself does not block here — the preflight layer already
+    # recorded the terminal admission outcome and blocked the card.
+    assert blocked == []
+
+
 def _degraded_three_leg_chain():
     return (
         _leg(model="codex-primary"),  # quota-exhausted openai-codex primary
