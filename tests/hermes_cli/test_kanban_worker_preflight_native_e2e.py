@@ -603,6 +603,22 @@ def test_athena_native_primary_timeout_advances(native_protocol):
     ]
     assert calls
     assert all(call["probe"] is True for call in calls)
+    # (d) The supervisor actually advanced past leg 0: it recorded the leg-1
+    # attempt, invoked the codex backend (the fixture server received the
+    # gpt-6.1-sol request), and exhausted the chain instead of stopping on the
+    # primary's admission failure.
+    assert any(
+        "Backend route attempt 2/3: kind=api, provider=openai-codex" in body
+        for body in comments
+    )
+    assert f["requests"] and f["requests"][0]["model"] == "gpt-6.1-sol"
+    assert task.status == "blocked"
+    blocked = next(e for e in events if e.kind == "blocked")
+    assert (
+        blocked.payload["reason"]
+        == "Backend exhaustion: all three canonical route legs failed with an "
+        "eligible availability/capacity error."
+    )
 
 
 def test_direct_codex_override_proceeds_after_probe(native_protocol):
