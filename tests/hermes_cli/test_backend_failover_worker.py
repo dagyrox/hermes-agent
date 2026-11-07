@@ -1192,6 +1192,139 @@ def test_quota_exhausted_primary_admission_advances_without_blocking(monkeypatch
     assert blocked == []
 
 
+def _degraded_three_leg_chain():
+    return (
+        _leg(model="codex-primary"),  # quota-exhausted openai-codex primary
+        _leg(kind="claude_code", provider=None, model="claude-sonnet-5-5"),
+        _leg(provider="deepseek", model="deepseek-flash"),
+    )
+
+
+def _supervisor_run_setup(monkeypatch, tmp_path, legs):
+    """Bind the chain and every lifecycle/no-op callback, pin a real ledger under
+    ``tmp_path``, and return the ``(spawned, blocked)`` recorders the caller
+    fills and asserts. Callers still own ``_run_leg`` and the preflight hook."""
+    from hermes_cli import backend_failover_worker as worker
+
+    spawned = []
+    blocked = []
+    monkeypatch.setattr(worker, "_load_chain", lambda _profile: legs)
+    monkeypatch.setattr(worker, "_task_status", lambda _task: "running")
+    monkeypatch.setattr(worker, "_comment", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        worker, "_block_task", lambda task, reason: blocked.append((task, reason))
+    )
+    monkeypatch.setattr(worker, "_validate_dispatch_context", lambda _args: tmp_path)
+    monkeypatch.setattr(worker, "_mcp_config", lambda *a: tmp_path / "mcp")
+    monkeypatch.setattr(worker, "_system_prompt", lambda *a: tmp_path / "system")
+    monkeypatch.setattr(worker, "_effective_context_chars", lambda *a, **kw: 0)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "424242")
+    return spawned, blocked
+
+
+def test_ledger_records_primary_admission_degraded_before_tool_execution(
+    monkeypatch, tmp_path
+):
+    """The leg-0 ledger record carries stage/code provenance and leg 0 was
+    admission-degraded before any tool-executing child was spawned."""
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import worker_preflight as preflight
+    from hermes_cli.backend_failover import EXIT_ELIGIBLE
+
+    spawned, blocked = _supervisor_run_setup(
+        monkeypatch, tmp_path, _degraded_three_leg_chain()
+    )
+
+    def fake_run_leg(leg, index, *_args, **_kwargs):
+        spawned.append((index, leg.model))
+        return 0
+
+    monkeypatch.setattr(worker, "_run_leg", fake_run_leg)
+    monkeypatch.setattr(
+        preflight,
+        "run_supervisor_preflight",
+        lambda _args, _primary, _home: (_ for _ in ()).throw(
+            preflight.SupervisorAdmissionEligible(
+                {"stage": "probe", "code": "probe_transient"}
+            )
+        ),
+    )
+
+    rc = worker.run(
+        ["--profile", "talos", "--task", "t_probe", "--timeout-seconds", "60"]
+    )
+
+    assert rc == 0
+    assert blocked == []
+    # Leg 0 was admission-degraded: it never spawned a tool-executing child.
+    assert spawned == [(1, "claude-sonnet-5-5")]
+
+    ledger_path = worker._ledger_path("t_probe")
+    assert ledger_path is not None
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["task_id"] == "t_probe"
+    attempts = ledger["attempts"]
+    assert [a["index"] for a in attempts] == [0, 1]
+    leg0 = attempts[0]
+    assert leg0["outcome"] == "finished"
+    assert leg0["returncode"] == EXIT_ELIGIBLE
+    assert leg0["degraded_source"]["kind"] == "api"
+    assert leg0["degraded_source"]["provider"] == "openai-codex"
+    assert leg0["degraded_source"]["model"] == "codex-primary"
+    assert leg0["degraded_source"]["admission"] == {
+        "stage": "probe",
+        "code": "probe_transient",
+    }
+    # The fallback leg succeeded and carries no degraded provenance.
+    assert attempts[1]["returncode"] == 0
+    assert "degraded_source" not in attempts[1]
+
+
+def test_ledger_negative_control_degrade_after_spawn_lacks_admission(
+    monkeypatch, tmp_path
+):
+    """A leg degraded only after ``_run_leg`` spawned a child is observably
+    different from admission-degraded: index 0 appears in the spawn list and the
+    ledger's ``degraded_source`` carries no stage/code admission. The positive
+    test's ordering/provenance assertions fail on this divergent input."""
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import worker_preflight as preflight
+    from hermes_cli.backend_failover import EXIT_ELIGIBLE
+
+    spawned, blocked = _supervisor_run_setup(
+        monkeypatch, tmp_path, _degraded_three_leg_chain()
+    )
+
+    def fake_run_leg(leg, index, *_args, **_kwargs):
+        spawned.append((index, leg.model))
+        # Leg 0 spawns a child, then reports an eligible availability failure —
+        # degraded only AFTER tool execution (the unsafe divergence).
+        return EXIT_ELIGIBLE if index == 0 else 0
+
+    monkeypatch.setattr(worker, "_run_leg", fake_run_leg)
+    # Preflight passes (no admission degradation), so leg 0 reaches _run_leg.
+    monkeypatch.setattr(
+        preflight, "run_supervisor_preflight", lambda _args, _primary, _home: None
+    )
+
+    rc = worker.run(
+        ["--profile", "talos", "--task", "t_probe", "--timeout-seconds", "60"]
+    )
+
+    assert rc == 0
+    # Unsafe divergence: leg 0 DID spawn (degraded after tool execution).
+    assert spawned[0] == (0, "codex-primary")
+    ledger_path = worker._ledger_path("t_probe")
+    assert ledger_path is not None
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    leg0 = ledger["attempts"][0]
+    assert leg0["returncode"] == EXIT_ELIGIBLE
+    assert leg0["degraded_source"]["kind"] == "api"
+    # No admission stage/code provenance — the positive test's assertions fail.
+    assert "admission" not in leg0["degraded_source"]
+
+
 def test_dispatcher_selects_supervisor_only_for_enabled_role(monkeypatch):
     from hermes_cli import kanban_db as kb
 
