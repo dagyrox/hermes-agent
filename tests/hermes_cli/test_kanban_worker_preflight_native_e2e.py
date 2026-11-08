@@ -542,7 +542,11 @@ def test_native_failure_matrix(native_protocol, monkeypatch, profile, scenario, 
         missing = next(
             e.payload["missing"] for e in events if e.kind == "preflight_failed"
         )
-        assert "terminal" in missing and "kanban_attach" in missing
+        # The capability-parity gate enforces the task's mandatory tool floor,
+        # not the full allowed surface — so only the required tool that the
+        # read_only leg cannot bridge (terminal) is named, not every tool in
+        # the broader hermes-cli surface.
+        assert "terminal" in missing
     if profile == "athena" or scenario in {"missing", "catalog"}:
         assert not f["requests"]
     if profile == "talos":
@@ -566,14 +570,16 @@ def test_availability_timeout_advances_supervisor_to_next_leg(native_protocol):
         "model=gpt-6.1-sol, stage=probe, code=probe_timeout" in body
         for body in comments
     )
-    # The supervisor advanced to the Claude subscription leg.
+    # The supervisor advanced to the Claude subscription leg AND admitted it:
+    # the declared capability reduction is no longer a parity refusal, so the
+    # leg is actually attempted rather than skipped.
     assert any(
-        "Backend degraded before tool execution: kind=claude_code, "
-        "provider=claude-code-subscription" in body
-        for body in comments
+        "Backend route attempt 2/3: kind=claude_code" in body for body in comments
     )
-    # The chain exhausted (all three legs degraded/refused by the fixture), so
-    # the card blocks on exhaustion — not on the primary's admission failure.
+    assert not any("refused by capability parity gate" in body for body in comments)
+    # The read-only fixture cannot serve a full-mode Claude leg, so the attempt
+    # ends in reconciliation; the card blocks rather than re-attempting the
+    # degraded primary.
     assert task.status == "blocked"
 
 

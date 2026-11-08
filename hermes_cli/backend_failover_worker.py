@@ -484,6 +484,32 @@ def _reviewer_waived_tools(
     return tuple(sorted(waived))
 
 
+def _claude_capability_waivers(
+    leg: BackendLeg, args: argparse.Namespace, *, resolved: set[str] | None = None,
+) -> tuple[str, ...]:
+    """Full-surface tools a Claude leg intentionally does not bridge.
+
+    The Claude bridge exposes a fixed, capability_mode-declared subset of the
+    Hermes tool surface. Everything else is a DELIBERATE reduction — not a
+    parity violation — but it must never be silent: the supervisor receipts it
+    on the card so the reduced leg's capability is auditable.
+    """
+    if resolved is None:
+        required_toolsets = [
+            str(name) for name in (getattr(args, "required_toolset", ()) or ())
+        ]
+        resolved, _ = _resolved_required_tool_schemas(required_toolsets)
+    if resolved is None:
+        raise ValueError("tool_schema_evidence")
+    waived = resolved - _claude_bridged_tool_names(leg)
+    if (
+        len(waived) > 64 or waived.intersection(_LIFECYCLE_TOOLS)
+        or any(re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) is None for name in waived)
+    ):
+        raise ValueError("claude_capability_waiver_evidence")
+    return tuple(sorted(waived))
+
+
 def _capability_mismatches(
     leg: BackendLeg, args: argparse.Namespace, *, reviewer: bool = False,
 ) -> tuple[str, ...]:
@@ -543,6 +569,18 @@ def _capability_mismatches(
             missing.add("context_window")
         return tuple(sorted(missing))
     supported = _claude_bridged_tool_names(leg)
+    if not reviewer:
+        # A non-reviewer Claude leg exposes a fixed, capability_mode-DECLARED
+        # subset of the full Hermes tool surface. Parity must therefore hold
+        # only against the task's mandatory tool floor (args.required_tools,
+        # default ["terminal"]) — not the entire allowed surface. The earlier
+        # over-strict comparison refused an intentionally-reduced fallback leg
+        # for tools the task never required. The surface delta is still never
+        # silent: the caller receipts it explicitly via _claude_capability_waivers,
+        # so a genuinely required tool the leg lacks still fails closed below.
+        required_tools = {
+            str(name) for name in (getattr(args, "required_tools", None) or ("terminal",))
+        }
     missing = {f"tool:{name}" for name in required_tools - supported}
     if bool(getattr(args, "requires_native_image", False)):
         # The Kanban Claude path does not currently transfer native media parts.
@@ -1032,6 +1070,17 @@ def _run_leg(
             "lifecycle tools; not provided on this leg: " + (", ".join(waived) or "none"),
         ):
             return 0
+    if leg.kind == "claude_code" and not reviewer:
+        try:
+            reduction = _claude_capability_waivers(leg, args)
+        except ValueError:
+            return EXIT_AMBIGUOUS
+        if not _comment(
+            args.task,
+            "Claude Code capability reduction (declared): full-surface tools not "
+            "bridged on this leg: " + (", ".join(reduction) or "none"),
+        ):
+            return 0
     if not _comment(
         args.task,
         f"Backend route attempt {index + 1}/3: kind={leg.kind}, "
@@ -1089,6 +1138,7 @@ def run(argv: list[str] | None = None) -> int:
     from hermes_cli.worker_preflight import run_supervisor_preflight, SupervisorAdmissionEligible
 
     admission = None
+    degraded_required_tools = None
     try:
         passed_settings = run_supervisor_preflight(args, legs[0], profile_home)
     except SystemExit as exc:
@@ -1096,8 +1146,19 @@ def run(argv: list[str] | None = None) -> int:
     except SupervisorAdmissionEligible as exc:
         passed_settings = None
         admission = exc.result
+        degraded_required_tools = exc.required_tools
     args.reviewer_contract = bool(
         passed_settings and passed_settings.get("role_contract") == "reviewer"
+    )
+    # The Claude capability-parity gate enforces the task's MANDATORY tool floor
+    # (kanban.worker_preflight.required_tools, default ["terminal"]), never the
+    # profile's full allowed surface. It is read only from the admission snapshot
+    # returned above (or the degraded-primary exception) — never by re-reading
+    # mutable profile config after admission.
+    args.required_tools = list(
+        degraded_required_tools
+        or (passed_settings or {}).get("required_tools")
+        or ["terminal"]
     )
 
     ledger_path = _ledger_path(args.task)

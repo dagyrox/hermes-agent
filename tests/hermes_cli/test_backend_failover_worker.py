@@ -263,22 +263,103 @@ def test_dispatch_context_does_not_create_missing_board(tmp_path, monkeypatch):
     assert not missing_db.exists()
 
 
-def test_task_specific_capability_gate_rejects_unsupported_claude_surface(monkeypatch):
+def test_claude_gate_admits_declared_reduction_when_task_does_not_require_missing_tools(
+    monkeypatch,
+):
+    from hermes_cli import backend_failover_worker as worker
+
+    # The full allowed surface includes browser/image_gen, but the task's
+    # mandatory floor is only ["terminal"], which the full Claude bridge
+    # provides. The reduction is declared (capability_mode="full") and receipted.
+    monkeypatch.setattr(
+        worker,
+        "_resolved_required_tool_schemas",
+        lambda _toolsets: ({"read_file", "terminal", "browser_navigate", "image_gen"}, 100),
+    )
+    args = argparse.Namespace(
+        required_toolset=["file", "browser", "image_gen"],
+        required_tools=["terminal"],
+        required_context_chars=1000,
+    )
+    leg = _leg(kind="claude_code", provider=None)
+    assert worker._capability_mismatches(leg, args) == ()
+    # No silent tool loss: the reduction is still computed for the receipt.
+    reduction = worker._claude_capability_waivers(leg, args)
+    assert "browser_navigate" in reduction and "image_gen" in reduction
+
+
+def test_claude_gate_refuses_when_task_requires_missing_tool(monkeypatch):
     from hermes_cli import backend_failover_worker as worker
 
     monkeypatch.setattr(
         worker,
         "_resolved_required_tool_schemas",
-        lambda _toolsets: ({"read_file", "browser_navigate", "image_gen"}, 100),
+        lambda _toolsets: ({"terminal", "browser_navigate"}, 100),
     )
     args = argparse.Namespace(
-        required_toolset=["file", "browser", "image_gen"],
+        required_toolset=["file", "browser"],
+        required_tools=["terminal", "browser_navigate"],
         required_context_chars=1000,
     )
-    capability_mismatches = getattr(worker, "_capability_mismatches")
-    missing = capability_mismatches(_leg(kind="claude_code", provider=None), args)
-    assert missing == ("tool:browser_navigate", "tool:image_gen")
-    assert capability_mismatches(_leg(), args) == ()
+    assert worker._capability_mismatches(_leg(kind="claude_code", provider=None), args) == (
+        "tool:browser_navigate",
+    )
+
+
+def test_claude_gate_refuses_undeclared_required_tool_reduction(monkeypatch):
+    # Negative control: when the task's mandatory floor is NOT covered by the
+    # leg's declared bridge (a read_only leg cannot provide terminal), the gate
+    # still fails closed and names the missing tool — the reduction is never
+    # silently waived, even though the capability_mode is declared.
+    from hermes_cli import backend_failover_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_resolved_required_tool_schemas",
+        lambda _toolsets: ({"terminal", "read_file"}, 100),
+    )
+    args = argparse.Namespace(
+        required_toolset=["terminal", "file"],
+        required_tools=["terminal"],
+        required_context_chars=1000,
+    )
+    leg = _leg(kind="claude_code", provider=None, capability_mode="read_only")
+    assert worker._capability_mismatches(leg, args) == ("tool:terminal",)
+
+
+def test_run_leg_receipts_claude_capability_reduction(monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    comments: list[str] = []
+    monkeypatch.setattr(worker, "_comment", lambda task, body: comments.append(body) or True)
+    monkeypatch.setattr(worker, "_leg_available", lambda *a, **k: True)
+    monkeypatch.setattr(worker, "_task_status", lambda _task: "running")
+    monkeypatch.setattr(
+        worker,
+        "_resolved_required_tool_schemas",
+        lambda _toolsets: ({"terminal", "browser_navigate"}, 100),
+    )
+    monkeypatch.setattr(worker, "_leg_command", lambda *a, **k: (["claude"], {}))
+    monkeypatch.setattr(
+        worker,
+        "_run_child",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    args = argparse.Namespace(
+        profile="talos",
+        task="t_probe",
+        timeout_seconds=600,
+        required_toolset=["terminal", "browser"],
+        required_tools=["terminal"],
+        required_context_chars=1000,
+        profile_home=None,
+    )
+    leg = _leg(kind="claude_code", provider=None)
+    rc = worker._run_leg(leg, 1, args, None, None)
+    assert rc == worker.EXIT_AMBIGUOUS
+    assert any("Claude Code capability reduction (declared)" in c for c in comments)
+    assert any("browser_navigate" in c for c in comments)
+    assert any("Backend route attempt 2/3: kind=claude_code" in c for c in comments)
 
 
 def test_task_specific_capability_gate_rejects_oversized_context():
@@ -307,9 +388,9 @@ def test_reviewer_contract_uses_real_unfiltered_profile_schemas(monkeypatch):
     assert {"terminal", "write_file", "patch", "kanban_create", "kanban_link",
             "kanban_attach", "kanban_attach_url", "kanban_attachments"} <= set(waived)
     assert not set(worker._LIFECYCLE_TOOLS).intersection(waived)
-    assert worker._capability_mismatches(leg, args) == tuple(
-        sorted("tool:" + name for name in waived)
-    )
+    # Non-reviewer: the read_only leg cannot provide the mandatory terminal
+    # floor (default ["terminal"]), so it is refused naming that single tool.
+    assert worker._capability_mismatches(leg, args) == ("tool:terminal",)
 
 
 @pytest.mark.parametrize("profile,kind,mode,access,index,passed,applies", [
@@ -517,7 +598,11 @@ def test_task_specific_capability_gate_accepts_restricted_claude_execution():
 def test_claude_orchestrator_rejects_unavailable_delegate_task():
     from hermes_cli import backend_failover_worker as worker
 
-    args = argparse.Namespace(required_toolset=["delegation"], required_context_chars=1)
+    args = argparse.Namespace(
+        required_toolset=["delegation"],
+        required_tools=["delegate_task"],
+        required_context_chars=1,
+    )
     assert worker._capability_mismatches(
         _leg(kind="claude_code", provider=None, capability_mode="orchestrator"),
         args,
@@ -530,6 +615,7 @@ def test_claude_native_image_read_does_not_claim_vision_tool_parity(monkeypatch)
     monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _toolsets: ({"vision_analyze"}, 100))
     args = argparse.Namespace(
         required_toolset=["vision"],
+        required_tools=["vision_analyze"],
         required_context_chars=1,
         requires_native_image=False,
     )

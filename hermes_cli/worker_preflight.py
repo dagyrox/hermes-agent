@@ -128,11 +128,13 @@ class SupervisorAdmissionEligible(Exception):
     credential rejection, a probe timeout, or a transient provider failure.
     Re-authenticating cannot resolve it, so the supervisor must advance to the
     next frozen leg exactly once instead of blocking the card. Carries the
-    sanitized result for auditable provenance.
+    sanitized result for auditable provenance and the resolved mandatory tool
+    floor so the supervisor's capability-parity gate does not re-read config.
     """
 
-    def __init__(self, result: dict):
+    def __init__(self, result: dict, required_tools: list[str] | None = None):
         self.result = result
+        self.required_tools = list(required_tools) if required_tools else None
         super().__init__(result.get("code") or "admission_eligible")
 
 
@@ -584,7 +586,7 @@ def run_worker_preflight(args, *, primary=None) -> dict | None:
         # leg exactly once; the direct worker path stays fail-closed.
         print(json.dumps(result, sort_keys=True), file=sys.stderr)
         os.environ.pop("HERMES_KANBAN_PREFLIGHT", None)
-        raise SupervisorAdmissionEligible(result)
+        raise SupervisorAdmissionEligible(result, (settings or {}).get("required_tools"))
     with kb.connect_closing() as conn:
         recorded = kb.record_preflight_outcome(
             conn, task_id, run_id=run_id, passed=passed, payload=result, kind=kind
