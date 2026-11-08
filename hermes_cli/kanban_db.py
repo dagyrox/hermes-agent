@@ -6425,15 +6425,21 @@ def record_preflight_outcome(
     The failure event joins block_task's existing transaction, so neither an
     orphan event nor an unrecorded terminal transition can survive a crash.
     """
-    from hermes_cli.worker_preflight import sanitize_outcome
+    from hermes_cli.worker_preflight import operator_hint, sanitize_outcome
 
     safe = sanitize_outcome(payload)
     safe["outcome"] = "passed" if passed else "failed"
     if not passed:
-        reason = "preflight {} at {} ({}/{})".format(
-            safe["code"], safe["stage"], safe.get("profile", "unknown"),
-            safe.get("provider", "unknown"),
-        )
+        hint = operator_hint(safe)
+        if hint:
+            reason = "preflight {} at {} ({}): {}".format(
+                safe["code"], safe["stage"], safe.get("profile", "unknown"), hint,
+            )
+        else:
+            reason = "preflight {} at {} ({}/{})".format(
+                safe["code"], safe["stage"], safe.get("profile", "unknown"),
+                safe.get("provider", "unknown"),
+            )
         return block_task(
             conn, task_id, reason=reason, kind=kind or "capability",
             expected_run_id=run_id, preflight_payload=safe,

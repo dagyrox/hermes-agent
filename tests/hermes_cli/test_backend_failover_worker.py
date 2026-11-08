@@ -263,22 +263,103 @@ def test_dispatch_context_does_not_create_missing_board(tmp_path, monkeypatch):
     assert not missing_db.exists()
 
 
-def test_task_specific_capability_gate_rejects_unsupported_claude_surface(monkeypatch):
+def test_claude_gate_admits_declared_reduction_when_task_does_not_require_missing_tools(
+    monkeypatch,
+):
+    from hermes_cli import backend_failover_worker as worker
+
+    # The full allowed surface includes browser/image_gen, but the task's
+    # mandatory floor is only ["terminal"], which the full Claude bridge
+    # provides. The reduction is declared (capability_mode="full") and receipted.
+    monkeypatch.setattr(
+        worker,
+        "_resolved_required_tool_schemas",
+        lambda _toolsets: ({"read_file", "terminal", "browser_navigate", "image_gen"}, 100),
+    )
+    args = argparse.Namespace(
+        required_toolset=["file", "browser", "image_gen"],
+        required_tools=["terminal"],
+        required_context_chars=1000,
+    )
+    leg = _leg(kind="claude_code", provider=None)
+    assert worker._capability_mismatches(leg, args) == ()
+    # No silent tool loss: the reduction is still computed for the receipt.
+    reduction = worker._claude_capability_waivers(leg, args)
+    assert "browser_navigate" in reduction and "image_gen" in reduction
+
+
+def test_claude_gate_refuses_when_task_requires_missing_tool(monkeypatch):
     from hermes_cli import backend_failover_worker as worker
 
     monkeypatch.setattr(
         worker,
         "_resolved_required_tool_schemas",
-        lambda _toolsets: ({"read_file", "browser_navigate", "image_gen"}, 100),
+        lambda _toolsets: ({"terminal", "browser_navigate"}, 100),
     )
     args = argparse.Namespace(
-        required_toolset=["file", "browser", "image_gen"],
+        required_toolset=["file", "browser"],
+        required_tools=["terminal", "browser_navigate"],
         required_context_chars=1000,
     )
-    capability_mismatches = getattr(worker, "_capability_mismatches")
-    missing = capability_mismatches(_leg(kind="claude_code", provider=None), args)
-    assert missing == ("tool:browser_navigate", "tool:image_gen")
-    assert capability_mismatches(_leg(), args) == ()
+    assert worker._capability_mismatches(_leg(kind="claude_code", provider=None), args) == (
+        "tool:browser_navigate",
+    )
+
+
+def test_claude_gate_refuses_undeclared_required_tool_reduction(monkeypatch):
+    # Negative control: when the task's mandatory floor is NOT covered by the
+    # leg's declared bridge (a read_only leg cannot provide terminal), the gate
+    # still fails closed and names the missing tool — the reduction is never
+    # silently waived, even though the capability_mode is declared.
+    from hermes_cli import backend_failover_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_resolved_required_tool_schemas",
+        lambda _toolsets: ({"terminal", "read_file"}, 100),
+    )
+    args = argparse.Namespace(
+        required_toolset=["terminal", "file"],
+        required_tools=["terminal"],
+        required_context_chars=1000,
+    )
+    leg = _leg(kind="claude_code", provider=None, capability_mode="read_only")
+    assert worker._capability_mismatches(leg, args) == ("tool:terminal",)
+
+
+def test_run_leg_receipts_claude_capability_reduction(monkeypatch):
+    from hermes_cli import backend_failover_worker as worker
+
+    comments: list[str] = []
+    monkeypatch.setattr(worker, "_comment", lambda task, body: comments.append(body) or True)
+    monkeypatch.setattr(worker, "_leg_available", lambda *a, **k: True)
+    monkeypatch.setattr(worker, "_task_status", lambda _task: "running")
+    monkeypatch.setattr(
+        worker,
+        "_resolved_required_tool_schemas",
+        lambda _toolsets: ({"terminal", "browser_navigate"}, 100),
+    )
+    monkeypatch.setattr(worker, "_leg_command", lambda *a, **k: (["claude"], {}))
+    monkeypatch.setattr(
+        worker,
+        "_run_child",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    args = argparse.Namespace(
+        profile="talos",
+        task="t_probe",
+        timeout_seconds=600,
+        required_toolset=["terminal", "browser"],
+        required_tools=["terminal"],
+        required_context_chars=1000,
+        profile_home=None,
+    )
+    leg = _leg(kind="claude_code", provider=None)
+    rc = worker._run_leg(leg, 1, args, None, None)
+    assert rc == worker.EXIT_AMBIGUOUS
+    assert any("Claude Code capability reduction (declared)" in c for c in comments)
+    assert any("browser_navigate" in c for c in comments)
+    assert any("Backend route attempt 2/3: kind=claude_code" in c for c in comments)
 
 
 def test_task_specific_capability_gate_rejects_oversized_context():
@@ -307,9 +388,9 @@ def test_reviewer_contract_uses_real_unfiltered_profile_schemas(monkeypatch):
     assert {"terminal", "write_file", "patch", "kanban_create", "kanban_link",
             "kanban_attach", "kanban_attach_url", "kanban_attachments"} <= set(waived)
     assert not set(worker._LIFECYCLE_TOOLS).intersection(waived)
-    assert worker._capability_mismatches(leg, args) == tuple(
-        sorted("tool:" + name for name in waived)
-    )
+    # Non-reviewer: the read_only leg cannot provide the mandatory terminal
+    # floor (default ["terminal"]), so it is refused naming that single tool.
+    assert worker._capability_mismatches(leg, args) == ("tool:terminal",)
 
 
 @pytest.mark.parametrize("profile,kind,mode,access,index,passed,applies", [
@@ -517,7 +598,11 @@ def test_task_specific_capability_gate_accepts_restricted_claude_execution():
 def test_claude_orchestrator_rejects_unavailable_delegate_task():
     from hermes_cli import backend_failover_worker as worker
 
-    args = argparse.Namespace(required_toolset=["delegation"], required_context_chars=1)
+    args = argparse.Namespace(
+        required_toolset=["delegation"],
+        required_tools=["delegate_task"],
+        required_context_chars=1,
+    )
     assert worker._capability_mismatches(
         _leg(kind="claude_code", provider=None, capability_mode="orchestrator"),
         args,
@@ -530,6 +615,7 @@ def test_claude_native_image_read_does_not_claim_vision_tool_parity(monkeypatch)
     monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _toolsets: ({"vision_analyze"}, 100))
     args = argparse.Namespace(
         required_toolset=["vision"],
+        required_tools=["vision_analyze"],
         required_context_chars=1,
         requires_native_image=False,
     )
@@ -1413,6 +1499,208 @@ def test_supervisor_uses_only_returned_preflight_snapshot(monkeypatch, tmp_path,
     monkeypatch.setattr(worker, "_run_leg", leg)
     assert worker.run(["--profile", "athena", "--task", "t_fixture", "--timeout-seconds", "60"]) == 0
     assert seen == [expected]
+
+
+@pytest.mark.parametrize("snapshot,expected_floor", [
+    ({"enabled": True, "required_tools": ["terminal", "browser_navigate"]}, ["terminal", "browser_navigate"]),
+    ({"enabled": True}, ["terminal"]),
+])
+def test_supervisor_binds_required_tools_floor_from_admission_snapshot(
+    monkeypatch, tmp_path, snapshot, expected_floor
+):
+    """The non-reviewer Claude floor is read only from the admission snapshot:
+    a snapshot carrying ``required_tools`` yields exactly that list, and a
+    snapshot without it yields the documented ``["terminal"]`` default. The
+    ``_run_leg`` stub observes ``args.required_tools`` as the supervisor binds
+    it at ``backend_failover_worker.run()`` (lines 1158-1162)."""
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import worker_preflight as preflight
+
+    primary = _leg(kind="claude_code", provider=None, capability_mode="full")
+    monkeypatch.setattr(worker, "_validate_dispatch_context", lambda args: tmp_path)
+    monkeypatch.setattr(worker, "_load_chain", lambda profile: (primary, _leg(), _leg()))
+    monkeypatch.setattr(preflight, "run_supervisor_preflight", lambda *a: snapshot)
+    monkeypatch.setattr(preflight, "dispatch_admission", lambda *a: pytest.fail("config re-read after admission"))
+    monkeypatch.setattr(worker, "_ledger_path", lambda task: None)
+    monkeypatch.setattr(worker, "_mcp_config", lambda *a: tmp_path / "mcp")
+    monkeypatch.setattr(worker, "_system_prompt", lambda *a: tmp_path / "system")
+    monkeypatch.setattr(worker, "_effective_context_chars", lambda *a, **kw: 0)
+    monkeypatch.setattr(worker, "_task_status", lambda task: "done")
+    seen = []
+
+    def stub_run_leg(leg, index, args, *rest):
+        seen.append(list(args.required_tools))
+        return 0
+
+    monkeypatch.setattr(worker, "_run_leg", stub_run_leg)
+    assert worker.run(["--profile", "talos", "--task", "t_fixture", "--timeout-seconds", "60"]) == 0
+    assert seen == [expected_floor]
+
+
+def test_supervisor_binds_required_tools_floor_from_degraded_admission(monkeypatch, tmp_path):
+    """A degraded-primary admission (``SupervisorAdmissionEligible``) carries the
+    floor on the exception and the supervisor binds exactly that list, while
+    ``dispatch_admission`` stays fenced (never re-read after admission)."""
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import worker_preflight as preflight
+
+    primary = _leg(kind="claude_code", provider=None, capability_mode="full")
+    monkeypatch.setattr(worker, "_validate_dispatch_context", lambda args: tmp_path)
+    monkeypatch.setattr(worker, "_load_chain", lambda profile: (primary, _leg(), _leg()))
+    monkeypatch.setattr(
+        preflight,
+        "run_supervisor_preflight",
+        lambda *a: (_ for _ in ()).throw(
+            preflight.SupervisorAdmissionEligible(
+                {"stage": "probe", "code": "probe_transient"},
+                ["terminal", "browser_navigate"],
+            )
+        ),
+    )
+    monkeypatch.setattr(preflight, "dispatch_admission", lambda *a: pytest.fail("config re-read after admission"))
+    monkeypatch.setattr(worker, "_ledger_path", lambda task: None)
+    monkeypatch.setattr(worker, "_mcp_config", lambda *a: tmp_path / "mcp")
+    monkeypatch.setattr(worker, "_system_prompt", lambda *a: tmp_path / "system")
+    monkeypatch.setattr(worker, "_effective_context_chars", lambda *a, **kw: 0)
+    monkeypatch.setattr(worker, "_task_status", lambda task: "done")
+    monkeypatch.setattr(worker, "_comment", lambda *_a, **_k: True)
+    seen = []
+
+    def stub_run_leg(leg, index, args, *rest):
+        seen.append(list(args.required_tools))
+        return 0
+
+    monkeypatch.setattr(worker, "_run_leg", stub_run_leg)
+    assert worker.run(["--profile", "talos", "--task", "t_fixture", "--timeout-seconds", "60"]) == 0
+    assert seen == [["terminal", "browser_navigate"]]
+
+
+def test_supervisor_full_mode_refusal_names_required_tool(monkeypatch, tmp_path):
+    """End-to-end through ``worker.run`` with the real ``_run_leg``: a floor of
+    ``["terminal", "browser_navigate"]`` from the snapshot on a full-mode Claude
+    leg (which does not bridge ``browser_navigate``) must produce a refusal
+    comment naming ``tool:browser_navigate``."""
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import worker_preflight as preflight
+
+    primary = _leg(kind="claude_code", provider=None, capability_mode="full")
+    claude_leg = _leg(kind="claude_code", provider=None, capability_mode="full")
+    monkeypatch.setattr(worker, "_validate_dispatch_context", lambda args: tmp_path)
+    monkeypatch.setattr(worker, "_load_chain", lambda profile: (primary, claude_leg, claude_leg))
+    monkeypatch.setattr(
+        preflight, "run_supervisor_preflight",
+        lambda *a: {"enabled": True, "required_tools": ["terminal", "browser_navigate"]},
+    )
+    monkeypatch.setattr(preflight, "dispatch_admission", lambda *a: pytest.fail("config re-read after admission"))
+    monkeypatch.setattr(worker, "_ledger_path", lambda task: None)
+    monkeypatch.setattr(worker, "_mcp_config", lambda *a: tmp_path / "mcp")
+    monkeypatch.setattr(worker, "_system_prompt", lambda *a: tmp_path / "system")
+    monkeypatch.setattr(worker, "_effective_context_chars", lambda *a, **kw: 0)
+    monkeypatch.setattr(worker, "_task_status", lambda task: "done")
+    monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _ts: ({"terminal", "browser_navigate"}, 100))
+    monkeypatch.setattr(worker, "_leg_available", lambda *a, **k: True)
+    monkeypatch.setattr(worker, "_leg_command", lambda *a, **k: (["claude"], {}))
+    monkeypatch.setattr(worker, "_run_child", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    comments = []
+    monkeypatch.setattr(worker, "_comment", lambda task, msg: (comments.append(msg) or True))
+
+    worker.run(["--profile", "talos", "--task", "t_fixture", "--timeout-seconds", "60"])
+
+    assert any("tool:browser_navigate" in c for c in comments)
+
+
+def test_preflight_and_run_leg_agree_on_terminal_less_floor(monkeypatch, tmp_path):
+    """A terminal-less floor (``["read_file"]``) on a non-reviewer read_only
+    Claude primary must be bound once from the admission snapshot and used by
+    BOTH the preflight capability check and ``_run_leg``. Preflight previously
+    defaulted to ``("terminal",)`` (refusing ``tool:terminal``) while ``_run_leg``
+    admitted the same leg; now both admit."""
+    import contextlib
+
+    from hermes_cli import backend_failover_worker as worker
+    from hermes_cli import worker_preflight as preflight
+    from hermes_cli import kanban_db as kb
+
+    profile = "talos"
+    profile_home = tmp_path / ".hermes" / "profiles" / profile
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "424242")
+    monkeypatch.setenv("HERMES_KANBAN_PREFLIGHT", "1")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock-fixture")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    settings = {
+        "enabled": True,
+        "required_tools": ["read_file"],
+        "timeout_seconds": 60,
+        "native_timeout_seconds": 60,
+        "max_output_tokens": 1000,
+    }
+
+    class _FakeConn:
+        def execute(self, *a, **k):
+            return self
+
+        def fetchone(self):
+            return {
+                "assignee": profile,
+                "current_run_id": 424242,
+                "status": "running",
+                "claim_lock": "lock-fixture",
+            }
+
+    @contextlib.contextmanager
+    def _fake_connect_closing(*a, **k):
+        yield _FakeConn()
+
+    monkeypatch.setattr(kb, "connect_closing", _fake_connect_closing)
+    monkeypatch.setattr(kb, "record_preflight_outcome", lambda *a, **k: True)
+    monkeypatch.setattr(preflight, "dispatch_admission", lambda *a: settings)
+    monkeypatch.setattr(preflight, "dispatch_checks", lambda *a, **k: None)
+    monkeypatch.setattr(preflight, "_check_native_tools", lambda *a, **k: None)
+    monkeypatch.setattr(
+        preflight, "bounded_probe",
+        lambda *a, **k: {"stage": "probe", "code": "startup_passed", "outcome": "passed"},
+    )
+    monkeypatch.setattr(worker, "_resolved_required_tool_schemas", lambda _ts: ({"read_file"}, 100))
+
+    primary = _leg(kind="claude_code", provider=None, capability_mode="read_only")
+    supervisor_args = argparse.Namespace(
+        profile=profile,
+        task="t_probe",
+        timeout_seconds=60,
+        required_toolset=[],
+        skill=[],
+    )
+
+    result = preflight.run_supervisor_preflight(supervisor_args, primary, profile_home)
+    assert result is settings
+    # The floor is bound once from the snapshot before the capability check.
+    assert supervisor_args.required_tools == ["read_file"]
+    # _run_leg's gate sees the same floor and also admits (no tool: mismatch).
+    assert worker._capability_mismatches(primary, supervisor_args, reviewer=False) == ()
+
+
+def test_dispatch_admission_rejects_empty_required_tools(tmp_path):
+    """An explicit empty floor must not be silently coerced to ["terminal"] nor
+    silently become permissive: it is rejected fail-closed as config_invalid."""
+    import yaml
+
+    from hermes_cli.worker_preflight import WorkerPreflightBlocked, dispatch_admission
+
+    tmp_path.joinpath("config.yaml").write_text(
+        yaml.safe_dump(
+            {"kanban": {"worker_preflight": {"enabled": True, "required_tools": []}}}
+        )
+    )
+    with pytest.raises(WorkerPreflightBlocked) as caught:
+        dispatch_admission(str(tmp_path))
+    assert caught.value.payload["code"] == "config_invalid"
 
 
 @pytest.mark.parametrize("scenario,expected", [

@@ -93,6 +93,50 @@ def test_malformed_opt_in_fails_closed(value, tmp_path):
     assert caught.value.payload["code"] == "config_invalid"
 
 
+def test_empty_required_tools_block_names_field_and_remedy(tmp_path):
+    import yaml
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.worker_preflight import WorkerPreflightBlocked, dispatch_admission
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    profile.joinpath("config.yaml").write_text(
+        yaml.safe_dump(
+            {"kanban": {"worker_preflight": {"enabled": True, "required_tools": []}}}
+        )
+    )
+    with pytest.raises(WorkerPreflightBlocked) as caught:
+        dispatch_admission(str(profile))
+    assert caught.value.payload["code"] == "config_invalid"
+    assert caught.value.payload["field"] == "required_tools"
+    assert caught.value.payload["detail"] == "empty"
+
+    with kb.connect_closing(tmp_path / "board.db") as conn:
+        task_id = kb.create_task(conn, title="empty floor", assignee="talos")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.record_preflight_outcome(
+            conn,
+            task_id,
+            run_id=claimed.current_run_id,
+            passed=False,
+            # Dispatcher shape: the exception payload plus the assignee profile.
+            payload={**caught.value.payload, "profile": "talos"},
+            kind="capability",
+        )
+        assert kb.get_task(conn, task_id).status == "blocked"
+        events = kb.list_events(conn, task_id)
+    failed = [e for e in events if e.kind == "preflight_failed"]
+    assert failed[0].payload["field"] == "required_tools"
+    assert failed[0].payload["detail"] == "empty"
+    blocked = [e for e in events if e.kind == "blocked"]
+    assert blocked[0].payload["reason"] == (
+        "preflight config_invalid at dispatch (talos): "
+        "kanban.worker_preflight.required_tools is empty \u2014 omit the key for the "
+        '["terminal"] default, or list at least one tool.'
+    )
+
+
 def test_hung_probe_is_killed_and_reaped(tmp_path):
     import sys
     import time
