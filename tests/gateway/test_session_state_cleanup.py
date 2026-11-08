@@ -260,6 +260,21 @@ class TestSessionResetZombieRace:
         assert key not in runner._running_agents_ts
         assert key not in runner._busy_ack_ts
 
+    def test_generation_invalidation_revokes_owner_bridge_before_bumping_token(self):
+        runner = _make_runner()
+        key = "agent:main:slack:channel:C1"
+        runner._session_run_generation = {key: 4}
+        bridge = MagicMock()
+        runner._owner_tool_bridges = {key: (4, bridge)}
+
+        generation = runner._invalidate_session_run_generation(
+            key, reason="session_reset"
+        )
+
+        assert generation == 5
+        bridge.revoke.assert_called_once_with("session_reset")
+        assert key not in runner._owner_tool_bridges
+
     def test_normal_completion_is_not_evicted_by_outer_release(self):
         """Guarded release with the current generation succeeds; the outer
         unconditional release that follows is a harmless no-op.

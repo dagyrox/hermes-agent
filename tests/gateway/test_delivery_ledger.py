@@ -35,6 +35,7 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         chat_id=kw.get("chat_id", "C1"),
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
+        recovery_policy=kw.get("recovery_policy", "at_least_once"),
     )
 
 
@@ -126,6 +127,32 @@ class TestSweep:
         _orphan("ob-1")
         claimed = dl.sweep_recoverable()
         assert claimed[0]["needs_marker"] is True
+
+    def test_fail_closed_pending_is_safe_to_recover_once(self):
+        _record(recovery_policy="fail_closed")
+        _orphan("ob-1")
+
+        claimed = dl.sweep_recoverable()
+
+        assert len(claimed) == 1
+        assert claimed[0]["needs_marker"] is False
+        row = _row("ob-1")
+        assert row is not None
+        assert row["state"] == "attempting"
+
+    @pytest.mark.parametrize("state", ["attempting", "failed"])
+    def test_fail_closed_ambiguous_send_is_never_replayed(self, state):
+        _record(recovery_policy="fail_closed")
+        if state == "attempting":
+            dl.mark_attempting("ob-1")
+        else:
+            dl.mark_failed("ob-1", "lost ack")
+        _orphan("ob-1")
+
+        assert dl.sweep_recoverable() == []
+        row = _row("ob-1")
+        assert row is not None
+        assert row["state"] == "abandoned"
 
     def test_delivered_rows_ignored(self):
         _record()

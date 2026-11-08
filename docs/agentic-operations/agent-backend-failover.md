@@ -34,6 +34,29 @@
 > unchanged/all-API or permit mid-turn rewind. The frozen five three-provider
 > chains and disabled-by-default posture remain unchanged.
 
+> **Gateway bridge implementation scope (Talos card `t_28664add`):** the
+> default-off live-conversation bridge implements only the frozen primary →
+> Claude subscription slice. It does not claim parity with, persist, or execute
+> the canonical third DeepSeek leg. The three-leg canonical chain remains the
+> contract of the Kanban worker supervisor. A gateway turn stops after an
+> unsuccessful Claude attempt and requires reconciliation; operators must not
+> treat `gateway_owner_bridge: true` as three-leg gateway readiness.
+
+> **Superseding architecture decision (Athena card `t_8d96d438`, run 499):**
+> ordinary Slack/default turns are in scope when this feature is enabled. The
+> approved minimum is a gateway-owned turn coordinator at the real `_run_agent`
+> boundary, with an immutable canonical turn snapshot and only pre-tool,
+> pre-output availability failover. Refusals, partial output, tool activity,
+> pending approval, timeout, or unfinished durable intent stop for
+> reconciliation and are never replayed. Claude subscription attempts use a
+> gateway-owned, turn-scoped tool bridge to the existing owner executor; they
+> are not Kanban conversation proxies. Capability eligibility is the
+> intersection of model/transport evidence, resolved schemas, installed
+> adapters, and approval guarantees. Unknown evidence fails closed. This
+> supersedes §§3–4 and §15 where they say ordinary conversations stay
+> unchanged/all-API or permit mid-turn rewind. The frozen five three-provider
+> chains and disabled-by-default posture remain unchanged.
+
 > **Authoritative correction (task comment, 2026-10-19):** every route leg
 > must use a distinct provider. This supersedes the same-provider fallback
 > rows and examples in the original Athena packet. The corrected route table

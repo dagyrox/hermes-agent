@@ -95,9 +95,18 @@ def _connect() -> sqlite3.Connection:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT
+            last_error TEXT,
+            recovery_policy TEXT NOT NULL DEFAULT 'at_least_once'
         )"""
     )
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+    }
+    if "recovery_policy" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN recovery_policy "
+            "TEXT NOT NULL DEFAULT 'at_least_once'"
+        )
     return conn
 
 
@@ -162,6 +171,7 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    recovery_policy: str = "at_least_once",
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -171,11 +181,11 @@ def record_obligation(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (obligation_id, session_key, platform, str(chat_id),
+                owner_pid, owner_started_at, recovery_policy)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+            (obligation_id, session_key, str(platform), str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, recovery_policy),
         )
     _prune()
 
@@ -230,18 +240,28 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at
+                      owner_pid, owner_started_at, recovery_policy
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, owner_pid, owner_started_at,
+             recovery_policy) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""",
+                    (now, oid),
+                )
+                continue
+            if recovery_policy == "fail_closed" and state != "pending":
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=?,
+                           last_error='ambiguous owner-final delivery; replay denied'
+                       WHERE obligation_id=?""",
                     (now, oid),
                 )
                 continue
@@ -255,7 +275,7 @@ def sweep_recoverable(
             cursor = conn.execute(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       updated_at=?
+                       state='attempting', updated_at=?
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
                 (pid, started, now, oid, owner_pid, owner_pid),
             )

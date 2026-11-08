@@ -2512,6 +2512,7 @@ class BasePlatformAdapter(ABC):
         # deliveries generation-aware and avoid stale runs clearing callbacks
         # registered by a fresher run for the same session.
         self._post_delivery_callbacks: Dict[str, Any] = {}
+        self._owner_final_deliveries: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Optional authorization check, registered by GatewayRunner. Used by
@@ -4249,6 +4250,28 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks.pop(session_key, None)
         return entry if callable(entry) else None
 
+    def register_owner_final_delivery(
+        self, session_key: str, delivery: Any, *, generation: int
+    ) -> None:
+        """Register one generation-fenced receipt-bound final delivery."""
+        if not session_key or delivery is None:
+            return
+        existing = self._owner_final_deliveries.get(session_key)
+        if existing is not None and int(existing[0]) > int(generation):
+            return
+        self._owner_final_deliveries[session_key] = (int(generation), delivery)
+
+    def pop_owner_final_delivery(
+        self, session_key: str, *, generation: int | None = None
+    ) -> Any | None:
+        entry = self._owner_final_deliveries.get(session_key)
+        if entry is None:
+            return None
+        if generation is None or int(entry[0]) != int(generation):
+            return None
+        self._owner_final_deliveries.pop(session_key, None)
+        return entry[1]
+
     # ── Processing lifecycle hooks ──────────────────────────────────────────
     # Subclasses override these to react to message processing events
     # (e.g. Discord adds 👀/✅/❌ reactions).
@@ -5291,7 +5314,20 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    _delivery_generation = getattr(
+                        interrupt_event,
+                        "_hermes_run_generation",
+                        None,
+                    )
+                    _owner_entry = delivery_adapter._owner_final_deliveries.get(
+                        session_key
+                    )
+                    _has_owner_delivery = bool(
+                        _owner_entry is not None
+                        and _delivery_generation is not None
+                        and int(_owner_entry[0]) == int(_delivery_generation)
+                    )
+                    if not _has_owner_delivery and not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
                         try:
@@ -5323,12 +5359,117 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
+                    _owner_delivery = delivery_adapter.pop_owner_final_delivery(
+                        session_key,
+                        generation=_delivery_generation,
                     )
+                    if _owner_delivery is not None:
+                        from gateway.delivery_ledger import (
+                            mark_attempting as _mark_owner_attempting,
+                            mark_delivered as _mark_owner_delivered,
+                            mark_failed as _mark_owner_failed,
+                        )
+
+                        _part_planner = getattr(
+                            delivery_adapter, "owner_delivery_parts", None
+                        )
+                        _planned_parts = (
+                            _part_planner(text_content)
+                            if callable(_part_planner)
+                            else (text_content,)
+                        )
+                        _claimed_parts = _owner_delivery.claim(_planned_parts)
+                        if not _claimed_parts:
+                            logger.warning(
+                                "[%s] Suppressing already-claimed owner final for %s",
+                                delivery_adapter.name,
+                                session_key,
+                            )
+                            result = SendResult(
+                                success=False, error="owner_final_already_claimed"
+                            )
+                        else:
+                            # Never invoke generic retries for an owner final.
+                            # A dropped ACK is ambiguous and replay is denied.
+                            _owner_receipts_recorded = 0
+
+                            def _record_owner_part(
+                                part_index: int, receipt: str
+                            ) -> None:
+                                nonlocal _owner_receipts_recorded
+                                _owner_delivery.record_receipt(part_index, receipt)
+                                _owner_receipts_recorded += 1
+
+                            _owner_metadata = dict(_final_thread_metadata or {})
+                            if callable(_part_planner):
+                                _owner_metadata["_owner_delivery_receipt"] = (
+                                    _record_owner_part
+                                )
+                            try:
+                                if _owner_delivery.obligation_id:
+                                    _mark_owner_attempting(
+                                        _owner_delivery.obligation_id
+                                    )
+                                result = await delivery_adapter.send(
+                                    chat_id=event.source.chat_id,
+                                    content=text_content,
+                                    reply_to=_reply_anchor,
+                                    metadata=_owner_metadata,
+                                )
+                            except BaseException:
+                                _owner_delivery.ambiguous()
+                                if _owner_delivery.obligation_id:
+                                    _mark_owner_failed(
+                                        _owner_delivery.obligation_id,
+                                        "owner-final send raised",
+                                    )
+                                raise
+                            if (
+                                result.success
+                                and result.message_id
+                                and _owner_receipts_recorded == 0
+                            ):
+                                _receipts = [str(result.message_id)] + [
+                                    str(value)
+                                    for value in (result.continuation_message_ids or [])
+                                ]
+                                if len(_claimed_parts) != 1:
+                                    _owner_delivery.ambiguous()
+                                    if _owner_delivery.obligation_id:
+                                        _mark_owner_failed(
+                                            _owner_delivery.obligation_id,
+                                            "transport omitted per-part receipts",
+                                        )
+                                    raise RuntimeError(
+                                        "transport omitted per-part delivery receipts"
+                                    )
+                                _owner_delivery.record_receipt(
+                                    0, ",".join(_receipts)
+                                )
+                                _owner_receipts_recorded = 1
+                            if (
+                                result.success
+                                and _owner_receipts_recorded == len(_claimed_parts)
+                            ):
+                                _owner_delivery.complete()
+                                if _owner_delivery.obligation_id:
+                                    _mark_owner_delivered(
+                                        _owner_delivery.obligation_id
+                                    )
+                            else:
+                                _owner_delivery.ambiguous()
+                                if _owner_delivery.obligation_id:
+                                    _mark_owner_failed(
+                                        _owner_delivery.obligation_id,
+                                        str(result.error or "missing delivery receipts"),
+                                    )
+                    else:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:

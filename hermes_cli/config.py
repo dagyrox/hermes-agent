@@ -939,6 +939,9 @@ DEFAULT_CONFIG = {
     # supplies validated per-role chains. Secrets never belong in this block.
     "agent_backend_failover": {
         "enabled": False,
+        # Conversation turns require their own acceptance gate. Worker
+        # failover may be enabled without selecting the gateway-owner bridge.
+        "gateway_owner_bridge": False,
         "max_attempts_per_leg": 1,
         "roles": {},
     },
