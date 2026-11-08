@@ -6962,12 +6962,13 @@ class SessionDB:
         ``message_count = 0`` rows unless messages had already been flushed to
         it before compression. See #15000.
 
-        This helper walks ``parent_session_id`` forward from ``session_id`` and
-        returns the descendant in the chain that has the **most recent** messages.
-        Unlike the original logic, it does NOT short-circuit when the starting
-        session already has messages — a descendant that was created by
-        compression may hold the continuation content and should be preferred
-        by the WebUI and gateway for ``--resume`` and session loading.
+        Compression continuations are resolved first through
+        :meth:`get_compression_tip`, which validates the parent's compression
+        end state and excludes branch/delegate/tool children.  The legacy
+        parent-child fallback below is intentionally restricted to an empty
+        starting session.  A message-bearing, non-compressed session must not
+        be replaced by an arbitrary child: doing so can cross source/owner
+        boundaries and make a read for one session return another transcript.
 
         If no descendant (including the starting session) has any messages,
         the original ``session_id`` is returned unchanged.
@@ -6995,12 +6996,29 @@ class SessionDB:
         except Exception:
             tip = session_id
         if tip and tip != session_id:
-            session_id = tip
+            return tip
 
         with self._lock:
             current = session_id
             seen = {current}
             best = None  # tracks the last (deepest) node with messages
+
+            # A non-compressed session with its own transcript is already the
+            # definitive resume/read target.  Only get_compression_tip above
+            # may redirect a message-bearing session.  The broad child walk is
+            # retained solely for historical empty-head chains (#15000).
+            try:
+                conn = self._conn
+                if conn is None:
+                    return session_id
+                starting_message = conn.execute(
+                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                    (current,),
+                ).fetchone()
+            except Exception:
+                return session_id
+            if starting_message is not None:
+                return session_id
 
             for _ in range(32):
                 # Check if the current node has messages.
