@@ -185,6 +185,12 @@ def dispatch_admission(profile_home: str | None) -> dict | None:
     names = raw.get("required_tools", ["terminal"])
     if (
         not isinstance(names, list)
+        # An explicit empty floor is ambiguous and fail-open: it must not be
+        # silently coerced to ["terminal"] (masking a misconfigured floor) nor
+        # silently become permissive (no mandatory tools enforced). Reject it
+        # so the operator must either omit the key (the ["terminal"] default)
+        # or list at least one genuinely required tool.
+        or not names
         or len(names) > 64
         or not all(isinstance(name, str) and _NAME.fullmatch(name) for name in names)
     ):
@@ -496,6 +502,13 @@ def run_worker_preflight(args, *, primary=None) -> dict | None:
             )
 
             reviewer = _reviewer_contract_applies(primary, args.supervisor_args, settings=settings)
+            # Bind the mandatory tool floor once from the admission snapshot so
+            # _check_primary_capability (this call) and the supervisor's _run_leg
+            # use the SAME value. Previously _run_leg coerced its own floor from
+            # the snapshot at backend_failover_worker.run() while preflight
+            # silently defaulted to ("terminal",) — a terminal-less floor would
+            # be refused here yet admitted (or vice versa) for the same leg.
+            args.supervisor_args.required_tools = list(settings["required_tools"])
             _check_primary_capability(primary, args.supervisor_args, reviewer=reviewer)
             if reviewer:
                 waived = list(_reviewer_waived_tools(primary, args.supervisor_args))
