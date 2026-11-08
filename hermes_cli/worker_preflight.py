@@ -61,6 +61,10 @@ _MODES = frozenset({
     "acp",
     "other",
 })
+# Config keys under kanban.worker_preflight that a config_invalid refusal may
+# name, and the closed set of defect kinds. Fixed vocabularies, never config text.
+_FIELDS = frozenset({"required_tools"})
+_DETAILS = frozenset({"empty", "invalid"})
 _ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}\Z")
 _NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
@@ -77,6 +81,8 @@ def sanitize_outcome(payload: object) -> dict:
         ("api_mode", _MODES),
         ("outcome", {"passed", "failed"}),
         ("route", {"direct", "supervisor"}),
+        ("field", _FIELDS),
+        ("detail", _DETAILS),
     ):
         value = raw.get(key)
         if isinstance(value, str) and value in allowed:
@@ -105,6 +111,17 @@ def sanitize_outcome(payload: object) -> dict:
         if type(value) is int and low <= value <= high:
             safe[key] = value
     return safe
+
+
+def operator_hint(safe: dict) -> str | None:
+    """Short remedy for a sanitized refusal that names its offending field."""
+    if safe.get("code") != "config_invalid" or safe.get("field") != "required_tools":
+        return None
+    problem = "is empty" if safe.get("detail") == "empty" else "is invalid"
+    return (
+        f"kanban.worker_preflight.required_tools {problem} \u2014 omit the key for "
+        'the ["terminal"] default, or list at least one tool.'
+    )
 
 
 class WorkerPreflightBlocked(RuntimeError):
@@ -183,18 +200,23 @@ def dispatch_admission(profile_home: str | None) -> dict | None:
             raise WorkerPreflightBlocked("config_invalid")
         settings[key] = max(1, min(value, ceiling))
     names = raw.get("required_tools", ["terminal"])
-    if (
-        not isinstance(names, list)
+    if isinstance(names, list) and not names:
         # An explicit empty floor is ambiguous and fail-open: it must not be
         # silently coerced to ["terminal"] (masking a misconfigured floor) nor
         # silently become permissive (no mandatory tools enforced). Reject it
         # so the operator must either omit the key (the ["terminal"] default)
         # or list at least one genuinely required tool.
-        or not names
+        raise WorkerPreflightBlocked(
+            "config_invalid", field="required_tools", detail="empty"
+        )
+    if (
+        not isinstance(names, list)
         or len(names) > 64
         or not all(isinstance(name, str) and _NAME.fullmatch(name) for name in names)
     ):
-        raise WorkerPreflightBlocked("config_invalid")
+        raise WorkerPreflightBlocked(
+            "config_invalid", field="required_tools", detail="invalid"
+        )
     settings["required_tools"] = names
     return settings
 

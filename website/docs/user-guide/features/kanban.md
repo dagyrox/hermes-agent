@@ -180,6 +180,12 @@ kanban:
     required_tools: [terminal]
 ```
 
+An empty `required_tools: []` is rejected as `config_invalid` and blocks dispatch
+for the whole assignee profile; the block reason names
+`kanban.worker_preflight.required_tools`. Omit the key to get the `["terminal"]`
+default, or list at least one tool. An empty list is not a way to disable the
+mandatory floor.
+
 | Resolved transport | Working-path diagnostic | Budget ceiling |
 | --- | --- | --- |
 | `chat_completions`, usable string key | One SDK request using the exact worker model | 15 seconds, 16 output tokens |
