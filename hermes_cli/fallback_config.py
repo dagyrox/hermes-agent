@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _normalized_base_url(value: Any) -> str:
@@ -106,3 +110,80 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
             chain.append(entry)
 
     return chain
+
+
+def _load_config_for_fallback(cfg_path: str | Path | None) -> dict[str, Any]:
+    """Read the raw ``config.yaml`` that owns the fallback chain.
+
+    Mirrors the gateway's original read: raw YAML, no managed overlay, empty
+    dict when the file is missing or unparseable.
+    """
+    if cfg_path is None:
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "config.yaml"
+    else:
+        path = Path(cfg_path)
+    if not path.exists():
+        return {}
+    import yaml
+
+    with open(path, encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def resolve_fallback_runtime(cfg_path: str | Path | None = None) -> dict[str, Any] | None:
+    """Resolve the first working entry of the configured fallback chain.
+
+    Walks ``fallback_providers`` / ``fallback_model`` in config order and
+    returns the resolved runtime of the first entry whose credentials resolve.
+    An entry that raises (missing credentials, disabled provider, bad custom
+    block) is skipped so one broken entry cannot disable the whole chain.
+
+    ``None`` means "no fallback available": either none is configured, the
+    config could not be read, or every entry failed to resolve. Callers keep
+    their original failure and surface it — this helper never masks it.
+
+    The returned dict is the subset of ``resolve_runtime_provider()`` output
+    that ``AIAgent`` consumes, plus the config entry's literal ``model``.
+    """
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    try:
+        chain = get_fallback_chain(_load_config_for_fallback(cfg_path))
+        if not chain:
+            return None
+        for entry in chain:
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=entry.get("provider"),
+                    explicit_base_url=entry.get("base_url"),
+                    explicit_api_key=resolve_entry_api_key(entry),
+                )
+            except Exception as fb_exc:  # noqa: BLE001 - one entry must not kill the chain
+                logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
+                continue
+            # Log the literal `provider` key from config, not the resolved
+            # runtime category — an Ollama fallback resolves through the
+            # OpenAI-compatible path and would otherwise be logged as
+            # "openrouter", contradicting the operator's config (#32790).
+            logger.info(
+                "Fallback provider resolved: %s model=%s",
+                entry.get("provider") or runtime.get("provider"),
+                entry.get("model"),
+            )
+            return {
+                "api_key": runtime.get("api_key"),
+                "base_url": runtime.get("base_url"),
+                "provider": runtime.get("provider"),
+                "requested_provider": runtime.get("requested_provider"),
+                "api_mode": runtime.get("api_mode"),
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+                "credential_pool": runtime.get("credential_pool"),
+                "model": entry.get("model"),
+            }
+    except Exception:  # noqa: BLE001 - fail closed: caller surfaces its own error
+        logger.debug("Fallback chain resolution failed", exc_info=True)
+    return None

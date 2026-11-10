@@ -26,7 +26,7 @@ import os
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
@@ -239,6 +239,7 @@ def run_oneshot(
     response: Optional[str] = None
     result: dict = {}
     failure: BaseException | None = None
+    fallback_notes: list[str] = []
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
             try:
@@ -248,6 +249,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    on_fallback=fallback_notes.append,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -263,6 +265,14 @@ def run_oneshot(
             devnull.close()
         except Exception:
             pass
+
+    # Fallback notices are staged while the whole call tree runs under the
+    # devnull redirect, then written here so the operator actually sees which
+    # provider served the run — including when the run then fails.
+    if fallback_notes:
+        for note in fallback_notes:
+            real_stderr.write(note)
+        real_stderr.flush()
 
     if failure is not None:
         # Re-raise control-flow exceptions so the parent handles them as usual
@@ -316,12 +326,21 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    on_fallback: Optional[Callable[[str], None]] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.  Returns ``(final_response, run_result)``."""
+    run a single conversation.  Returns ``(final_response, run_result)``.
+
+    ``on_fallback`` is called with an operator-facing note when the primary
+    provider cannot be resolved and a configured fallback entry serves the
+    run instead. The caller owns emitting it (the whole call tree here runs
+    under a devnull stderr redirect).
+    """
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     from hermes_cli.config import load_config
+    from hermes_cli.fallback_config import resolve_fallback_runtime
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
@@ -382,13 +401,38 @@ def _run_agent(
                 if detected:
                     effective_provider, effective_model = detected
 
-    runtime = resolve_runtime_provider(
-        requested=effective_provider,
-        target_model=effective_model or None,
-        explicit_base_url=explicit_base_url_from_alias,
-    )
-    if runtime.get("provider_access_mode") == "api":
-        effective_model = runtime["model"]
+    try:
+        runtime = resolve_runtime_provider(
+            requested=effective_provider,
+            target_model=effective_model or None,
+            explicit_base_url=explicit_base_url_from_alias,
+        )
+    except AuthError as auth_exc:
+        # resolve_runtime_provider() raises AuthError during *resolution* when
+        # the primary is quota-capped (429) or its credentials are broken —
+        # i.e. before AIAgent exists, so the in-process fallback chain passed
+        # below can never fire for this failure class. Walk the configured
+        # chain here, exactly as the gateway lane does. get_fallback_chain()
+        # returns [] when an external failover supervisor owns the chain, so
+        # this is a no-op there.
+        detail = " ".join(str(auth_exc).split())
+        kind = "quota/rate limited" if is_rate_limited_auth_error(auth_exc) else "auth failure"
+        reason = f"{kind}: {detail}" if detail else kind
+        fb_runtime = resolve_fallback_runtime()
+        if fb_runtime is None:
+            # No fallback configured, or every entry failed to resolve. Surface
+            # the primary's real error rather than a generic one.
+            raise
+        runtime = fb_runtime
+        effective_model = fb_runtime.get("model") or effective_model
+        if on_fallback is not None:
+            on_fallback(
+                f"hermes -z: primary provider unavailable ({reason}); "
+                f"using fallback {fb_runtime.get('provider')}/{effective_model}\n"
+            )
+    else:
+        if runtime.get("provider_access_mode") == "api":
+            effective_model = runtime["model"]
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived

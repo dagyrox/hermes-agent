@@ -2348,53 +2348,16 @@ def _credential_pool_for_provider(provider: Optional[str]):
 
 
 def _try_resolve_fallback_provider() -> dict | None:
-    """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
-    from hermes_cli.runtime_provider import resolve_runtime_provider
-    try:
-        import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
-        fb_list = get_fallback_chain(cfg)
-        if not fb_list:
-            return None
-        for entry in fb_list:
-            try:
-                from hermes_cli.fallback_config import resolve_entry_api_key
+    """Attempt to resolve credentials from the fallback_model/fallback_providers config.
 
-                runtime = resolve_runtime_provider(
-                    requested=entry.get("provider"),
-                    explicit_base_url=entry.get("base_url"),
-                    explicit_api_key=resolve_entry_api_key(entry),
-                )
-                # Log the literal `provider` key from config, not the resolved
-                # runtime category — an Ollama fallback resolves through the
-                # OpenAI-compatible path and would otherwise be logged as
-                # "openrouter", contradicting the operator's config (#32790).
-                logger.info(
-                    "Fallback provider resolved: %s model=%s",
-                    entry.get("provider") or runtime.get("provider"),
-                    entry.get("model"),
-                )
-                return {
-                    "api_key": runtime.get("api_key"),
-                    "base_url": runtime.get("base_url"),
-                    "provider": runtime.get("provider"),
-                    "requested_provider": runtime.get("requested_provider"),
-                    "api_mode": runtime.get("api_mode"),
-                    "command": runtime.get("command"),
-                    "args": list(runtime.get("args") or []),
-                    "credential_pool": runtime.get("credential_pool"),
-                    "model": entry.get("model"),
-                }
-            except Exception as fb_exc:
-                logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
-                continue
-    except Exception:
-        pass
-    return None
+    Delegates to the shared walker in ``hermes_cli.fallback_config`` so the
+    gateway and ``hermes -z`` oneshot lanes fail over identically. The shared
+    helper skips entries that fail to resolve and returns None when the chain
+    is empty or every entry fails.
+    """
+    from hermes_cli.fallback_config import resolve_fallback_runtime
+
+    return resolve_fallback_runtime(cfg_path=_hermes_home / "config.yaml")
 
 
 def _event_media_type_at(event, index: int) -> str:
