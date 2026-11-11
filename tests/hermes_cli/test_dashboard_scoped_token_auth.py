@@ -173,18 +173,62 @@ def test_route_verifier_never_consults_the_global_provider_stack(monkeypatch):
 
 
 def test_occ_credential_does_not_authenticate_on_the_drain_route():
-    """A scoped read credential must not unlock a state-changing route."""
+    """A scoped read credential must not unlock a state-changing route.
+
+    B9 round 3: this used to assert only the seam's 401 against a stub handler.
+    It now drives the real drain handler and asserts no drain marker file was
+    written — the state change the credential must never be able to cause. It
+    also uses a token shaped like a real OCC credential rather than a stub.
+    """
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+
+    from gateway import drain_control
+    from hermes_cli import web_server
+
+    occ_token = "O" * 43
     token_auth.register_token_route("/api/gateway/drain")
     token_auth.register_token_route("/machine", verifier=_accepted_verifier())
+
     # The global stack has no provider that accepts this token, exactly as in
     # production: the OCC credential is never registered globally.
     resp = _run(
         token_auth.token_auth_middleware(
-            _request("/api/gateway/drain", headers=[("Authorization", "Bearer occ-secret")]),
+            _request("/api/gateway/drain", headers=[("Authorization", f"Bearer {occ_token}")]),
             _ok,
         )
     )
     assert resp.status_code == 401
+
+    # End to end: mount the real handler behind the real seam and prove the
+    # marker file is never created by an unauthenticated POST.
+    with tempfile.TemporaryDirectory() as home_dir:
+        old_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = home_dir
+        try:
+            marker = drain_control.drain_request_path()
+            drain_app = FastAPI()
+            drain_app.middleware("http")(token_auth.token_auth_middleware)
+            drain_app.add_api_route(
+                "/api/gateway/drain", web_server.gateway_drain, methods=["POST"]
+            )
+            with TestClient(drain_app, client=("127.0.0.1", 40000)) as client:
+                post = client.post(
+                    "/api/gateway/drain",
+                    json={"action": "drain"},
+                    headers={"Authorization": f"Bearer {occ_token}"},
+                )
+            assert post.status_code == 401
+            assert not Path(marker).exists(), f"drain marker was written: {marker}"
+        finally:
+            if old_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = old_home
 
 
 def test_legacy_unverifiered_route_behaviour_is_unchanged():
@@ -229,6 +273,70 @@ def test_raw_path_aliases_do_not_authenticate(raw):
     token_auth.register_token_route("/machine", verifier=_accepted_verifier())
     request = _request("/machine", raw_path=raw)
     assert _run(token_auth.token_auth_middleware(request, _ok)).status_code == 401
+
+
+@pytest.fixture()
+def seam_audit(monkeypatch):
+    """Capture records written by the seam itself (R3-1)."""
+    records: list[dict] = []
+
+    def _capture(event, **fields):
+        records.append({"event": getattr(event, "value", str(event)), **fields})
+
+    monkeypatch.setattr(token_auth, "audit_log", _capture)
+    return records
+
+
+def test_non_empty_root_path_is_audited_once_from_the_peer(seam_audit):
+    """R3-1: an alias probe must not be silent.
+
+    The B2 repair originally passed ``audit=False`` here and dropped this record
+    entirely, which made the alias probes the audit exists to catch invisible.
+    """
+    token_auth.register_token_route("/machine", verifier=_accepted_verifier())
+    request = _request(
+        "/machine",
+        root_path="/mounted",
+        headers=[("X-Forwarded-For", "203.0.113.66")],
+        client=("192.168.5.5", 5000),
+    )
+    assert _run(token_auth.token_auth_middleware(request, _ok)).status_code == 401
+    assert len(seam_audit) == 1, seam_audit
+    record = seam_audit[0]
+    assert record["reason"] == "non_empty_root_path"
+    # The IP is the transport peer, not the forwarding header.
+    assert record["ip"] == "192.168.5.5", record
+    assert "203.0.113.66" not in json.dumps(record)
+
+
+def test_raw_path_alias_is_audited_once_from_the_peer(seam_audit):
+    """R3-1: the encoded-path variant is audited exactly once."""
+    token_auth.register_token_route("/machine", verifier=_accepted_verifier())
+    request = _request(
+        "/machine",
+        raw_path=b"/mac%68ine",
+        headers=[("X-Forwarded-For", "203.0.113.66")],
+        client=("192.168.5.5", 5000),
+    )
+    assert _run(token_auth.token_auth_middleware(request, _ok)).status_code == 401
+    assert len(seam_audit) == 1, seam_audit
+    assert seam_audit[0]["reason"] == "raw_path_mismatch"
+    assert seam_audit[0]["ip"] == "192.168.5.5", seam_audit[0]
+
+
+def test_verifier_route_rejection_is_not_double_audited(seam_audit):
+    """B2/R3-2: the seam stays silent when the verifier owns the rejection.
+
+    With ``token_auth.audit_log`` now patched, this assertion can actually fail
+    if the seam reintroduces its second record.
+    """
+    def _rejecting_verifier(request):
+        return None  # verifier refuses; it would audit in product code
+
+    token_auth.register_token_route("/machine", verifier=_rejecting_verifier)
+    request = _request("/machine")
+    assert _run(token_auth.token_auth_middleware(request, _ok)).status_code == 401
+    assert seam_audit == [], seam_audit
 
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ import time
 import unicodedata
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from starlette.testclient import TestClient
 
 from hermes_cli import kanban_occ_read as occ
@@ -228,6 +228,10 @@ def app(monkeypatch, config):
     kanban_occ_api._AuthorizedBudget = kanban_occ_api._Budget(per_minute=120, burst=30)
     kanban_occ_api._FailedBudget = kanban_occ_api._Budget(per_minute=30, burst=30)
     kanban_occ_api._ExhaustedAudit.reset()
+    # Pre-comparison audit windows are process-global too (B1 round 3); a test
+    # that asserts "one record was written" must not inherit the previous
+    # test's window.
+    kanban_occ_api._PreComparisonAudit.reset()
     # The credential is snapshotted once per process (B8). Each test starts
     # from "not yet snapshotted" so its own environment decides the value.
     kanban_occ_api._reset_token_snapshot()
@@ -271,33 +275,44 @@ def test_summary_requires_the_dedicated_credential(app):
         assert _get(client, "summary").status_code == 200
 
 
-def test_occ_credential_does_not_authenticate_the_dashboard_board_route(app):
+def test_occ_credential_does_not_authenticate_the_dashboard_board_route(app, config):
     """The scoped credential is not a dashboard credential.
 
-    Asserted at the seam: the token seam must not mark ``/board`` as
-    token-authenticated, which is what the production session gate relies on to
-    reject the call. (The test app mounts no session gate, so a 200 here would
-    be the harness, not the product.)
+    B9 round 3: this used to assert registry facts only. It now *sends the
+    request* carrying a valid OCC credential to the real ``/board`` path and
+    asserts the seam left it unauthenticated, which is precisely the flag the
+    production session gate keys on. The local app mounts no session gate, so a
+    200 here would be the harness, not the product — the assertion is therefore
+    on ``token_authenticated``, captured by an inner probe handler.
     """
-    from starlette.requests import Request
-
     from hermes_cli.dashboard_auth import token_auth as seam
 
-    scope = {
-        "type": "http",
-        "method": "GET",
-        "path": "/api/plugins/kanban/board",
-        "raw_path": b"/api/plugins/kanban/board",
-        "root_path": "",
-        "headers": [(b"authorization", f"Bearer {TOKEN}".encode())],
-        "client": ("127.0.0.1", 40000),
-        "query_string": b"",
-    }
-    request = Request(scope)
-    assert seam.is_token_route("/api/plugins/kanban/board") is False
-    assert seam.route_verifier("/api/plugins/kanban/board") is None
-    # And the OCC principal never authenticates on an unregistered path.
-    assert getattr(request.state, "token_authenticated", False) is False
+    probe = FastAPI()
+    probe.middleware("http")(seam.token_auth_middleware)
+    observed: dict[str, bool] = {}
+
+    # A dedicated probe path: the shared `app` fixture also mounts a
+    # `/api/plugins/kanban/board` route, and re-registering the same path in a
+    # second app makes FastAPI treat `request` as a query field. The property
+    # under test is path-independent: an unregistered dashboard path must never
+    # become token-authenticated.
+    board_path = "/api/plugins/kanban/board-probe"
+
+    @probe.get(board_path)
+    async def _board(request: Request):
+        observed["authenticated"] = bool(
+            getattr(request.state, "token_authenticated", False)
+        )
+        return {"reached": True}
+
+    assert seam.is_token_route(board_path) is False
+    assert seam.route_verifier(board_path) is None
+    with TestClient(probe, client=("127.0.0.1", 40000)) as client:
+        resp = client.get(board_path, headers=_auth())
+    assert resp.status_code == 200, resp.text
+    assert observed["authenticated"] is False, (
+        "the OCC credential must never mark a dashboard route token-authenticated"
+    )
 
 
 def test_cookie_session_is_refused_on_the_machine_route(app):
@@ -573,6 +588,34 @@ def test_token_is_snapshotted_once_and_env_rewrite_does_not_rotate_it(monkeypatc
         assert _get(client, "summary", token=TOKEN).status_code == 200
 
 
+def test_registration_must_not_snapshot_the_credential(app, monkeypatch):
+    """B8 round 3: eager snapshotting at registration deadlocks the import.
+
+    Athena round 3 asked for the credential to be frozen inside
+    ``register_routes()``. That cannot work: registration runs from the kanban
+    plugin's API module, which ``web_server`` imports from inside
+    ``_mount_plugin_api_routes()`` while ``web_server`` is still executing its
+    own module body, and validating the token consults
+    ``web_server._SESSION_TOKEN``. Doing it eagerly re-enters the in-progress
+    import and hangs the process forever (measured with a faulthandler dump).
+
+    This pins the safe contract instead: after registration the snapshot is
+    still unset, and the first request is what freezes it.
+    """
+    from hermes_cli import kanban_occ_api
+
+    kanban_occ_api._reset_token_snapshot()
+    kanban_occ_api.register_routes()
+    assert kanban_occ_api._configured_token is kanban_occ_api._UNSET, (
+        "register_routes() must not snapshot the credential; web_server is still "
+        "importing and validation would re-enter it"
+    )
+    # A request is safe: by then web_server has finished importing.
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        assert _get(client, "summary").status_code == 200
+    assert kanban_occ_api._configured_token == TOKEN
+
+
 # ---------------------------------------------------------------------------
 # Rate limiting, 429 and audit hygiene (Athena A7 + B1/B2)
 # ---------------------------------------------------------------------------
@@ -580,9 +623,18 @@ def test_token_is_snapshotted_once_and_env_rewrite_does_not_rotate_it(monkeypatc
 
 @pytest.fixture()
 def audit_records(monkeypatch):
-    """Capture audit writes instead of touching the on-disk log."""
+    """Capture audit writes from **both** audit call sites.
+
+    Two modules write auth-failure records on a route-scoped rejection:
+    ``kanban_occ_api`` (the verifier) and ``token_auth`` (the seam's alias
+    probes). ``token_auth`` imported ``audit_log`` by name at module scope
+    (``from ...audit import audit_log``), so patching only the source module
+    cannot intercept it. R3-2: without patching ``token_auth.audit_log`` as
+    well, the "the seam must not duplicate" assertion could never fail.
+    """
     from hermes_cli import kanban_occ_api
     from hermes_cli.dashboard_auth import audit as audit_module
+    from hermes_cli.dashboard_auth import token_auth as token_auth_module
 
     records: list[dict] = []
 
@@ -590,6 +642,7 @@ def audit_records(monkeypatch):
         records.append({"event": getattr(event, "value", str(event)), **fields})
 
     monkeypatch.setattr(audit_module, "audit_log", _capture)
+    monkeypatch.setattr(token_auth_module, "audit_log", _capture)
     # _reject_audit imports the symbol lazily, so patching the module attribute
     # above is enough; this assertion keeps that contract honest.
     assert kanban_occ_api._reject_audit.__module__ == "hermes_cli.kanban_occ_api"
@@ -710,6 +763,40 @@ def test_audit_ip_comes_from_the_peer_not_the_forwarded_header(app, audit_record
     for record in audit_records:
         assert record["ip"] == "192.168.5.5", record
         assert "203.0.113.66" not in json.dumps(record)
+
+
+def test_pre_comparison_rejections_are_audited_once_per_window(app, audit_records):
+    """B1 round 3: an unauthenticated loop cannot amplify the audit log.
+
+    Ten rejections happen before the credential comparison (config, peer,
+    headers, query, syntax). A caller can trigger them in a loop without ever
+    presenting a token, so each reason is audited once per window instead of
+    once per request.
+    """
+    from hermes_cli import kanban_occ_api
+
+    kanban_occ_api._PreComparisonAudit.reset()
+    # No Authorization header at all -> authorization_header_count, 20 times.
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        for _ in range(20):
+            assert client.get("/api/plugins/kanban/occ/v1/summary").status_code == 401
+    counted = [
+        r for r in audit_records if r.get("reason") == "authorization_header_count"
+    ]
+    assert len(counted) == 1, counted
+    # Suppression is per reason, so other classes still surface.
+    assert kanban_occ_api._PreComparisonAudit.should_write("peer_not_private") is True
+
+
+def test_pre_comparison_window_does_not_throttle_the_legitimate_caller(app):
+    """B1 round 3: windowing the audit must not change any response status."""
+    kanban_occ_api = __import__("hermes_cli.kanban_occ_api", fromlist=["x"])
+    kanban_occ_api._PreComparisonAudit.reset()
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        for _ in range(5):
+            assert client.get("/api/plugins/kanban/occ/v1/summary").status_code == 401
+        # A correct credential is still served throughout the window.
+        assert _get(client, "summary").status_code == 200
 
 
 # ---------------------------------------------------------------------------

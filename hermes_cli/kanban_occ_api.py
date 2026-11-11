@@ -410,14 +410,62 @@ def _query_pairs(scope: dict) -> list[tuple[str, str]]:
     return pairs
 
 
+#: Reasons refused *before* the credential comparison. These are cheap local
+#: checks (config, peer, headers, query, syntax), so an unauthenticated caller
+#: can trigger them in a loop without ever presenting a token. Each one is
+#: audited, but only once per window per reason: A7 requires the failure budget
+#: to stop per-attempt auditing, and a pre-comparison reason never debits the
+#: credential budget (B1 round 3 keeps the legitimate caller unthrottled).
+_AUDIT_WINDOW_SECONDS: float = 60.0
+
+
+class _WindowedAudit:
+    """At most one audit record per ``reason`` per window.
+
+    Suppression is *per reason* rather than global so a single noisy source
+    cannot hide a different attack class from the audit trail. The first record
+    of each window is always written, so the trail never goes silent.
+    """
+
+    def __init__(self, window_seconds: float) -> None:
+        self._window = window_seconds
+        self._last: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def should_write(self, reason: str) -> bool:
+        """Record ``reason`` and return whether this occurrence writes a line."""
+        with self._lock:
+            now = time.monotonic()
+            previous = self._last.get(reason)
+            if previous is not None and (now - previous) < self._window:
+                return False
+            self._last[reason] = now
+            return True
+
+    def reset(self) -> None:
+        """Test-only: forget every window so the next occurrence writes."""
+        with self._lock:
+            self._last.clear()
+
+
+_PreComparisonAudit = _WindowedAudit(_AUDIT_WINDOW_SECONDS)
+
+
 def _reject_audit(reason: str, scope: dict) -> None:
     """Write one peer-attributed audit record for a rejection.
 
     ``ip`` comes from the transport peer only (B2). The route-scoped path never
     trusts ``X-Forwarded-For``: those requests are refused outright, so deriving
     the IP from the header would record whatever the attacker wrote.
+
+    Pre-comparison reasons are windowed: an unauthenticated loop against
+    ``peer_not_private`` or a missing ``Authorization`` header would otherwise
+    write one record per request forever (B1).
     """
     from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+
+    if not _PreComparisonAudit.should_write(reason):
+        return
 
     audit_log(
         AuditEvent.TOKEN_AUTH_FAILURE,
@@ -821,14 +869,21 @@ def register_routes() -> None:
     Called once at plugin import. Registration is idempotent (the seam allows
     an identical re-registration) and refuses any later binding swap.
 
-    The credential is snapshotted on the **first request**, not here. Validation
-    compares against ``web_server._SESSION_TOKEN``, and importing ``web_server``
-    from this function re-enters ``web_server`` while it is still importing the
-    plugin that called us — a circular import that deadlocks the process. First
-    use is still "process start" in the only sense that matters for rotation:
-    once snapshotted, the value is frozen for the life of the process and no
-    later ``os.environ`` rewrite can swap it (B8). A missing or invalid token
-    keeps the surface closed with 401, unchanged from before.
+    The credential is **not** snapshotted here, and that is deliberate. This
+    function runs from the kanban plugin's API module, which ``web_server``
+    imports from inside ``_mount_plugin_api_routes()`` while ``web_server`` is
+    still executing its own module body. Validation compares the token against
+    ``web_server._SESSION_TOKEN``, so snapshotting here would re-enter
+    ``hermes_cli.web_server`` mid-import and deadlock the process. This was
+    measured, not assumed: registration then blocks forever in the import
+    machinery (see the "registration must not snapshot" test and Athena round 3).
+
+    The credential is therefore frozen on the **first authenticated-route
+    request**, by which time ``web_server`` has finished importing. That is
+    still "process start" for the property that matters: the value is read once,
+    frozen for the life of the process, and no later ``os.environ`` rewrite can
+    swap it — which is exactly what the runbook and the witness promise. A
+    missing or invalid token keeps the surface closed with 401.
     """
     for path in OCC_ROUTE_PATHS:
         register_token_route(path, verifier=_verify_occ_request)

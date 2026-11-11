@@ -170,6 +170,17 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def _peer_ip(request: Request) -> str:
+    """The transport peer address only, never a forwarding header (B2/R3-1).
+
+    ``_client_ip`` above still honours ``X-Forwarded-For`` for legacy token and
+    gate audit logs, which is tracked as backlog. Route-scoped rejections must
+    not: this path is reached *because* someone sent a forwarding header, so the
+    header value would be attacker-chosen.
+    """
+    return request.client.host if request.client else ""
+
+
 def extract_bearer_token(request: Request) -> str:
     """Return the bearer token from the ``Authorization`` header, or "".
 
@@ -251,15 +262,24 @@ async def _route_scoped_token_request(
     **Audit ownership.** A route that binds its own verifier owns its audit:
     the verifier knows *why* it refused and can attribute the peer correctly,
     and only it can tell a wrong credential from an exhausted budget. This
-    seam therefore writes **no** record for a verifier-route rejection (B2) —
-    the old second ``route_credential_rejected`` line both duplicated every
-    failure and, through ``_client_ip``, took its IP from ``X-Forwarded-For``.
-    Legacy non-verifier routes keep their existing seam auditing unchanged.
+    seam therefore writes **no** record for a rejection *made by the verifier*
+    (B2) — the old second ``route_credential_rejected`` line both duplicated
+    every failure and, through ``_client_ip``, took its IP from
+    ``X-Forwarded-For``. Legacy non-verifier routes keep their existing seam
+    auditing unchanged.
+
+    The alias checks below are the exception, and they must stay audited
+    (R3-1): a non-empty ``root_path`` or a non-canonical ``raw_path`` means the
+    request reached this handler through a mount alias or an encoded-path
+    variant, and the verifier never runs for those. Writing no record there
+    would make exactly the probes the audit exists to catch silent. Their audit
+    goes through the verifier's own single-record helper, attributed to the
+    transport peer.
     """
     if request.scope.get("root_path", "") != "":
-        return _unauthorized(request, path, reason="non_empty_root_path", audit=False)
+        return _unauthorized(request, path, reason="non_empty_root_path", audit=True)
     if request.scope.get("raw_path") != path.encode("ascii"):
-        return _unauthorized(request, path, reason="raw_path_mismatch", audit=False)
+        return _unauthorized(request, path, reason="raw_path_mismatch", audit=True)
 
     try:
         result = verifier(request)
@@ -315,8 +335,13 @@ def _decision_response(decision: RouteVerifierDecision) -> JSONResponse:
 def _unauthorized(request: Request, path: str, *, reason: str, audit: bool = True) -> JSONResponse:
     """Uniform 401 for route-scoped credentials (reason is audit-only).
 
-    ``audit=False`` is used on paths owned by a route verifier, which has
+    ``audit=False`` is used for rejections the route verifier owns: it has
     already written its own single, peer-correct record.
+
+    When this function does audit, the IP is the transport peer (``_peer_ip``),
+    never ``X-Forwarded-For`` (B2/R3-1). The alias checks in
+    ``_route_scoped_token_request`` reach here *because* the request carried an
+    unusual mount/path shape, so a header-derived IP would be attacker-chosen.
     """
     if audit:
         audit_log(
@@ -324,7 +349,7 @@ def _unauthorized(request: Request, path: str, *, reason: str, audit: bool = Tru
             provider="route-scoped",
             reason=reason,
             path=path,
-            ip=_client_ip(request),
+            ip=_peer_ip(request),
         )
     return JSONResponse({"error": "unauthenticated"}, status_code=401)
 
