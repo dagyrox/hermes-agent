@@ -207,9 +207,9 @@
       "exhausted_response": "429 {\"error\":\"rate_limited\"} with a Retry-After header, for either bucket",
       "audit_while_exhausted": "at most one audit record per reason per window"
     },
-    "audit": "one record per rejection, attributed to the transport peer, never X-Forwarded-For: the route verifier writes the record for every credential, peer, header and query rejection; the auth seam writes the record for the root_path/raw_path alias probes, which never reach the verifier. No rejection is written twice.",
+    "audit": "one record per rejection, attributed to the transport peer, never X-Forwarded-For. The route verifier writes the record for every credential, peer, header and query rejection; the auth seam writes it for the root_path/raw_path alias probes, which never reach the verifier. No rejection is written twice.",
     "rotation": "token read, validated and frozen on the first request after startup; from then on no os.environ rewrite can swap it and no hot reload exists, so rotation requires a restart. It cannot be read during route registration: registration runs inside the plugin import that web_server performs while still executing its own module body, and validation consults web_server._SESSION_TOKEN, so an eager read there deadlocks the import (measured).",
-    "audit_volume": "summarized per reason per window: after the first record in a 60s window, further rejections of the same reason are suppressed until the window rolls over, so an unauthenticated loop cannot amplify the audit log"
+    "audit_volume": "summarized for the reasons that precede the credential comparison, and for alias probes: each of those reasons writes at most one record per 60s window, so an unauthenticated loop cannot amplify the audit log. credential_mismatch is NOT windowed: every wrong credential is recorded with its peer, because that record is what describes who was guessing."
   },
   "config": {
     "enabled_key": "kanban.occ_read.enabled",

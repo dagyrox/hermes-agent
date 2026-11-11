@@ -416,6 +416,11 @@ def _query_pairs(scope: dict) -> list[tuple[str, str]]:
 #: audited, but only once per window per reason: A7 requires the failure budget
 #: to stop per-attempt auditing, and a pre-comparison reason never debits the
 #: credential budget (B1 round 3 keeps the legitimate caller unthrottled).
+#:
+#: This set is an allowlist on purpose (R4-2). Windowing *every* rejection would
+#: also suppress ``credential_mismatch``, and a wrong credential is the one
+#: event the audit must never drop: one record per peer per attempt is the
+#: guarantee the failure budget relies on to describe who was guessing.
 _AUDIT_WINDOW_SECONDS: float = 60.0
 
 
@@ -448,6 +453,23 @@ class _WindowedAudit:
             self._last.clear()
 
 
+#: The exact reasons that predate the credential comparison. Anything not in
+#: this set is audited on every occurrence.
+_PRE_COMPARISON_REASONS = frozenset(
+    {
+        "disabled_or_unconfigured",
+        "token_unconfigured",
+        "peer_not_private",
+        "forwarding_header_present",
+        "cookie_or_session_header_present",
+        "query_not_utf8",
+        "query_credential_present",
+        "authorization_header_count",
+        "authorization_scheme",
+        "authorization_token_syntax",
+    }
+)
+
 _PreComparisonAudit = _WindowedAudit(_AUDIT_WINDOW_SECONDS)
 
 
@@ -458,13 +480,14 @@ def _reject_audit(reason: str, scope: dict) -> None:
     trusts ``X-Forwarded-For``: those requests are refused outright, so deriving
     the IP from the header would record whatever the attacker wrote.
 
-    Pre-comparison reasons are windowed: an unauthenticated loop against
-    ``peer_not_private`` or a missing ``Authorization`` header would otherwise
-    write one record per request forever (B1).
+    Windowing applies to ``_PRE_COMPARISON_REASONS`` only (R4-2). A
+    ``credential_mismatch`` is written on every attempt: it is the record the
+    failure budget exists to summarize, and dropping it per reason would let a
+    second guessing peer go unrecorded.
     """
     from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 
-    if not _PreComparisonAudit.should_write(reason):
+    if reason in _PRE_COMPARISON_REASONS and not _PreComparisonAudit.should_write(reason):
         return
 
     audit_log(

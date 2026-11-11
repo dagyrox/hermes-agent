@@ -765,6 +765,25 @@ def test_audit_ip_comes_from_the_peer_not_the_forwarded_header(app, audit_record
         assert "203.0.113.66" not in json.dumps(record)
 
 
+def test_credential_mismatch_is_audited_for_every_peer_r4_2(app, audit_records):
+    """R4-2: the window must not suppress ``credential_mismatch``.
+
+    Round 3's window was applied to every rejection, so a second guessing peer
+    inside the same minute went unrecorded. Only the pre-comparison reasons are
+    windowed; a wrong credential is the record the failure budget exists for.
+    """
+    from hermes_cli import kanban_occ_api
+
+    kanban_occ_api._PreComparisonAudit.reset()
+    with TestClient(app, client=("192.168.5.5", 40000)) as client:
+        assert _get(client, "summary", token="Z" * 43).status_code == 401
+    with TestClient(app, client=("10.1.2.3", 40000)) as client:
+        assert _get(client, "summary", token="Y" * 43).status_code == 401
+    mismatches = [r for r in audit_records if r.get("reason") == "credential_mismatch"]
+    assert len(mismatches) == 2, mismatches
+    assert {r["ip"] for r in mismatches} == {"192.168.5.5", "10.1.2.3"}
+
+
 def test_pre_comparison_rejections_are_audited_once_per_window(app, audit_records):
     """B1 round 3: an unauthenticated loop cannot amplify the audit log.
 

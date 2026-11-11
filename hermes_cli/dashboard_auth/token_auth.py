@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Tuple
 
@@ -179,6 +180,35 @@ def _peer_ip(request: Request) -> str:
     header value would be attacker-chosen.
     """
     return request.client.host if request.client else ""
+
+
+#: Alias probes are as cheap to trigger as the verifier's pre-comparison checks:
+#: any peer can send an encoded path or a mounted prefix in a loop. They are
+#: audited at most once per reason per window so the record exists without
+#: becoming a write amplifier (R4-1).
+_ALIAS_AUDIT_WINDOW_SECONDS: float = 60.0
+_alias_audit_last: dict[str, float] = {}
+_alias_audit_lock = threading.Lock()
+
+#: The two alias-probe reasons this seam audits, and only these.
+_ALIAS_PROBE_REASONS = frozenset({"non_empty_root_path", "raw_path_mismatch"})
+
+
+def _alias_audit_allowed(reason: str) -> bool:
+    """True when this occurrence of an alias-probe reason should be written."""
+    with _alias_audit_lock:
+        now = time.monotonic()
+        previous = _alias_audit_last.get(reason)
+        if previous is not None and (now - previous) < _ALIAS_AUDIT_WINDOW_SECONDS:
+            return False
+        _alias_audit_last[reason] = now
+        return True
+
+
+def reset_alias_audit_window() -> None:
+    """Test-only: forget the alias-probe windows."""
+    with _alias_audit_lock:
+        _alias_audit_last.clear()
 
 
 def extract_bearer_token(request: Request) -> str:
@@ -342,8 +372,16 @@ def _unauthorized(request: Request, path: str, *, reason: str, audit: bool = Tru
     never ``X-Forwarded-For`` (B2/R3-1). The alias checks in
     ``_route_scoped_token_request`` reach here *because* the request carried an
     unusual mount/path shape, so a header-derived IP would be attacker-chosen.
+
+    Alias-probe reasons are windowed per reason (R4-1): any peer can send an
+    encoded path in a loop, so the record must exist without becoming a write
+    amplifier.
     """
     if audit:
+        # Alias probes are windowed (R4-1); every other reason is audited on
+        # every occurrence.
+        if reason in _ALIAS_PROBE_REASONS and not _alias_audit_allowed(reason):
+            return JSONResponse({"error": "unauthenticated"}, status_code=401)
         audit_log(
             AuditEvent.TOKEN_AUTH_FAILURE,
             provider="route-scoped",

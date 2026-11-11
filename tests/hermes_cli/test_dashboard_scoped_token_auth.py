@@ -293,6 +293,7 @@ def test_non_empty_root_path_is_audited_once_from_the_peer(seam_audit):
     The B2 repair originally passed ``audit=False`` here and dropped this record
     entirely, which made the alias probes the audit exists to catch invisible.
     """
+    token_auth.reset_alias_audit_window()
     token_auth.register_token_route("/machine", verifier=_accepted_verifier())
     request = _request(
         "/machine",
@@ -311,6 +312,7 @@ def test_non_empty_root_path_is_audited_once_from_the_peer(seam_audit):
 
 def test_raw_path_alias_is_audited_once_from_the_peer(seam_audit):
     """R3-1: the encoded-path variant is audited exactly once."""
+    token_auth.reset_alias_audit_window()
     token_auth.register_token_route("/machine", verifier=_accepted_verifier())
     request = _request(
         "/machine",
@@ -322,6 +324,22 @@ def test_raw_path_alias_is_audited_once_from_the_peer(seam_audit):
     assert len(seam_audit) == 1, seam_audit
     assert seam_audit[0]["reason"] == "raw_path_mismatch"
     assert seam_audit[0]["ip"] == "192.168.5.5", seam_audit[0]
+
+
+def test_alias_probe_audit_is_windowed_r4_1(seam_audit):
+    """R4-1: 20 alias probes must write one record, not 20.
+
+    Alias probes are triggerable from any peer by an encoded path, so an
+    unwindowed record is a write amplifier — the same defect B1 fixed for the
+    verifier's pre-comparison checks.
+    """
+    token_auth.reset_alias_audit_window()
+    token_auth.register_token_route("/machine", verifier=_accepted_verifier())
+    for _ in range(20):
+        request = _request("/machine", raw_path=b"/mac%68ine", client=("192.168.5.5", 5000))
+        assert _run(token_auth.token_auth_middleware(request, _ok)).status_code == 401
+    assert len(seam_audit) == 1, seam_audit
+    assert seam_audit[0]["reason"] == "raw_path_mismatch"
 
 
 def test_verifier_route_rejection_is_not_double_audited(seam_audit):
