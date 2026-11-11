@@ -303,8 +303,10 @@ async def _route_scoped_token_request(
     request reached this handler through a mount alias or an encoded-path
     variant, and the verifier never runs for those. Writing no record there
     would make exactly the probes the audit exists to catch silent. Their audit
-    goes through the verifier's own single-record helper, attributed to the
-    transport peer.
+    is written by this seam's own ``_unauthorized`` helper under the
+    ``route-scoped`` provider, attributed to the transport peer and windowed per
+    reason: at most one record per reason per 60s, so an alias probe loop cannot
+    amplify the log.
     """
     if request.scope.get("root_path", "") != "":
         return _unauthorized(request, path, reason="non_empty_root_path", audit=True)

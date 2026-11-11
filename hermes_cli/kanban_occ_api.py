@@ -187,11 +187,14 @@ def _valid_configured_token(value: Optional[str]) -> Optional[str]:
     return value
 
 
-#: Snapshot of the validated credential, taken once at route registration
-#: (B8). The runbook and the witness both promise "read once at process start,
-#: restart to rotate": reading ``os.environ`` per request would make a live
-#: ``os.environ`` rewrite (by any code in the process) a hot-reload path the
-#: documentation says does not exist. ``_UNSET`` distinguishes "not snapshotted
+#: Snapshot of the validated credential, frozen once and then reused for the
+#: life of the process (B8). The runbook and the witness both promise "read once
+#: at process start, restart to rotate": reading ``os.environ`` per request
+#: would make a live ``os.environ`` rewrite (by any code in the process) a
+#: hot-reload path the documentation says does not exist. The freeze happens on
+#: the first request that needs it, not during route registration: registration
+#: runs inside the plugin import, where an eager read deadlocks (see the
+#: contract's ``rotation`` note). ``_UNSET`` distinguishes "not snapshotted
 #: yet" from "snapshotted and absent".
 _UNSET: object = object()
 _configured_token: object = _UNSET
@@ -199,7 +202,7 @@ _TOKEN_LOCK = threading.Lock()
 
 
 def _snapshot_token() -> Optional[str]:
-    """Read, validate and freeze the configured token. Called at registration."""
+    """Read and validate the configured token. Called once, under the lock."""
     return _valid_configured_token(os.environ.get(TOKEN_ENV_VAR))
 
 
@@ -416,11 +419,17 @@ def _query_pairs(scope: dict) -> list[tuple[str, str]]:
 #: audited, but only once per window per reason: A7 requires the failure budget
 #: to stop per-attempt auditing, and a pre-comparison reason never debits the
 #: credential budget (B1 round 3 keeps the legitimate caller unthrottled).
+#: The window keys on the reason alone, not the reason and the peer, so one
+#: peer's probe suppresses another peer's record of the same reason.
 #:
 #: This set is an allowlist on purpose (R4-2). Windowing *every* rejection would
-#: also suppress ``credential_mismatch``, and a wrong credential is the one
-#: event the audit must never drop: one record per peer per attempt is the
-#: guarantee the failure budget relies on to describe who was guessing.
+#: also suppress ``credential_mismatch``, which is the one failure the audit
+#: must not drop while the failure budget still has capacity. It is not a
+#: guarantee of one record per attempt: once the budget is exhausted, a wrong
+#: credential is answered 429 and audited as ``failure_budget_exhausted`` at
+#: most once per reason per peer per window (see :func:`_throttled`), so beyond
+#: that point the trail shows the throttled peer and a suppressed count rather
+#: than a record for each guess.
 _AUDIT_WINDOW_SECONDS: float = 60.0
 
 
@@ -481,9 +490,12 @@ def _reject_audit(reason: str, scope: dict) -> None:
     the IP from the header would record whatever the attacker wrote.
 
     Windowing applies to ``_PRE_COMPARISON_REASONS`` only (R4-2). A
-    ``credential_mismatch`` is written on every attempt: it is the record the
-    failure budget exists to summarize, and dropping it per reason would let a
-    second guessing peer go unrecorded.
+    ``credential_mismatch`` is written on every attempt that reaches the
+    comparison with failure-budget capacity left: it is the record that
+    describes who was guessing. That holds only while capacity remains —
+    :func:`_throttled` answers an exhausted budget with 429 and audits
+    ``failure_budget_exhausted`` at most once per reason per peer per window,
+    so attempts past the budget are counted, not individually recorded.
     """
     from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 
