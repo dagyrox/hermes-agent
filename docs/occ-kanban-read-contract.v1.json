@@ -7,7 +7,7 @@
   "run": 927,
   "packet": "docs/work-packets/occ-kanban-provider-implementation.md",
   "schema_version": 1,
-  "review_status": "changes_required_at_40717779ad0_round3_findings_repaired_unreviewed",
+  "review_status": "changes_required_at_844819cc1_round4_findings_repaired_unreviewed",
   "review_history": [
     {
       "head": "74e5c29526cb7606a54eca7a15924ef41456cfd0",
@@ -18,7 +18,7 @@
       "record": "docs/work-packets/occ-kanban-visual/athena-provider-review.md"
     }
   ],
-  "review_status_note": "Athena round 3 reviewed 40717779ad0 and returned CHANGES_REQUIRED (B1, B2, B8, B9, B10 plus R3-1, R3-2). Those findings are repaired on 4c9c2314fc3 and Athena has not reviewed that head. One finding (B8) is rejected with measured evidence rather than implemented: eager snapshotting at registration deadlocks the import. Approval is recorded only by Athena's next exact-head review; this file must not self-declare one.",
+  "review_status_note": "Athena round 4 reviewed 844819cc1 and returned CHANGES_REQUIRED for two new defects in the round-3 repair (R4-1 unwindowed alias-probe audit, R4-2 over-broad audit window suppressing credential_mismatch); it accepted B8 and closed B1, B2, B9, B10, R3-1 and R3-2. Both are repaired on 10ce15746ca and Athena has not reviewed that head. Approval is recorded only by Athena's next exact-head review; this file must not self-declare one.",
   "installation_status": "not_installed",
   "activation_status": "not_activated",
   "endpoints": [
