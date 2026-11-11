@@ -7311,6 +7311,47 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
         ) from exc
 
 
+def require_valid_failover_before_write(data: Any) -> None:
+    """Refuse to write a config whose ``agent_backend_failover`` is invalid.
+
+    ``load_config()`` validates the staged failover map and raises
+    :class:`ValueError` on a bad chain. That validates *reads* only: nothing
+    stopped an invalid block from being written to disk first. The failure
+    then surfaced one layer away, at every subsequent load — the gateway's
+    Kanban dispatcher crashed once a minute, workers never spawned, and the
+    write that caused it had already reported success.
+
+    Observed shape (2026-11-10): an edit that stripped the ``claude_code``
+    legs left ``openai-codex`` duplicated in legs 1 and 2 of every role.
+    Write succeeded; dispatch died for 143 consecutive ticks.
+
+    Validating here makes the write the failure point, with the offending
+    message, while ``config.yaml`` on disk still holds the last good state.
+    A write that would leave no usable config is refused instead of applied.
+
+    Validation is skipped when the key is absent (nothing to validate) and
+    when the payload is not a mapping that could carry it.
+    """
+    if not isinstance(data, dict):
+        return
+    failover_config = data.get("agent_backend_failover")
+    if failover_config is None:
+        return
+    if not isinstance(failover_config, dict):
+        raise ValueError("agent_backend_failover must be a mapping")
+
+    from hermes_cli.backend_failover import validate_backend_failover_config
+
+    try:
+        validate_backend_failover_config(failover_config)
+    except ValueError as exc:
+        raise ValueError(
+            "Refusing to write config.yaml: agent_backend_failover is invalid "
+            f"({exc}). The existing file was left unchanged. Fix the chain or "
+            "remove the agent_backend_failover key to write without it."
+        ) from exc
+
+
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """Fail-closed atomic write for ``config.yaml``.
 
@@ -7334,6 +7375,7 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     from utils import atomic_yaml_write
 
     require_readable_config_before_write(config_path)
+    require_valid_failover_before_write(data)
     atomic_yaml_write(config_path, data, **kwargs)
 
 
@@ -7779,6 +7821,7 @@ def save_config(
         ensure_hermes_home()
         config_path = get_config_path()
         require_readable_config_before_write(config_path)
+        require_valid_failover_before_write(config)
         # Compute explicit user paths BEFORE any normalisation --------
         # _normalize_max_turns_config may inject agent.max_turns from
         # DEFAULT_CONFIG; using the raw dict preserves which paths the

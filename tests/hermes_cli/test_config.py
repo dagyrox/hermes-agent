@@ -468,6 +468,129 @@ class TestSaveAndLoadRoundtrip:
         assert config_path.exists()
         assert "openrouter" in config_path.read_text(encoding="utf-8")
 
+    # ------------------------------------------------------------------
+    # agent_backend_failover write guard
+    #
+    # Regression shape (2026-11-10): an edit stripped every claude_code leg
+    # and left openai-codex duplicated in legs 1 and 2. The write succeeded
+    # and reported success; load_config() then rejected the block on every
+    # subsequent read, so the gateway dispatcher failed for 143 straight
+    # ticks and no worker could spawn anywhere. Validating at the write
+    # chokepoint moves the failure to the edit, while the last good
+    # config.yaml is still on disk.
+    # ------------------------------------------------------------------
+
+    def test_atomic_config_write_refuses_duplicate_provider_chain(self, tmp_path):
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        original = "model:\n  provider: openrouter\n"
+        config_path.write_text(original, encoding="utf-8")
+
+        broken = {
+            "model": {"provider": "openrouter"},
+            "agent_backend_failover": {
+                "enabled": True,
+                "max_attempts_per_leg": 1,
+                "roles": {
+                    "talos": [
+                        {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+                        {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+                        {"kind": "api", "provider": "deepseek", "model": "deepseek-flash"},
+                    ]
+                },
+            },
+        }
+
+        with pytest.raises(ValueError, match="Refusing to write config.yaml"):
+            atomic_config_write(config_path, broken)
+
+        # The last good config must survive untouched.
+        assert config_path.read_text(encoding="utf-8") == original
+
+    def test_atomic_config_write_refuses_route_off_the_frozen_table(self, tmp_path):
+        """A chain with three distinct providers that still does not match the
+        frozen route is also refused — distinctness alone is not enough."""
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("model:\n  provider: openrouter\n", encoding="utf-8")
+
+        off_table = {
+            "agent_backend_failover": {
+                "enabled": True,
+                "max_attempts_per_leg": 1,
+                "roles": {
+                    "talos": [
+                        {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+                        {"kind": "api", "provider": "openai-api", "model": "gpt-6.1-sol"},
+                        {"kind": "api", "provider": "deepseek", "model": "deepseek-flash"},
+                    ]
+                },
+            }
+        }
+
+        with pytest.raises(ValueError, match="Refusing to write config.yaml"):
+            atomic_config_write(config_path, off_table)
+
+    def test_atomic_config_write_accepts_canonical_chain(self, tmp_path):
+        """The canonical three-provider chain must still write normally."""
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        valid = {
+            "agent_backend_failover": {
+                "enabled": True,
+                "max_attempts_per_leg": 1,
+                "roles": {
+                    "talos": [
+                        {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+                        {"kind": "claude_code", "model": "claude-sonnet-5-5", "capability_mode": "full"},
+                        {"kind": "api", "provider": "deepseek", "model": "deepseek-flash"},
+                    ]
+                },
+            }
+        }
+
+        atomic_config_write(config_path, valid)
+        written = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert written["agent_backend_failover"]["roles"]["talos"][1]["kind"] == "claude_code"
+
+    def test_atomic_config_write_allows_absent_failover_key(self, tmp_path):
+        """No agent_backend_failover key means nothing to validate."""
+        from hermes_cli.config import atomic_config_write
+
+        config_path = tmp_path / "config.yaml"
+        atomic_config_write(config_path, {"model": {"provider": "openrouter"}})
+        assert config_path.exists()
+
+    def test_save_config_refuses_duplicate_provider_chain(self, tmp_path):
+        """save_config is the other common write path and must refuse too."""
+        config_path = tmp_path / "config.yaml"
+        original = "model:\n  provider: openrouter\n"
+        config_path.write_text(original, encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with pytest.raises(ValueError, match="Refusing to write config.yaml"):
+                save_config(
+                    {
+                        "model": {"provider": "openrouter"},
+                        "agent_backend_failover": {
+                            "enabled": True,
+                            "max_attempts_per_leg": 1,
+                            "roles": {
+                                "talos": [
+                                    {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+                                    {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+                                    {"kind": "api", "provider": "deepseek", "model": "deepseek-flash"},
+                                ]
+                            },
+                        },
+                    }
+                )
+
+        assert config_path.read_text(encoding="utf-8") == original
+
     def test_save_config_normalizes_legacy_root_level_max_turns(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             save_config({"model": "test/custom-model", "max_turns": 37})
