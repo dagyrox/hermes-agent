@@ -35,6 +35,8 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
+import os
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -45,7 +47,10 @@ from fastapi.responses import JSONResponse, Response
 
 from hermes_cli import kanban_occ_read as occ
 from hermes_cli.dashboard_auth.base import TokenPrincipal
-from hermes_cli.dashboard_auth.token_auth import register_token_route
+from hermes_cli.dashboard_auth.token_auth import (
+    RouteVerifierDecision,
+    register_token_route,
+)
 
 log = logging.getLogger(__name__)
 
@@ -70,16 +75,23 @@ _TOKEN68_EXTRA = frozenset("-._~+/=")
 
 #: Forwarding headers are refused outright. A same-host reverse proxy makes
 #: every peer look like loopback, so ignoring these would be theatre.
-_FORWARDING_HEADERS = frozenset(
-    {b"forwarded", b"x-real-ip", b"x-forwarded-for", b"x-forwarded-host",
-     b"x-forwarded-proto", b"x-forwarded-port", b"x-forwarded-server"}
-)
+#:
+#: Matched by *prefix* (``x-forwarded-``) as well as by name, because an
+#: allowlist of known spellings leaks: ``X-Forwarded-Prefix``, ``X-Forwarded-Uri``,
+#: ``X-Forwarded-Ssl``, ``X-Forwarded-Scheme``, ``X-Forwarded-Client-Cert`` and
+#: anything a future proxy invents would otherwise pass.
+_FORWARDING_HEADER_PREFIX = b"x-forwarded-"
+_FORWARDING_HEADERS = frozenset({b"forwarded", b"x-real-ip"})
 _COOKIE_HEADERS = frozenset({b"cookie", b"x-hermes-session-token"})
 
 _RATE_WINDOW_SECONDS = 60.0
 _RATE_BUDGET = 120
 _RATE_BURST = 30
 _FAILED_BUDGET = 30
+#: One summarized audit line per window once a budget is exhausted, instead of
+#: one per rejected attempt (B1: the failure budget must *stop* per-attempt
+#: auditing, otherwise a guessing loop controls our write amplification).
+_SUPPRESSED_AUDIT_TTL_SECONDS = _RATE_WINDOW_SECONDS
 
 
 class ConfigError(ValueError):
@@ -175,9 +187,37 @@ def _valid_configured_token(value: Optional[str]) -> Optional[str]:
     return value
 
 
-# ---------------------------------------------------------------------------
-# Rate limiting
-# ---------------------------------------------------------------------------
+#: Snapshot of the validated credential, taken once at route registration
+#: (B8). The runbook and the witness both promise "read once at process start,
+#: restart to rotate": reading ``os.environ`` per request would make a live
+#: ``os.environ`` rewrite (by any code in the process) a hot-reload path the
+#: documentation says does not exist. ``_UNSET`` distinguishes "not snapshotted
+#: yet" from "snapshotted and absent".
+_UNSET: object = object()
+_configured_token: object = _UNSET
+_TOKEN_LOCK = threading.Lock()
+
+
+def _snapshot_token() -> Optional[str]:
+    """Read, validate and freeze the configured token. Called at registration."""
+    return _valid_configured_token(os.environ.get(TOKEN_ENV_VAR))
+
+
+def _load_token_once() -> Optional[str]:
+    """The frozen credential; snapshotted on first use if registration missed it."""
+    global _configured_token
+    if _configured_token is _UNSET:
+        with _TOKEN_LOCK:
+            if _configured_token is _UNSET:
+                _configured_token = _snapshot_token()
+    return _configured_token if isinstance(_configured_token, str) else None
+
+
+def _reset_token_snapshot() -> None:
+    """Test-only: forget the frozen credential so the next call re-reads it."""
+    global _configured_token
+    with _TOKEN_LOCK:
+        _configured_token = _UNSET
 
 
 class _Budget:
@@ -187,6 +227,11 @@ class _Budget:
     them separate stops a credential-guessing loop from exhausting the budget a
     legitimate caller needs, while still bounding the write amplification of
     the audit log.
+
+    A failure is debited **only** on a wrong credential (B1): checking a
+    well-formed request against the bucket up front, then releasing the debit
+    when the comparison succeeds, means ~30 wrong tokens a minute can no longer
+    lock the legitimate caller out of the 120/min ceiling it was promised.
     """
 
     def __init__(self, *, per_minute: int, burst: int) -> None:
@@ -196,16 +241,28 @@ class _Budget:
         self._updated = time.monotonic()
         self._lock = threading.Lock()
 
+    def _refill(self, now: float) -> None:
+        elapsed = now - self._updated
+        self._updated = now
+        self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
+
     def take(self) -> Optional[float]:
         """Consume one unit. Returns ``None`` on success, else retry-after."""
         with self._lock:
             now = time.monotonic()
-            elapsed = now - self._updated
-            self._updated = now
-            self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
+            self._refill(now)
             if self._tokens >= 1.0:
                 self._tokens -= 1.0
                 return None
+            return max(1.0, (1.0 - self._tokens) / self._rate)
+
+    def retry_after(self) -> float:
+        """Seconds until this bucket can serve one more request."""
+        with self._lock:
+            now = time.monotonic()
+            self._refill(now)
+            if self._tokens >= 1.0:
+                return 0.0
             return max(1.0, (1.0 - self._tokens) / self._rate)
 
 
@@ -213,38 +270,98 @@ _AuthorizedBudget = _Budget(per_minute=_RATE_BUDGET, burst=_RATE_BURST)
 _FailedBudget = _Budget(per_minute=_FAILED_BUDGET, burst=_FAILED_BUDGET)
 
 
+class _AuditSuppressor:
+    """Emit at most one audit record per reason per window.
+
+    Once either budget is exhausted the rejections are no longer individually
+    interesting — they are one event, not thousands of log lines. Keyed by
+    ``(reason, peer)`` so a flood from one peer cannot hide another peer's
+    first failure, and so the very first exhaustion is always recorded.
+    """
+
+    def __init__(self, ttl: float) -> None:
+        self._ttl = ttl
+        self._last: dict[tuple[str, str], float] = {}
+        self._lock = threading.Lock()
+        self.suppressed: dict[tuple[str, str], int] = {}
+
+    def allow(self, reason: str, peer: str) -> bool:
+        key = (reason, peer)
+        now = time.monotonic()
+        with self._lock:
+            last = self._last.get(key)
+            if last is not None and (now - last) < self._ttl:
+                self.suppressed[key] = self.suppressed.get(key, 0) + 1
+                return False
+            self._last[key] = now
+            self.suppressed.pop(key, None)
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._last.clear()
+            self.suppressed.clear()
+
+
+_ExhaustedAudit = _AuditSuppressor(ttl=_SUPPRESSED_AUDIT_TTL_SECONDS)
+
+
 # ---------------------------------------------------------------------------
 # Peer and header checks
 # ---------------------------------------------------------------------------
 
+#: A5's allowlist, spelled out. Deliberately *not* ``ipaddress.is_private``:
+#: that property also accepts 2001::/23 (which contains the globally reachable
+#: Teredo prefix 2001::/32), 2001:db8::/32 and the IPv4 documentation/reserved
+#: ranges 192.0.0.0/24, 192.0.2.0/24, 198.18.0.0/15, 198.51.100.0/24 and
+#: 203.0.113.0/24. An allowlist cannot leak a range nobody thought of.
+_PRIVATE_PEER_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128",
+        "fc00::/7",
+    )
+)
 
-def _peer_is_private(scope: dict) -> bool:
-    """Loopback / RFC1918 / ULA only. Link-local, CGNAT, unspecified refused."""
+
+def _peer_address(scope: dict) -> Optional[ipaddress._BaseAddress]:
+    """The transport peer as an address, or ``None``.
+
+    ``scope["client"]`` only — never a header. A caller-supplied forwarding
+    header is refused separately (B7); trusting one here would make the audit
+    ``ip`` whatever the attacker typed.
+    """
     client = scope.get("client")
     if not client:
-        return False
+        return None
     host = client[0] if isinstance(client, (tuple, list)) and client else client
     if not isinstance(host, str) or not host:
-        return False
+        return None
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
-        return False
+        return None
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
-    if addr.is_loopback or addr.is_private and not addr.is_link_local:
-        # is_private also covers link-local and CGNAT in some versions, so
-        # exclude those explicitly; ULA (fc00::/7) is already is_private.
-        if addr.is_link_local:
-            return False
-        if isinstance(addr, ipaddress.IPv4Address) and addr in ipaddress.ip_network(
-            "100.64.0.0/10"
-        ):
-            return False
-        if addr.is_unspecified or addr.is_multicast or addr.is_reserved:
-            return False
-        return True
-    return False
+    return addr
+
+
+def _peer_is_private(scope: dict) -> bool:
+    """Loopback, RFC1918 and ULA only — by explicit network membership."""
+    addr = _peer_address(scope)
+    if addr is None:
+        return False
+    return any(addr in network for network in _PRIVATE_PEER_NETWORKS)
+
+
+def _peer_text(scope: dict) -> str:
+    """Peer address for the audit record (never a header value)."""
+    addr = _peer_address(scope)
+    return str(addr) if addr is not None else ""
 
 
 def _header_values(scope: dict, name: bytes) -> list[bytes]:
@@ -260,6 +377,18 @@ def _header_values(scope: dict, name: bytes) -> list[bytes]:
     return [
         value for key, value in scope.get("headers", []) if key.lower() == target
     ]
+
+
+def _presented_header_names(scope: dict) -> set[bytes]:
+    return {key.lower() for key, _value in scope.get("headers", [])}
+
+
+def _forwarding_header_present(scope: dict) -> bool:
+    """True for ``Forwarded``/``X-Real-IP`` and *any* ``X-Forwarded-*`` name."""
+    for name in _presented_header_names(scope):
+        if name in _FORWARDING_HEADERS or name.startswith(_FORWARDING_HEADER_PREFIX):
+            return True
+    return False
 
 
 def _query_pairs(scope: dict) -> list[tuple[str, str]]:
@@ -282,15 +411,20 @@ def _query_pairs(scope: dict) -> list[tuple[str, str]]:
 
 
 def _reject_audit(reason: str, scope: dict) -> None:
+    """Write one peer-attributed audit record for a rejection.
+
+    ``ip`` comes from the transport peer only (B2). The route-scoped path never
+    trusts ``X-Forwarded-For``: those requests are refused outright, so deriving
+    the IP from the header would record whatever the attacker wrote.
+    """
     from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 
-    client = scope.get("client")
     audit_log(
         AuditEvent.TOKEN_AUTH_FAILURE,
         provider="kanban-occ-read",
         reason=reason,
         path=scope.get("path", TASK_PATH),
-        ip=(client[0] if isinstance(client, (tuple, list)) and client else ""),
+        ip=_peer_text(scope),
     )
 
 
@@ -298,78 +432,115 @@ def _unauthorized() -> JSONResponse:
     return JSONResponse({"error": "unauthenticated"}, status_code=401)
 
 
-def _verify_occ_request(request: Request) -> Optional[TokenPrincipal]:
+#: The seam's decision type. Defined once in the seam so the middleware can
+#: ``isinstance``-check without importing this module (which imports the seam).
+VerifierDecision = RouteVerifierDecision
+
+
+_ACCEPT = VerifierDecision(principal=KANBAN_OCC_PRINCIPAL)
+
+
+def _throttled(retry_after: float, *, scope: dict, reason: str) -> VerifierDecision:
+    """429 for an exhausted budget, audit-suppressed to one record per window."""
+    peer = _peer_text(scope)
+    if _ExhaustedAudit.allow(reason, peer):
+        _reject_audit(reason, scope)
+    return VerifierDecision(
+        status_code=429,
+        error="rate_limited",
+        retry_after=max(1, int(math.ceil(retry_after))),
+    )
+
+
+def _verify_occ_request(request: Request) -> VerifierDecision:
     """Route verifier for the three OCC read paths.
 
-    Returns :data:`KANBAN_OCC_PRINCIPAL` on success, ``None`` on any failure.
-    Every rejection maps to the same 401 so a caller cannot distinguish
-    "disabled" from "wrong token" from "wrong peer" by response.
+    Returns an accepted decision carrying :data:`KANBAN_OCC_PRINCIPAL`, or a
+    rejection decision. Every credential failure maps to the same 401 so a
+    caller cannot distinguish "disabled" from "wrong token" from "wrong peer"
+    by response; only throttling (429) and an unavailable auth backend (503,
+    raised by the seam) are distinct, and neither reveals credential validity.
+
+    Order is deliberate and cheap-first where it is safe: config, peer and
+    header checks are local and cost nothing, so they run before the token
+    comparison. The *failure* budget is checked before the comparison but only
+    debited when the comparison fails (B1) — a legitimate caller is never
+    charged for someone else's guessing.
     """
     scope = request.scope
 
     enabled, board = _load_occ_config()
     if not enabled or not board:
         _reject_audit("disabled_or_unconfigured", scope)
-        return None
+        return VerifierDecision()
 
-    import os
-
-    configured = _valid_configured_token(os.environ.get(TOKEN_ENV_VAR))
+    configured = _load_token_once()
     if configured is None:
         _reject_audit("token_unconfigured", scope)
-        return None
+        return VerifierDecision()
 
     if not _peer_is_private(scope):
         _reject_audit("peer_not_private", scope)
-        return None
+        return VerifierDecision()
 
-    headers = scope.get("headers", [])
-    presented_headers = {key.lower() for key, _value in headers}
-    for banned in (_FORWARDING_HEADERS | _COOKIE_HEADERS) & presented_headers:
-        _reject_audit(
-            "forwarding_header_present" if banned in _FORWARDING_HEADERS
-            else "cookie_or_session_header_present",
-            scope,
-        )
-        return None
+    if _forwarding_header_present(scope):
+        _reject_audit("forwarding_header_present", scope)
+        return VerifierDecision()
 
-    if _query_pairs(scope):
-        for key, _value in _query_pairs(scope):
-            if key == "token":
-                _reject_audit("query_credential_present", scope)
-                return None
+    if _COOKIE_HEADERS & _presented_header_names(scope):
+        _reject_audit("cookie_or_session_header_present", scope)
+        return VerifierDecision()
+
+    try:
+        pairs = _query_pairs(scope)
+    except UnicodeDecodeError:
+        # A non-UTF-8 query string is a malformed request, not a credential
+        # failure: answering 503 would tell an unauthenticated caller something
+        # about the backend, and a warning per request is log spam.
+        _reject_audit("query_not_utf8", scope)
+        return VerifierDecision()
+
+    if any(key == "token" for key, _value in pairs):
+        _reject_audit("query_credential_present", scope)
+        return VerifierDecision()
 
     auth_values = _header_values(scope, b"authorization")
     if len(auth_values) != 1:
         _reject_audit("authorization_header_count", scope)
-        return None
+        return VerifierDecision()
     aauth = auth_values[0]
     if not aauth.startswith(b"Bearer "):
         _reject_audit("authorization_scheme", scope)
-        return None
+        return VerifierDecision()
     presented = aauth[len(b"Bearer "):]
     if not presented or any(byte <= 0x20 or byte >= 0x7F for byte in presented):
         _reject_audit("authorization_token_syntax", scope)
-        return None
+        return VerifierDecision()
 
-    retry_after = _FailedBudget.take()
-    if retry_after is not None:
-        _reject_audit("attempt_budget_exhausted", scope)
-        return None
+    # Check the failure budget *before* doing the comparison work, but debit it
+    # only on a mismatch. If it is already exhausted we still allow the request
+    # through to the comparison: a correct credential must never be refused
+    # because another caller is guessing, and the cost of letting a *wrong*
+    # attempt through when the bucket is empty is bounded by the authorized
+    # budget below plus the summarized audit (one record per window).
+    exhausted_retry = _FailedBudget.retry_after()
 
     presented_ok = hmac.compare_digest(
         hashlib.sha256(presented).digest(),
         hashlib.sha256(configured.encode("ascii")).digest(),
     )
     if not presented_ok:
+        if exhausted_retry > 0:
+            return _throttled(exhausted_retry, scope=scope, reason="failure_budget_exhausted")
+        _FailedBudget.take()
         _reject_audit("credential_mismatch", scope)
-        return None
+        return VerifierDecision()
 
-    if _AuthorizedBudget.take() is not None:
-        _reject_audit("authorized_budget_exhausted", scope)
-        return None
+    authorized_retry = _AuthorizedBudget.take()
+    if authorized_retry is not None:
+        return _throttled(authorized_retry, scope=scope, reason="authorized_budget_exhausted")
 
-    return KANBAN_OCC_PRINCIPAL
+    return _ACCEPT
 
 
 def _raw_path_matches(request: Request, path: str) -> bool:
@@ -649,6 +820,15 @@ def register_routes() -> None:
 
     Called once at plugin import. Registration is idempotent (the seam allows
     an identical re-registration) and refuses any later binding swap.
+
+    The credential is snapshotted on the **first request**, not here. Validation
+    compares against ``web_server._SESSION_TOKEN``, and importing ``web_server``
+    from this function re-enters ``web_server`` while it is still importing the
+    plugin that called us — a circular import that deadlocks the process. First
+    use is still "process start" in the only sense that matters for rotation:
+    once snapshotted, the value is frozen for the life of the process and no
+    later ``os.environ`` rewrite can swap it (B8). A missing or invalid token
+    keeps the surface closed with 401, unchanged from before.
     """
     for path in OCC_ROUTE_PATHS:
         register_token_route(path, verifier=_verify_occ_request)

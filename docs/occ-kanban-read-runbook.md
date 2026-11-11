@@ -13,11 +13,23 @@ Three static GET endpoints, all under the existing Kanban plugin namespace:
 - `GET /api/plugins/kanban/occ/v1/task?task_id=t_xxxxxxxx`
 
 Wire contract `schema_version: 1`. Errors are `{"error":"<code>"}` only:
-`unauthenticated` (401), `invalid_request`/`invalid_order`/`invalid_task_id`/
-`cursor_invalid` (400), `cursor_stale` (409), `not_found` (404),
+`unauthenticated` (401), `rate_limited` (429, with a `Retry-After` header),
+`invalid_request`/`invalid_order`/`invalid_task_id`/`cursor_invalid` (400),
+`cursor_stale` (409), `not_found` (404),
 `board_unavailable`/`schema_unsupported`/`response_too_large`/`auth_unavailable`
 (503). Responses carry `Cache-Control: no-store` and
 `X-Content-Type-Options: nosniff` and are capped at 1 MiB.
+
+Two independent token buckets guard the surface. The **failure** bucket
+(30/min) is debited only when a presented credential is wrong; a throttled
+guesser cannot consume the capacity a legitimate caller needs. The
+**success** bucket (120/min, burst 30) is debited only for requests that
+authenticate. Both answer `429 {"error":"rate_limited"}` with `Retry-After`,
+never a credential-shaped 401. While a bucket is exhausted, audit writes are
+summarised to one record per reason per peer per window.
+
+The credential is read **once** and then frozen for the life of the process —
+see the rotation section.
 
 Fields the design asks for that the current schema cannot support are
 **always null**: `status_entered_at`, `scheduled_at`, `reason_preview`, and
@@ -45,10 +57,15 @@ No broad dashboard session token, OAuth refresh token, raw SQLite path or DB acc
 
 ## Rotation — authorized operator only, no token output
 
-The provider reads `HERMES_KANBAN_OCC_READ_TOKEN` **once at process start**, so
-rotation always requires a provider process restart. There is no hot reload and
-no rotation endpoint; that is deliberate, because a live rotation path would be
-a second credential-acceptance surface.
+The provider reads `HERMES_KANBAN_OCC_READ_TOKEN` **once**, on the first
+authenticated attempt after process start, and freezes the validated value for
+the life of the process. Writing `os.environ` afterwards does **not** rotate
+the credential — that is the point. Rotation always requires a provider process
+restart. There is no hot reload and no rotation endpoint; that is deliberate,
+because a live rotation path would be a second credential-acceptance surface.
+The corresponding test (`test_token_is_snapshotted_once_and_env_rewrite_does_not_rotate_it`)
+pins this in both directions: after an in-process env rewrite the old value
+still works and the new one does not.
 
 A rotation is a four-part transaction. If any step is ambiguous, stop with the
 surface off — an unrotated credential is a smaller risk than a half-rotated one.

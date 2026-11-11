@@ -199,17 +199,48 @@ def classify_status(value: object) -> str:
     return "known" if value in KNOWN_STATUSES else "unknown"
 
 
-def occ_fold(value: Optional[str]) -> Optional[str]:
+def classify_stored_status(storage_type: object, blob: object) -> tuple[str, Optional[str]]:
+    """The single classifier for a ``(typeof(status), CAST(status AS BLOB))`` cell.
+
+    Every caller — snapshot key load, summary buckets, list projection, detail
+    — goes through this function, so the class a row *renders* with and the
+    bucket it is *counted* in can never disagree.
+
+    Non-TEXT storage is always ``invalid``, even when the bytes happen to
+    decode to a known word: a BLOB ``b"running"`` is malformed storage, and
+    treating it as ``running`` in one view would break the reconciliation the
+    contract promises. TEXT overrides the returned label with the decoded text
+    so a BLOB (or non-text) row shows ``null`` rather than a substituted string.
+    """
+    if storage_type != "text":
+        return "invalid", None
+    text = _decode_text(blob)
+    return classify_status(text), text
+
+
+def occ_fold(value: object) -> Optional[str]:
     """Deterministic search folding: NFC then ``casefold``.
 
     Registered on every connection ``sqlite3`` so SQL and Python agree. SQLite's
     own ``lower()`` is ASCII-only and would make ``q`` matching locale- and
     build-dependent.
+
+    The SQL side always passes ``CAST(col AS BLOB)``, so this function receives
+    ``bytes`` for *every* storage class and a TEXT argument never reaches
+    CPython's strict decoder on the way in. Undecodable bytes, and any other
+    non-text value, return ``None``: SQLite turns that into ``NULL``, the row
+    simply does not match a ``q`` needle, and one malformed title can never
+    abort the whole page with "user-defined function raised exception".
     """
     if value is None:
         return None
-    if not isinstance(value, str):
-        value = str(value)
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return None
+    elif not isinstance(value, str):
+        return None
     return unicodedata.normalize("NFC", value).casefold()
 
 
@@ -418,9 +449,15 @@ def build_predicates(filters: Filters) -> tuple[str, list[Any]]:
         # Fold the needle too: SQL folds the haystack, so an untouched needle
         # would never match "PAYMENT" against "payment". Both sides must go
         # through the same deterministic NFC+casefold.
+        #
+        # The haystack is CAST to BLOB first (B6). A bare TEXT column reaching a
+        # Python UDF is decoded strictly by CPython, and one row with invalid
+        # UTF-8 would then raise "user-defined function raised exception" and
+        # abort the whole page. Over BLOB storage the UDF decides per row.
         needle = occ_fold(filters.q)
         clauses.append(
-            "(instr(occ_fold(t.title), ?) > 0 OR instr(occ_fold(t.id), ?) > 0)"
+            "(instr(occ_fold(CAST(t.title AS BLOB)), ?) > 0 "
+            "OR instr(occ_fold(CAST(t.id AS BLOB)), ?) > 0)"
         )
         params.extend([needle, needle])
     if filters.assignee is not None:
@@ -435,15 +472,13 @@ def build_predicates(filters: Filters) -> tuple[str, list[Any]]:
     if filters.status is not None:
         clauses.append("(typeof(t.status) = 'text' AND CAST(t.status AS BLOB) = ?)")
         params.append(filters.status.encode("utf-8"))
-    if filters.status_class is not None:
-        # The class set is decided in Python (control characters and the
-        # eight-status allowlist are not cheap SQL tests), so the SQL side only
-        # narrows to "text" and lets the row filter finish the job. Excluding
-        # non-text storage here would silently drop the invalid records this
-        # contract exists to preserve, so the SQL predicate is permissive and
-        # the Python mirror is authoritative.
-        clauses.append("(typeof(t.status) = 'text' OR t.status IS NULL)")
-        # no params: the exact membership test happens in Python
+    # ``status_class`` deliberately adds NO SQL predicate. The class set is
+    # decided in Python (control characters and the eight-status allowlist are
+    # not cheap SQL tests), and every non-TEXT storage class is ``invalid``.
+    # Narrowing to ``typeof='text'`` here would silently drop exactly the
+    # malformed rows this contract exists to preserve (B4), so the Python
+    # mirror in read_summary/read_tasks is authoritative and the SQL side is
+    # unfiltered.
 
     return " AND ".join(clauses), params
 
@@ -461,6 +496,15 @@ def _row_matches_class_filter(status_class: str, allowed: Optional[str]) -> bool
 # ---------------------------------------------------------------------------
 
 _PROCESS_CURSOR_KEY: Optional[bytes] = None
+#: Public, random per-process epoch identifier carried in every cursor.
+#:
+#: It is *not* a secret: it only lets the server tell "this cursor came from a
+#: previous process" (409 ``cursor_stale``, a state conflict the caller can
+#: recover from by restarting at page 1) apart from "this cursor was tampered
+#: with or is not a cursor at all" (400 ``cursor_invalid``). Without it a
+#: restart would make every outstanding cursor fail a MAC check and surface as
+#: the wrong error class.
+_PROCESS_CURSOR_EPOCH: Optional[str] = None
 _KEY_LOCK = threading.Lock()
 
 
@@ -477,6 +521,21 @@ def _cursor_key() -> bytes:
             if _PROCESS_CURSOR_KEY is None:
                 _PROCESS_CURSOR_KEY = secrets.token_bytes(32)
     return _PROCESS_CURSOR_KEY
+
+
+def _cursor_epoch() -> str:
+    """The current process epoch id (created alongside the key).
+
+    Calls ``_cursor_key()`` *before* taking ``_KEY_LOCK``: the lock is a plain
+    ``Lock`` and ``_cursor_key`` acquires it itself, so nesting the two would
+    deadlock the request thread.
+    """
+    global _PROCESS_CURSOR_EPOCH
+    _cursor_key()
+    with _KEY_LOCK:
+        if _PROCESS_CURSOR_EPOCH is None:
+            _PROCESS_CURSOR_EPOCH = secrets.token_urlsafe(9)
+        return _PROCESS_CURSOR_EPOCH
 
 
 def _b64encode(raw: bytes) -> str:
@@ -502,9 +561,12 @@ def encode_cursor(payload: dict[str, Any]) -> str:
 def decode_cursor(token: str) -> dict[str, Any]:
     """Verify and decode a cursor.
 
-    A tampered or malformed cursor is a caller error (400 ``cursor_invalid``);
-    a *valid* cursor whose snapshot no longer matches is a state conflict
-    (409 ``cursor_stale``), decided by the caller.
+    A malformed or tampered cursor is a caller error (400 ``cursor_invalid``).
+    A well-formed cursor that names a *different* process epoch is a state
+    conflict (409 ``cursor_stale``) and is decided *before* the MAC is checked:
+    the old process's key is gone, so the MAC could not verify even for an
+    honest caller, and telling them "invalid" would send them into a pointless
+    retry loop instead of the "board changed, start over" path.
     """
     if not isinstance(token, str) or not token or len(token) > MAX_CURSOR_BYTES:
         raise CursorInvalid("cursor malformed")
@@ -514,15 +576,17 @@ def decode_cursor(token: str) -> dict[str, Any]:
         mac = _b64decode(mac_part)
     except (ValueError, TypeError) as exc:
         raise CursorInvalid("cursor malformed") from exc
-    expected = hmac.new(_cursor_key(), raw, hashlib.sha256).digest()
-    if not hmac.compare_digest(mac, expected):
-        raise CursorInvalid("cursor signature mismatch")
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CursorInvalid("cursor payload invalid") from exc
     if not isinstance(payload, dict):
         raise CursorInvalid("cursor payload invalid")
+    if payload.get("z") != _cursor_epoch():
+        raise CursorStale("cursor issued by a previous process epoch")
+    expected = hmac.new(_cursor_key(), raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        raise CursorInvalid("cursor signature mismatch")
     return payload
 
 
@@ -670,20 +734,13 @@ def _project_row(row: sqlite3.Row, *, now: int, claim_stale_secs: int) -> dict[s
         _decode_text(row["tenant_blob"]) if row["tenant_type"] == "text" else None
     )
 
-    if row["status_type"] == "text":
-        decoded_status = _decode_text(row["status_blob"])
-        status_class = classify_status(decoded_status)
-        wire_status = decoded_status
-    elif row["status_type"] == "blob":
-        decoded_status = _decode_text(row["status_blob"])
-        status_class = "invalid"
-        wire_status = decoded_status
-    else:
-        # integer/real/NULL storage classes: no text to show, so the wire says
-        # null and OCC renders "Invalid status".
-        decoded_status = None
-        status_class = "invalid"
-        wire_status = None
+    # One classifier for every view. ``wire_status`` is only a *display* value;
+    # the class is never derived from it, so a BLOB b"running" is rendered
+    # invalid and counted invalid rather than silently becoming "running".
+    status_class, decoded_status = classify_stored_status(
+        row["status_type"], row["status_blob"]
+    )
+    wire_status = decoded_status
 
     heartbeat = row["last_heartbeat_at"]
     running: Optional[dict[str, Any]] = None
@@ -765,18 +822,15 @@ def _load_snapshot(conn: sqlite3.Connection, *, where: str, params: list[Any],
     out: list[dict[str, Any]] = []
     for row in conn.execute(sql, params):
         id_text = _decode_text(row["id_blob"]) if row["id_type"] == "text" else None
-        if row["status_type"] == "text":
-            status_text = _decode_text(row["status_blob"])
-        elif row["status_type"] == "blob":
-            status_text = _decode_text(row["status_blob"])
-        else:
-            status_text = None
+        status_class, status_text = classify_stored_status(
+            row["status_type"], row["status_blob"]
+        )
         out.append(
             {
                 "rowid": row["rowid"],
                 "id_key": id_text,
                 "id_raw": row["id_blob"],
-                "status_class": classify_status(status_text),
+                "status_class": status_class,
                 "status_key": status_text,
                 "snapshot_key": row["snapshot_key"],
             }
@@ -840,10 +894,17 @@ def read_summary(conn: sqlite3.Connection, *, board: str, filters: Filters,
         if not _row_matches_class_filter(entry["status_class"], filters.status_class):
             continue
         total += 1
-        if entry["status_class"] == "known":
+        if entry["status_class"] == "known" and entry["status_key"] in KNOWN_STATUSES:
             counts[entry["status_key"]] += 1
         else:
-            counts[entry["status_class"]] += 1
+            # ``unknown``/``invalid`` buckets, and a defensive fallback so a
+            # class/status pair that could never be keyed still lands in a
+            # bucket: sum(counts_by_status) == total_filtered must hold
+            # unconditionally, not just on well-formed boards.
+            bucket = entry["status_class"]
+            if bucket not in counts:
+                bucket = "invalid"
+            counts[bucket] += 1
         if entry["id_raw"] is None or entry["id_key"] is None:
             invalid_records += 1
 
@@ -937,6 +998,7 @@ def read_tasks(conn: sqlite3.Connection, *, board: str, filters: Filters,
     if offset + limit < len(entries):
         next_cursor = encode_cursor(
             {
+                "z": _cursor_epoch(),
                 "b": board,
                 "f": hashlib.sha256(filters.canonical().encode("utf-8")).hexdigest(),
                 "o": order,

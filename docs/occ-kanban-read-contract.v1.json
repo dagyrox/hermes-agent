@@ -7,7 +7,18 @@
   "run": 927,
   "packet": "docs/work-packets/occ-kanban-provider-implementation.md",
   "schema_version": 1,
-  "review_status": "pending_athena_exact_head",
+  "review_status": "changes_required_at_74e5c29526cb_repairs_unreviewed",
+  "review_history": [
+    {
+      "head": "74e5c29526cb7606a54eca7a15924ef41456cfd0",
+      "reviewer": "athena",
+      "round": 2,
+      "verdict": "CHANGES_REQUIRED",
+      "findings": "B1-B10",
+      "record": "docs/work-packets/occ-kanban-visual/athena-provider-review.md"
+    }
+  ],
+  "review_status_note": "B1-B10 were repaired on this head. Athena has not reviewed it. Approval is recorded only by Athena's next exact-head review; this file must not self-declare one.",
   "installation_status": "not_installed",
   "activation_status": "not_activated",
   "endpoints": [
@@ -40,8 +51,10 @@
     "known": ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"],
     "count_keys": ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "unknown", "invalid"],
     "archived_excluded": true,
-    "unknown_means": "decodable string that is not one of the eight known statuses",
-    "invalid_means": "non-string storage class, empty string, or control/format character"
+    "classifier": "one classifier over (typeof(status), CAST(status AS BLOB)) is used by the summary, the list and the detail; the class of a row never differs between views",
+    "unknown_means": "TEXT storage whose value decodes to a string that is not one of the eight known statuses",
+    "invalid_means": "non-TEXT storage (BLOB/INTEGER/REAL/NULL), an empty TEXT value, undecodable bytes, or a control/format character. A BLOB whose bytes spell a known word is still invalid.",
+    "status_field_note": "task.status on the wire is the stored text for TEXT storage and null for every other storage class"
   },
   "orders": {
     "values": ["oldest_status", "heartbeat_attention", "priority_age", "scheduled", "updated_desc", "completed_desc"],
@@ -55,7 +68,8 @@
   "status_filters": {
     "status": "one of the eight known statuses only",
     "status_class": ["known", "unknown", "invalid", "unknown,invalid"],
-    "mutually_exclusive": true
+    "mutually_exclusive": true,
+    "non_text_storage": "included: status_class=invalid and status_class=unknown,invalid match non-TEXT storage rows"
   },
   "null_fields": {
     "status_entered_at": "unsupported: no complete status-transition event log",
@@ -87,11 +101,20 @@
     "cookies": "refused",
     "session_header": "refused",
     "query_credentials": "refused",
-    "forwarding_headers": "refused",
+    "forwarding_headers": "refused: any name starting with x-forwarded-, plus forward and x-real-ip; refused on the raw header name, so an unlisted x-forwarded-* spelling cannot pass",
     "peers": ["loopback", "rfc1918", "fc00::/7"],
+    "peer_rule": "explicit allowlist membership in 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, ::1/128, fc00::/7 after unwrapping IPv4-mapped addresses; read from the transport peer (scope.client) only, never from a header",
     "comparison": "hmac.compare_digest over sha256 digests",
-    "budget": {"authorized_per_minute": 120, "authorized_burst": 30, "failed_per_minute": 30},
-    "rotation": "restart required; token read at process start"
+    "budget": {
+      "authorized_per_minute": 120,
+      "authorized_burst": 30,
+      "failed_per_minute": 30,
+      "failed_debited_on": "wrong credential only; a passing request does not consume failure capacity and a correct credential is never refused because another caller is guessing",
+      "exhausted_response": "429 {\"error\":\"rate_limited\"} with a Retry-After header, for either bucket",
+      "audit_while_exhausted": "at most one audit record per reason per peer per window"
+    },
+    "audit": "one record per rejection, written by the route verifier; ip is the transport peer, never X-Forwarded-For",
+    "rotation": "token read once, then frozen for the life of the process; restart required to rotate"
   },
   "config": {
     "enabled_key": "kanban.occ_read.enabled",
@@ -103,11 +126,12 @@
   },
   "cursors": {
     "binding": ["board", "filter_digest", "order", "limit", "offset", "snapshot_digest", "latest_event_id", "process_epoch"],
-    "stale": "409 when snapshot digest, latest_event_id or process epoch changes",
-    "invalid": "400 when the MAC does not verify in the current epoch"
+    "stale": "409 when the process epoch is not this process, or when the snapshot digest, latest event id, board, filter, order or limit changes",
+    "invalid": "400 when the cursor is malformed or its MAC does not verify in the current epoch"
   },
   "counts": {
     "invariant": "sum(counts_by_status) == total_filtered",
+    "reconcile": "for every status_class filter, the summary total and its class bucket equal the list total for the same filter",
     "invalid_records": "subset of total_filtered, not additive"
   },
   "error_codes": {

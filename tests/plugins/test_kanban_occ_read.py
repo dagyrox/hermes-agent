@@ -122,6 +122,10 @@ def home(tmp_path):
     kanban_home.mkdir()
     board = kanban_home / "kanban.db"
     conn = sqlite3.connect(board)
+    # WAL is what the production dispatcher uses; it is also the only mode in
+    # which the "-wal"/"-shm" sidecars exist, so the read-only guarantee can
+    # actually be tested against them (B9).
+    conn.execute("PRAGMA journal_mode = WAL")
     _schema(conn)
     # Anchored in the recent past so "expired claim" / "old heartbeat" are real
     # relative to wall-clock ``now`` inside the request transaction.
@@ -192,7 +196,13 @@ def config(monkeypatch, home):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home.parent / "other.db"))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "some-other-board")
     _patch_config(monkeypatch, enabled=True, board="default")
-    return home
+    # Hold a writer connection open so the board stays in WAL mode with live
+    # "-wal"/"-shm" sidecars (closing the last connection checkpoints and
+    # removes them, which would make the sidecar tests vacuous).
+    holder = sqlite3.connect(home / "kanban.db")
+    holder.execute("PRAGMA journal_mode = WAL")
+    yield home
+    holder.close()
 
 
 def _patch_config(monkeypatch, *, enabled: bool, board):
@@ -217,6 +227,10 @@ def app(monkeypatch, config):
     # test's consumption.
     kanban_occ_api._AuthorizedBudget = kanban_occ_api._Budget(per_minute=120, burst=30)
     kanban_occ_api._FailedBudget = kanban_occ_api._Budget(per_minute=30, burst=30)
+    kanban_occ_api._ExhaustedAudit.reset()
+    # The credential is snapshotted once per process (B8). Each test starts
+    # from "not yet snapshotted" so its own environment decides the value.
+    kanban_occ_api._reset_token_snapshot()
     kanban_occ_api.register_routes()
 
     application = FastAPI()
@@ -317,6 +331,14 @@ def test_query_token_is_refused(app):
         ("X-Forwarded-For", "1.2.3.4"),
         ("X-Real-IP", "1.2.3.4"),
         ("X-Forwarded-Proto", "https"),
+        # B7: names that were absent from the old fixed list. A caller must not
+        # be able to pick a forwarding header the server happens not to know.
+        ("X-Forwarded-Prefix", "/evil"),
+        ("X-Forwarded-Uri", "/admin"),
+        ("X-Forwarded-Ssl", "on"),
+        ("X-Forwarded-Scheme", "https"),
+        ("X-Forwarded-Client-Ip", "1.2.3.4"),
+        ("X-Forwarded-Invented-By-A-Future-Proxy", "x"),
     ],
 )
 def test_forwarding_headers_are_refused(app, header, value):
@@ -325,6 +347,75 @@ def test_forwarding_headers_are_refused(app, header, value):
             "/api/plugins/kanban/occ/v1/summary", headers=_auth(**{header: value})
         )
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Peer allowlist (Athena A5 + B3)
+# ---------------------------------------------------------------------------
+
+
+def _verify_from(host):
+    """Call the real verifier with a synthetic scope carrying ``host`` as peer."""
+    from starlette.requests import Request
+
+    from hermes_cli import kanban_occ_api
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": kanban_occ_api.SUMMARY_PATH,
+        "raw_path": kanban_occ_api.SUMMARY_PATH.encode("ascii"),
+        "root_path": "",
+        "headers": [(b"authorization", f"Bearer {TOKEN}".encode("ascii"))],
+        "client": (host, 40000) if host is not None else None,
+        "query_string": b"",
+    }
+    return kanban_occ_api._verify_occ_request(Request(scope))
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [
+        "127.0.0.1",
+        "127.9.9.9",
+        "10.1.2.3",
+        "172.16.0.5",
+        "172.31.255.254",
+        "192.168.1.10",
+        "::1",
+        "fd00::1",
+        "fc00::1",
+        "::ffff:127.0.0.1",   # IPv4-mapped loopback unwraps first
+        "::ffff:10.0.0.7",    # IPv4-mapped RFC1918 unwraps first
+    ],
+)
+def test_allowlisted_peers_are_accepted(app, peer):
+    assert _verify_from(peer).ok is True, peer
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [
+        "8.8.8.8",            # public IPv4
+        "1.1.1.1",            # public IPv4
+        "169.254.169.254",    # link-local / cloud metadata
+        "100.64.0.1",         # CGNAT (RFC 6598)
+        "2001::1",            # Teredo range: is_private accepted this
+        "2001:db8::1",        # IPv6 documentation
+        "192.0.2.1",          # IPv4 documentation
+        "198.18.0.1",         # benchmarking range accepted by is_private
+        "203.0.113.9",        # IPv4 documentation
+        "0.0.0.0",            # unspecified
+        "::ffff:8.8.8.8",     # mapped public address
+        "not-an-ip",          # unparsable
+        "",                   # empty
+        None,                 # no transport peer at all
+    ],
+)
+def test_non_allowlisted_peers_are_refused(app, peer):
+    decision = _verify_from(peer)
+    assert decision.ok is False, peer
+    assert decision.status_code == 401
 
 
 def test_repeated_authorization_header_is_refused(app):
@@ -366,6 +457,81 @@ def test_trailing_slash_request_does_not_reach_a_handler_as_scoped(app):
     assert resp.status_code in {307, 401, 404}
 
 
+def _handler_guard_result(*, principal, raw_path):
+    """Run the real handler guard with a synthetic request state."""
+    from starlette.requests import Request
+
+    from hermes_cli import kanban_occ_api
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": kanban_occ_api.SUMMARY_PATH,
+        "raw_path": raw_path,
+        "root_path": "",
+        "headers": [],
+        "client": ("127.0.0.1", 40000),
+        "query_string": b"",
+    }
+    request = Request(scope)
+    request.state.token_principal = principal
+    return kanban_occ_api._handler_guard(request, kanban_occ_api.SUMMARY_PATH)
+
+
+def test_handler_guard_404s_for_a_session_principal(app):
+    """B9: the handler's own identity check must actually be exercised.
+
+    A cookie session that arrives through an unregistered alias path reaches
+    the handler with *some* principal. It must get 404 — not the data — because
+    it is not the sentinel OCC principal object.
+    """
+    from hermes_cli import kanban_occ_api
+    from hermes_cli.dashboard_auth.base import TokenPrincipal
+
+    sentinel = kanban_occ_api.KANBAN_OCC_PRINCIPAL
+    impostor = TokenPrincipal(
+        principal=sentinel.principal, provider=sentinel.provider, scopes=sentinel.scopes
+    )
+    # Equal by value, different by identity — which is the whole point.
+    assert impostor == sentinel and impostor is not sentinel
+    result = _handler_guard_result(
+        principal=impostor, raw_path=b"/api/plugins/kanban/occ/v1/summary"
+    )
+    assert result is not None
+    assert result.status_code == 404
+    assert json.loads(result.body) == {"error": "not_found"}
+
+
+def test_handler_guard_404s_without_a_principal(app):
+    result = _handler_guard_result(
+        principal=None, raw_path=b"/api/plugins/kanban/occ/v1/summary"
+    )
+    assert result is not None and result.status_code == 404
+
+
+def test_handler_guard_404s_on_a_mismatched_raw_path(app):
+    """Reached through an alias, even the real principal gets 404."""
+    from hermes_cli import kanban_occ_api
+
+    result = _handler_guard_result(
+        principal=kanban_occ_api.KANBAN_OCC_PRINCIPAL,
+        raw_path=b"/api/plugins/kanban/occ/v1/summary/",
+    )
+    assert result is not None and result.status_code == 404
+
+
+def test_handler_guard_accepts_the_real_principal_on_the_exact_path(app):
+    from hermes_cli import kanban_occ_api
+
+    assert (
+        _handler_guard_result(
+            principal=kanban_occ_api.KANBAN_OCC_PRINCIPAL,
+            raw_path=b"/api/plugins/kanban/occ/v1/summary",
+        )
+        is None
+    )
+
+
 def test_disabled_surface_returns_401_even_with_a_valid_token(monkeypatch, app, config):
     _patch_config(monkeypatch, enabled=False, board="default")
     with TestClient(app, client=("127.0.0.1", 40000)) as client:
@@ -373,15 +539,177 @@ def test_disabled_surface_returns_401_even_with_a_valid_token(monkeypatch, app, 
 
 
 def test_missing_token_env_returns_401(monkeypatch, app):
+    """An unset credential closes the surface (no snapshot has been taken yet)."""
+    from hermes_cli import kanban_occ_api
+
     monkeypatch.delenv("HERMES_KANBAN_OCC_READ_TOKEN", raising=False)
+    kanban_occ_api._reset_token_snapshot()
     with TestClient(app, client=("127.0.0.1", 40000)) as client:
         assert _get(client, "summary").status_code == 401
 
 
 def test_short_configured_token_is_treated_as_unconfigured(monkeypatch, app):
+    from hermes_cli import kanban_occ_api
+
     monkeypatch.setenv("HERMES_KANBAN_OCC_READ_TOKEN", "tooshort")
+    kanban_occ_api._reset_token_snapshot()
     with TestClient(app, client=("127.0.0.1", 40000)) as client:
         assert _get(client, "summary", token="tooshort").status_code == 401
+
+
+def test_token_is_snapshotted_once_and_env_rewrite_does_not_rotate_it(monkeypatch, app, config):
+    """B8: the credential is read once. A live environ rewrite must not work.
+
+    The runbook says rotation requires a process restart. If the verifier
+    re-read ``os.environ`` per request, any code in the process could swap the
+    credential without one — so this asserts the *documented* behaviour, in
+    both directions: the old value keeps working and the new one does not.
+    """
+    new_token = "B" * 43
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        assert _get(client, "summary").status_code == 200
+        monkeypatch.setenv("HERMES_KANBAN_OCC_READ_TOKEN", new_token)
+        assert _get(client, "summary", token=new_token).status_code == 401
+        assert _get(client, "summary", token=TOKEN).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting, 429 and audit hygiene (Athena A7 + B1/B2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def audit_records(monkeypatch):
+    """Capture audit writes instead of touching the on-disk log."""
+    from hermes_cli import kanban_occ_api
+    from hermes_cli.dashboard_auth import audit as audit_module
+
+    records: list[dict] = []
+
+    def _capture(event, **fields):
+        records.append({"event": getattr(event, "value", str(event)), **fields})
+
+    monkeypatch.setattr(audit_module, "audit_log", _capture)
+    # _reject_audit imports the symbol lazily, so patching the module attribute
+    # above is enough; this assertion keeps that contract honest.
+    assert kanban_occ_api._reject_audit.__module__ == "hermes_cli.kanban_occ_api"
+    return records
+
+
+def test_successful_requests_do_not_consume_the_failure_budget(app):
+    """B1: a legitimate caller must never be throttled by someone's guessing.
+
+    Before the fix ``_FailedBudget.take()`` ran before the digest compare, so
+    ~30 wrong tokens a minute locked the real caller out of the 120/min ceiling
+    it was promised. Here the failure bucket is small and the success bucket is
+    not: guessing must not touch the caller's budget.
+    """
+    from hermes_cli import kanban_occ_api
+
+    kanban_occ_api._FailedBudget = kanban_occ_api._Budget(per_minute=1, burst=3)
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        for _ in range(10):
+            assert _get(client, "summary", token="Z" * 43).status_code in {401, 429}
+        # The legitimate caller is still served after the guesser is throttled.
+        assert _get(client, "summary").status_code == 200
+        # Moving to a fresh "exhausted" budget, a success still does not debit
+        # the failure bucket: its token count is unchanged by a passing request.
+        assert kanban_occ_api._FailedBudget.retry_after() > 0
+
+
+def test_passing_requests_leave_the_failure_bucket_untouched(app):
+    """The debit is released on success, not merely checked."""
+    from hermes_cli import kanban_occ_api
+
+    budget = kanban_occ_api._Budget(per_minute=1, burst=3)
+    kanban_occ_api._FailedBudget = budget
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        assert _get(client, "summary").status_code == 200
+    # A passing request must not have consumed failure capacity: the bucket can
+    # still absorb its full burst of wrong attempts.
+    for _ in range(3):
+        assert budget.take() is None
+    assert budget.take() is not None
+
+
+def test_failure_budget_exhaustion_returns_429_with_retry_after(app):
+    """B1: throttling is 429 ``rate_limited``, never a credential-shaped 401."""
+    from hermes_cli import kanban_occ_api
+
+    kanban_occ_api._FailedBudget = kanban_occ_api._Budget(per_minute=1, burst=1)
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        assert _get(client, "summary", token="Z" * 43).status_code == 401
+        resp = _get(client, "summary", token="Z" * 43)
+    assert resp.status_code == 429
+    assert json.loads(resp.content) == {"error": "rate_limited"}
+    assert int(resp.headers["retry-after"]) >= 1
+
+
+def test_authorized_budget_exhaustion_returns_429_with_retry_after(app):
+    """B1: the *success* budget is separate and also answers 429."""
+    from hermes_cli import kanban_occ_api
+
+    kanban_occ_api._AuthorizedBudget = kanban_occ_api._Budget(per_minute=1, burst=1)
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        assert _get(client, "summary").status_code == 200
+        resp = _get(client, "summary")
+    assert resp.status_code == 429
+    assert json.loads(resp.content) == {"error": "rate_limited"}
+    assert resp.headers["retry-after"]
+
+
+def test_429_body_and_headers_are_safe(app):
+    from hermes_cli import kanban_occ_api
+
+    kanban_occ_api._AuthorizedBudget = kanban_occ_api._Budget(per_minute=1, burst=1)
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        _get(client, "summary")
+        resp = _get(client, "summary")
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert TOKEN not in resp.text
+
+
+def test_exhausted_budget_audits_once_per_window(app, audit_records):
+    """B1: after exhaustion, auditing is summarized — not one line per attempt."""
+    from hermes_cli import kanban_occ_api
+
+    kanban_occ_api._FailedBudget = kanban_occ_api._Budget(per_minute=1, burst=1)
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        _get(client, "summary", token="Z" * 43)          # 401, one audit line
+        for _ in range(20):
+            assert _get(client, "summary", token="Z" * 43).status_code == 429
+    exhausted = [
+        r for r in audit_records if r.get("reason") == "failure_budget_exhausted"
+    ]
+    assert len(exhausted) == 1, exhausted
+    # The 20 suppressed attempts are counted, but the window wrote one record.
+    assert sum(kanban_occ_api._ExhaustedAudit.suppressed.values()) >= 19
+
+
+def test_each_rejection_is_audited_exactly_once(app, audit_records):
+    """B2: the verifier owns auditing; the seam must not write a second line."""
+    with TestClient(app, client=("192.168.5.5", 40000)) as client:
+        assert _get(client, "summary", token="Z" * 43).status_code == 401
+    mismatch = [r for r in audit_records if r.get("reason") == "credential_mismatch"]
+    seam = [r for r in audit_records if r.get("reason") == "route_credential_rejected"]
+    assert len(mismatch) == 1, audit_records
+    assert seam == [], "the seam must not duplicate a verifier-route rejection"
+    assert mismatch[0]["provider"] == "kanban-occ-read"
+
+
+def test_audit_ip_comes_from_the_peer_not_the_forwarded_header(app, audit_records):
+    """B2: the audit IP is the transport peer, never attacker-controlled text."""
+    with TestClient(app, client=("192.168.5.5", 40000)) as client:
+        resp = client.get(
+            "/api/plugins/kanban/occ/v1/summary",
+            headers=_auth(token="Z" * 43, **{"X-Forwarded-For": "203.0.113.66"}),
+        )
+    assert resp.status_code == 401
+    assert audit_records, "a rejection must still be audited"
+    for record in audit_records:
+        assert record["ip"] == "192.168.5.5", record
+        assert "203.0.113.66" not in json.dumps(record)
 
 
 # ---------------------------------------------------------------------------
@@ -478,14 +806,32 @@ def test_q_control_characters_are_rejected(app):
         assert _get(client, "summary", query="q=a%00b").status_code == 400
 
 
-def test_q_nfc_normalisation(app):
-    """A decomposed query still matches a precomposed stored title."""
-    composed = unicodedata.normalize("NFC", "café")
-    decomposed = unicodedata.normalize("NFD", "café")
+def test_q_nfc_normalisation(app, config):
+    """A decomposed query still matches a precomposed stored title.
+
+    B9: this used to assert ``total_filtered >= 0``, which no implementation
+    could fail. It now inserts a genuinely precomposed row and asserts the
+    match, so breaking the NFC step makes it red.
+    """
+    composed = unicodedata.normalize("NFC", "Café Payment")
+    decomposed = unicodedata.normalize("NFD", "Café Payment")
+    assert composed != decomposed
+
+    conn = sqlite3.connect(config / "kanban.db")
+    conn.execute(
+        "INSERT INTO tasks(id, title, status, created_at) VALUES('t_00000094',?,?,?)",
+        (composed, "todo", 1_799_999_000),
+    )
+    conn.commit()
+    conn.close()
+
     with TestClient(app, client=("127.0.0.1", 40000)) as client:
-        assert composed != decomposed
-        body = json.loads(_get(client, "summary", query="q=" + "cafe").content)
-    assert body["total_filtered"] >= 0  # sanity: no crash on accent paths
+        # The needle is normalised to NFC by ``normalize_q``; the haystack is
+        # NFC-folded in SQL. Without either step this returns nothing.
+        matched = json.loads(_get(client, "summary", query="q=cafe%CC%81").content)
+        unmatched = json.loads(_get(client, "summary", query="q=cafe").content)
+    assert matched["total_filtered"] == 1
+    assert unmatched["total_filtered"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +900,161 @@ def test_blob_status_is_classified_not_decoded_as_text(app, config):
         body = json.loads(_get(client, "tasks", query="limit=100&order=updated_desc").content)
     row = next(t for t in body["tasks"] if t["id"] == "t_00000096")
     assert row["status_class"] == "invalid"
+
+
+def test_blob_status_counts_as_invalid_in_the_summary_too(app, config):
+    """B4: the summary must classify a BLOB b"running" exactly like the list row.
+
+    Before the fix the summary decoded the bytes and added them to
+    ``counts_by_status["running"]`` while the row rendered ``invalid`` — so the
+    strip and the rows disagreed for the same task.
+    """
+    conn = sqlite3.connect(config / "kanban.db")
+    conn.execute(
+        "INSERT INTO tasks(id, title, status, created_at) VALUES('t_00000093','BlobRun',?,?)",
+        (b"running", 1_799_999_000),
+    )
+    conn.commit()
+    conn.close()
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        summary = json.loads(_get(client, "summary").content)
+        listed = json.loads(_get(client, "tasks", query="limit=100&order=updated_desc").content)
+
+    counts = summary["counts_by_status"]
+    row = next(t for t in listed["tasks"] if t["id"] == "t_00000093")
+    assert row["status_class"] == "invalid"
+    assert row["status"] is None, "non-TEXT storage has no text to display"
+    # The seeded board has exactly one real running task (t_00000002).
+    assert counts["running"] == 1, counts
+    assert counts["invalid"] == 1, counts
+    assert sum(counts.values()) == summary["total_filtered"] == listed["total"]
+
+
+def test_summary_and_list_reconcile_per_status_class(app, config):
+    """Every class bucket in the summary equals the filtered list total."""
+    conn = sqlite3.connect(config / "kanban.db")
+    for row in (
+        ("t_00000092", "BlobRow", b"todo"),
+        ("t_00000091", "IntRow", 7),
+        ("t_00000090", "OddRow", "future_state"),
+        ("t_0000008f", "NulRow", "run\x00ning"),
+    ):
+        conn.execute(
+            "INSERT INTO tasks(id, title, status, created_at) VALUES(?,?,?,?)",
+            (*row, 1_799_999_000),
+        )
+    conn.commit()
+    conn.close()
+
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        for status_class, bucket in (
+            ("invalid", "invalid"),
+            ("unknown", "unknown"),
+            ("unknown,invalid", None),
+        ):
+            summary = json.loads(_get(client, "summary", query=f"status_class={status_class}").content)
+            listed = json.loads(
+                _get(
+                    client,
+                    "tasks",
+                    query=f"status_class={status_class}&limit=100&order=updated_desc",
+                ).content
+            )
+            assert summary["total_filtered"] == listed["total"], status_class
+            assert sum(summary["counts_by_status"].values()) == listed["total"], status_class
+            if bucket is not None:
+                assert summary["counts_by_status"][bucket] == listed["total"], status_class
+
+
+def test_status_class_invalid_includes_non_text_storage(app, config):
+    """B4: non-TEXT statuses must appear under the Unknown/Invalid chip.
+
+    ``tasks.status`` has TEXT affinity, so an INTEGER *bound value* is stored
+    as TEXT (that case is ``unknown`` — see
+    ``test_non_status_strings_are_unknown_and_blobs_are_invalid``). To get a
+    genuinely non-TEXT storage class the column must be written as BLOB.
+    """
+    conn = sqlite3.connect(config / "kanban.db")
+    conn.execute(
+        "INSERT INTO tasks(id, title, status, created_at) VALUES('t_00000089','BlobOnly',?,?)",
+        (b"whatever", 1_799_999_000),
+    )
+    conn.execute(
+        "INSERT INTO tasks(id, title, status, created_at) VALUES('t_00000088','BlobKnownWord',?,?)",
+        (b"done", 1_799_999_000),
+    )
+    conn.commit()
+    conn.close()
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        listed = json.loads(
+            _get(client, "tasks", query="status_class=invalid&limit=100&order=updated_desc").content
+        )
+        summary = json.loads(_get(client, "summary", query="status_class=invalid").content)
+    ids = {t["id"] for t in listed["tasks"]}
+    # b"done" decodes to a known word but is not TEXT storage: still invalid,
+    # and still counted under Done by nothing.
+    assert {"t_00000089", "t_00000088"} <= ids
+    assert summary["total_filtered"] == listed["total"] >= 2
+    assert summary["counts_by_status"]["done"] == 0
+
+
+def test_q_does_not_fail_when_a_row_has_invalid_utf8(app, config):
+    """C4/B6: one bad row must never fail the whole page for ``q``.
+
+    CPython's sqlite3 decodes a TEXT argument strictly before calling a Python
+    UDF, so folding the raw column raised "user-defined function raised
+    exception" and turned summary+list into 503 for every caller.
+    """
+    conn = sqlite3.connect(config / "kanban.db")
+    conn.execute(
+        "INSERT INTO tasks(id, title, status, created_at) VALUES('t_00000087',?,?,?)",
+        (b"Bad \xff\xfe utf8 title", "todo", 1_799_999_000),
+    )
+    conn.execute(
+        "INSERT INTO tasks(id, title, status, created_at) VALUES('t_00000086','Good searchable row',?,?)",
+        ("todo", 1_799_999_000),
+    )
+    conn.commit()
+    conn.close()
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        summary = _get(client, "summary", query="q=searchable")
+        listed = _get(client, "tasks", query="q=searchable&limit=100&order=updated_desc")
+        touched = _get(client, "tasks", query="q=bad&limit=100&order=updated_desc")
+    assert summary.status_code == 200, summary.content
+    assert listed.status_code == 200, listed.content
+    assert json.loads(summary.content)["total_filtered"] == 1
+    # The bad row simply does not match a needle; it is not dropped from the
+    # unfiltered page (see test_unsupported_status_values_stay_visible).
+    assert touched.status_code == 200
+    assert json.loads(touched.content)["total"] == 0
+
+
+def test_q_does_not_match_blob_or_integer_titles_by_repr(app, config):
+    """A BLOB title matches on its real text, never the Python ``b'…'`` repr."""
+    conn = sqlite3.connect(config / "kanban.db")
+    conn.execute(
+        "INSERT INTO tasks(id, title, status, created_at) VALUES('t_00000085',?,'todo',?)",
+        (b"uniqueblobtoken", 1_799_999_000),
+    )
+    conn.execute(
+        "INSERT INTO tasks(id, title, status, created_at) VALUES('t_00000084',?,'todo',?)",
+        (12345, 1_799_999_000),
+    )
+    conn.commit()
+    conn.close()
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        blob_match = json.loads(_get(client, "summary", query="q=uniqueblobtoken").content)
+        repr_probe = json.loads(_get(client, "summary", query="q=b%27uniqueblobtoken").content)
+        int_probe = json.loads(_get(client, "summary", query="q=12345").content)
+    # The BLOB's actual bytes are searchable...
+    assert blob_match["total_filtered"] == 1
+    # ...but the repr wrapper b' is never in the haystack.
+    assert repr_probe["total_filtered"] == 0
+    # ``title`` is TEXT-affinity, so this INTEGER is stored (and searched) as
+    # the string "12345": an honest text match, not a repr of the number.
+    assert int_probe["total_filtered"] == 1
+    listed = json.loads(_get(client, "tasks", query="q=12345&limit=100").content)
+    assert next(t for t in listed["tasks"] if t["id"] == "t_00000084")["title"] == "12345"
 
 
 def test_invalid_utf8_id_is_counted_and_kept(app, config):
@@ -701,29 +1202,95 @@ def test_cursor_bound_to_filters(app):
 
 
 def test_cursor_detects_change_without_any_event_row(app, config):
-    """A heartbeat update writes no event; the digest must still catch it."""
+    """A heartbeat update writes no event; the digest must still catch it.
+
+    B9: the old version ran under ``updated_desc`` — where the heartbeat is not
+    part of the digest — and accepted 200, so it could never fail. Under
+    ``heartbeat_attention`` the heartbeat *is* the sort key, so the digest must
+    move and the stale cursor must be refused with 409. The same statement
+    under ``updated_desc`` is the control: there the digest does *not* move,
+    which is exactly why the original test was vacuous.
+    """
+    db = config / "kanban.db"
     with TestClient(app, client=("127.0.0.1", 40000)) as client:
-        first = json.loads(_get(client, "tasks", query="limit=2&order=updated_desc").content)
-        conn = sqlite3.connect(config / "kanban.db")
+        # heartbeat_attention is bound to status=running; the seeded board has
+        # exactly one running row, so page with limit=1 over a status filter
+        # that has several rows instead and rely on the digest, which covers
+        # the heartbeat of *every* row in the filtered sequence.
+        first = json.loads(
+            _get(client, "tasks", query="status=running&order=heartbeat_attention&limit=1").content
+        )
+        assert [t["id"] for t in first["tasks"]] == ["t_00000002"]
+
+        # Issue a cursor over the same running filter but with a page size that
+        # leaves a second page: add a second running row first.
+        conn = sqlite3.connect(db)
         conn.execute(
-            "UPDATE tasks SET last_heartbeat_at = ? WHERE id = 't_00000002'",
-            (1_799_999_999,),
+            "INSERT INTO tasks(id, title, status, created_at, last_heartbeat_at)"
+            " VALUES('t_00000080','Second runner','running',?,?)",
+            (1_799_999_000, 1_799_999_000),
         )
         conn.commit()
         conn.close()
-        second = _get(
+
+        paged = json.loads(
+            _get(client, "tasks", query="status=running&order=heartbeat_attention&limit=1").content
+        )
+        cursor = paged["next_cursor"]
+        assert cursor, paged
+
+        # Touch a heartbeat without writing any event row.
+        conn = sqlite3.connect(db)
+        events_before = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = last_heartbeat_at + 900"
+            " WHERE id = 't_00000002'"
+        )
+        conn.commit()
+        events_after = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+        conn.close()
+        assert events_before == events_after, "the fixture must not write an event"
+
+        stale = _get(
             client,
             "tasks",
-            query=f"limit=2&order=updated_desc&cursor={first['next_cursor']}",
+            query=f"status=running&order=heartbeat_attention&limit=1&cursor={cursor}",
         )
-    assert second.status_code in {409, 200}
-    if second.status_code == 200:
-        # If the changed row is not in this page's ordering window, the digest
-        # of the whole filtered sequence still changed; assert we did not
-        # silently repeat a row.
-        ids_first = {t["id"] for t in first["tasks"]}
-        ids_second = {t["id"] for t in json.loads(second.content)["tasks"]}
-        assert not (ids_first & ids_second)
+
+    assert stale.status_code == 409, stale.content
+    assert json.loads(stale.content) == {"error": "cursor_stale"}
+
+
+def test_cursor_from_a_previous_process_epoch_is_stale_not_invalid(app, config):
+    """B5: a restart must yield 409 ``cursor_stale``, not 400 ``cursor_invalid``.
+
+    The per-process HMAC key is gone after a restart, so an old cursor can
+    never verify. Without an explicit epoch the caller would be told its cursor
+    was malformed, and the documented recovery ("start again at page 1") would
+    never be reached.
+    """
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        first = json.loads(_get(client, "tasks", query="limit=2&order=updated_desc").content)
+        cursor = first["next_cursor"]
+        assert cursor
+
+        # Simulate a restart: new key, new epoch.
+        occ._PROCESS_CURSOR_KEY = None
+        occ._PROCESS_CURSOR_EPOCH = None
+
+        resp = _get(
+            client, "tasks", query=f"limit=2&order=updated_desc&cursor={cursor}"
+        )
+        # A cursor minted in the *new* epoch still works.
+        fresh = json.loads(_get(client, "tasks", query="limit=2&order=updated_desc").content)
+        ok = _get(
+            client,
+            "tasks",
+            query=f"limit=2&order=updated_desc&cursor={fresh['next_cursor']}",
+        )
+    assert resp.status_code == 409, resp.content
+    assert json.loads(resp.content) == {"error": "cursor_stale"}
+    assert ok.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +1321,51 @@ def test_reads_do_not_modify_the_database(app, config):
             assert _get(client, "task", query="task_id=t_00000001").status_code == 200
     after = (db.stat().st_size, db.stat().st_mtime_ns)
     assert before == after
+
+
+def test_reads_do_not_touch_the_wal_or_shm_sidecars(app, config):
+    """B9: the fixture board is now in WAL mode, so the WAL half is exercised.
+
+    A read-only connection must never checkpoint, truncate or grow the WAL —
+    a read that mutates the operator's sidecar files is a write in disguise.
+    """
+    db = config / "kanban.db"
+    wal = db.with_name(db.name + "-wal")
+    shm = db.with_name(db.name + "-shm")
+    assert wal.exists(), "fixture must be in WAL mode for this test to mean anything"
+
+    def snapshot():
+        return {
+            path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+            for path in (db, wal, shm)
+            if path.exists()
+        }
+
+    before = snapshot()
+    with TestClient(app, client=("127.0.0.1", 40000)) as client:
+        for _ in range(3):
+            assert _get(client, "summary").status_code == 200
+            assert _get(client, "tasks", query="limit=100&order=updated_desc").status_code == 200
+            assert _get(client, "task", query="task_id=t_00000001").status_code == 200
+    assert snapshot() == before
+
+
+def test_readonly_connection_reports_wal_mode(app, config):
+    """The read connection sees a WAL board (asserted via its own handle)."""
+    db = config / "kanban.db"
+    check = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        assert check.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    finally:
+        check.close()
+    # ...and the service's own authorizer refuses to run that PRAGMA, which is
+    # the belt to ``query_only``'s braces.
+    conn = occ.open_readonly_connection(db)
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("PRAGMA journal_mode").fetchone()
+    finally:
+        conn.close()
 
 
 def test_board_path_cannot_escape_the_kanban_home(tmp_path):

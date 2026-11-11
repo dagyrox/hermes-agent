@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Tuple
 
 from fastapi import Request
@@ -62,6 +63,27 @@ _token_routes: set[str] = set()
 TokenVerifier = Callable[[Request], Any]
 _route_verifiers: dict[str, TokenVerifier] = {}
 _lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class RouteVerifierDecision:
+    """Optional rich rejection for a route verifier.
+
+    A verifier may return one of these instead of ``principal | None`` when the
+    rejection needs a status other than 401 — throttling is the motivating case
+    (429 + ``Retry-After``). The dataclass lives here, not in the consumer, so
+    any future route-scoped provider can use it without importing that module.
+    ``principal is None`` means "rejected".
+    """
+
+    principal: Optional[TokenPrincipal] = None
+    status_code: int = 401
+    error: str = "unauthenticated"
+    retry_after: Optional[int] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.principal is not None
 
 # Canonical token-route paths are narrow by construction: ASCII, absolute, no
 # percent-encoding, query/fragment, empty or dot segments, or trailing slash.
@@ -225,23 +247,35 @@ async def _route_scoped_token_request(
 
     HEAD/OPTIONS are included in the refusal: Starlette would otherwise answer
     them without ever invoking the handler.
+
+    **Audit ownership.** A route that binds its own verifier owns its audit:
+    the verifier knows *why* it refused and can attribute the peer correctly,
+    and only it can tell a wrong credential from an exhausted budget. This
+    seam therefore writes **no** record for a verifier-route rejection (B2) —
+    the old second ``route_credential_rejected`` line both duplicated every
+    failure and, through ``_client_ip``, took its IP from ``X-Forwarded-For``.
+    Legacy non-verifier routes keep their existing seam auditing unchanged.
     """
     if request.scope.get("root_path", "") != "":
-        return _unauthorized(request, path, reason="non_empty_root_path")
+        return _unauthorized(request, path, reason="non_empty_root_path", audit=False)
     if request.scope.get("raw_path") != path.encode("ascii"):
-        return _unauthorized(request, path, reason="raw_path_mismatch")
+        return _unauthorized(request, path, reason="raw_path_mismatch", audit=False)
 
     try:
         result = verifier(request)
-        # Accept either ``(principal, unreachable)`` (the seam's documented
-        # shape) or a bare ``principal | None``. A route verifier has no
-        # "backing store unreachable" concept — it fails closed to 401 — and
-        # tolerating both shapes removes an easy mistake that would otherwise
-        # surface as a 503 on every request.
+        # Accept the seam's ``(principal, unreachable)`` shape, a bare
+        # ``principal | None``, or a rich decision object carrying an explicit
+        # status (429 + Retry-After for throttling). Tolerating all three keeps
+        # a simple verifier simple without forcing every rejection through 401.
         if isinstance(result, tuple) and len(result) == 2:
             principal = result[0]
+            rejection: Optional[Response] = None
+        elif isinstance(result, RouteVerifierDecision):
+            principal = result.principal if result.ok else None
+            rejection = None if result.ok else _decision_response(result)
         else:
             principal = result
+            rejection = None
     except Exception as exc:  # noqa: BLE001 — auth boundary: fail closed, no text
         _log.warning(
             "dashboard-auth: route verifier for %s raised %s",
@@ -251,7 +285,9 @@ async def _route_scoped_token_request(
         return JSONResponse({"error": "auth_unavailable"}, status_code=503)
 
     if principal is None:
-        return _unauthorized(request, path, reason="route_credential_rejected")
+        if rejection is not None:
+            return rejection
+        return _unauthorized(request, path, reason="route_credential_rejected", audit=False)
 
     if request.method != "GET":
         return JSONResponse(
@@ -265,15 +301,31 @@ async def _route_scoped_token_request(
     return await call_next(request)
 
 
-def _unauthorized(request: Request, path: str, *, reason: str) -> JSONResponse:
-    """Uniform 401 for route-scoped credentials (reason is audit-only)."""
-    audit_log(
-        AuditEvent.TOKEN_AUTH_FAILURE,
-        provider="route-scoped",
-        reason=reason,
-        path=path,
-        ip=_client_ip(request),
+def _decision_response(decision: RouteVerifierDecision) -> JSONResponse:
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+    if decision.retry_after is not None:
+        headers["Retry-After"] = str(decision.retry_after)
+    return JSONResponse(
+        {"error": decision.error},
+        status_code=decision.status_code,
+        headers=headers,
     )
+
+
+def _unauthorized(request: Request, path: str, *, reason: str, audit: bool = True) -> JSONResponse:
+    """Uniform 401 for route-scoped credentials (reason is audit-only).
+
+    ``audit=False`` is used on paths owned by a route verifier, which has
+    already written its own single, peer-correct record.
+    """
+    if audit:
+        audit_log(
+            AuditEvent.TOKEN_AUTH_FAILURE,
+            provider="route-scoped",
+            reason=reason,
+            path=path,
+            ip=_client_ip(request),
+        )
     return JSONResponse({"error": "unauthenticated"}, status_code=401)
 
 
