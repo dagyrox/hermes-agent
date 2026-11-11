@@ -428,8 +428,9 @@ def _query_pairs(scope: dict) -> list[tuple[str, str]]:
 #: guarantee of one record per attempt: once the budget is exhausted, a wrong
 #: credential is answered 429 and audited as ``failure_budget_exhausted`` at
 #: most once per reason per peer per window (see :func:`_throttled`), so beyond
-#: that point the trail shows the throttled peer and a suppressed count rather
-#: than a record for each guess.
+#: that point the trail shows that the peer was throttled, once per window,
+#: and no record for each guess (the suppressed count is kept in memory only
+#: and is not audited).
 _AUDIT_WINDOW_SECONDS: float = 60.0
 
 
