@@ -128,21 +128,23 @@ def _normalize_board_for_config(board: str) -> str:
     return normalized
 
 
-def _board_db_path(board: str):
+def _kanban_home():
+    """The kanban root, resolved through ``kanban_db`` (HOME override aware)."""
     from hermes_cli.kanban_db import kanban_home
 
-    return occ.resolve_board_db_path(board, kanban_home=kanban_home())
+    return kanban_home()
+
+
+def _board_db_path(board: str):
+    return occ.resolve_board_db_path(board, kanban_home=_kanban_home())
 
 
 def _board_exists(board: str) -> bool:
     """A configured board must already exist; it is never created."""
-    if board == "default":
-        return _board_db_path(board).is_file()
     try:
-        _board_db_path(board)
+        return _board_db_path(board).is_file()
     except occ.OccReadError:
         return False
-    return (_board_db_path(board)).is_file()
 
 
 def _valid_configured_token(value: Optional[str]) -> Optional[str]:
@@ -246,13 +248,18 @@ def _peer_is_private(scope: dict) -> bool:
 
 
 def _header_values(scope: dict, name: bytes) -> list[bytes]:
-    """All raw values for ``name`` (lowercase bytes) in order.
+    """All raw values for ``name`` in order.
 
     Counted from ``scope["headers"]`` rather than ``headers.get`` so a repeated
     header is visible: an application that folds duplicates could be tricked
-    into accepting the second value.
+    into accepting the second value. Compared case-insensitively because ASGI
+    *requires* lowercase names but a non-conforming server must not be able to
+    slip a duplicate past this check.
     """
-    return [value for key, value in scope.get("headers", []) if key.lower() == name]
+    target = name.lower()
+    return [
+        value for key, value in scope.get("headers", []) if key.lower() == target
+    ]
 
 
 def _query_pairs(scope: dict) -> list[tuple[str, str]]:
@@ -317,14 +324,14 @@ def _verify_occ_request(request: Request) -> Optional[TokenPrincipal]:
         return None
 
     headers = scope.get("headers", [])
-    for key, _value in headers:
-        lowered = key.lower()
-        if lowered in _FORWARDING_HEADERS:
-            _reject_audit("forwarding_header_present", scope)
-            return None
-        if lowered in _COOKIE_HEADERS:
-            _reject_audit("cookie_or_session_header_present", scope)
-            return None
+    presented_headers = {key.lower() for key, _value in headers}
+    for banned in (_FORWARDING_HEADERS | _COOKIE_HEADERS) & presented_headers:
+        _reject_audit(
+            "forwarding_header_present" if banned in _FORWARDING_HEADERS
+            else "cookie_or_session_header_present",
+            scope,
+        )
+        return None
 
     if _query_pairs(scope):
         for key, _value in _query_pairs(scope):
@@ -501,7 +508,7 @@ def _run_occ_read(operation: Callable[[Any, int], dict[str, Any]], board: str) -
 
     conn = None
     try:
-        conn = occ.open_board(board)
+        conn = occ.open_board(board, kanban_home=_kanban_home())
         now = occ._begin(conn)
         payload = operation(conn, now)
         return _json_response(payload)

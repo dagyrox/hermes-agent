@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Awaitable, Callable, Optional, Tuple
+from typing import Any, Awaitable, Callable, Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
@@ -56,8 +56,10 @@ _log = logging.getLogger(__name__)
 _token_routes: set[str] = set()
 # Route-local verifiers. A path registered with its own verifier NEVER consults
 # the global provider stack: that keeps a route-scoped credential from
-# authenticating anywhere else (e.g. the gateway drain route).
-TokenVerifier = Callable[[Request], Tuple[Optional[TokenPrincipal], Optional[str]]]
+# authenticating anywhere else (e.g. the gateway drain route). A verifier may
+# return ``(principal, unreachable)`` like :func:`authenticate_token`, or just
+# a bare ``principal | None``.
+TokenVerifier = Callable[[Request], Any]
 _route_verifiers: dict[str, TokenVerifier] = {}
 _lock = threading.Lock()
 
@@ -230,7 +232,16 @@ async def _route_scoped_token_request(
         return _unauthorized(request, path, reason="raw_path_mismatch")
 
     try:
-        principal, _unreachable = verifier(request)
+        result = verifier(request)
+        # Accept either ``(principal, unreachable)`` (the seam's documented
+        # shape) or a bare ``principal | None``. A route verifier has no
+        # "backing store unreachable" concept — it fails closed to 401 — and
+        # tolerating both shapes removes an easy mistake that would otherwise
+        # surface as a 503 on every request.
+        if isinstance(result, tuple) and len(result) == 2:
+            principal = result[0]
+        else:
+            principal = result
     except Exception as exc:  # noqa: BLE001 — auth boundary: fail closed, no text
         _log.warning(
             "dashboard-auth: route verifier for %s raised %s",

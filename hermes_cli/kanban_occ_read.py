@@ -415,10 +415,14 @@ def build_predicates(filters: Filters) -> tuple[str, list[Any]]:
     params: list[Any] = []
 
     if filters.q:
+        # Fold the needle too: SQL folds the haystack, so an untouched needle
+        # would never match "PAYMENT" against "payment". Both sides must go
+        # through the same deterministic NFC+casefold.
+        needle = occ_fold(filters.q)
         clauses.append(
             "(instr(occ_fold(t.title), ?) > 0 OR instr(occ_fold(t.id), ?) > 0)"
         )
-        params.extend([filters.q, filters.q])
+        params.extend([needle, needle])
     if filters.assignee is not None:
         clauses.append("t.assignee = ?")
         params.append(filters.assignee)
@@ -843,14 +847,17 @@ def read_summary(conn: sqlite3.Connection, *, board: str, filters: Filters,
         if entry["id_raw"] is None or entry["id_key"] is None:
             invalid_records += 1
 
+    # Facets honour the same predicate builder as counts and rows, so a tenant
+    # excluded by ``exclude_tenant`` cannot reappear in the filter UI.
     assignees = [
         _decode_text(row["assignee_blob"])
         for row in conn.execute(
             _BASE_CTE
             + "SELECT DISTINCT k.assignee_blob AS assignee_blob FROM tasks t "
-            "JOIN k ON k.id IS t.id "
-            "WHERE t.status IS NOT 'archived' AND k.assignee_type = 'text' "
-            "ORDER BY k.assignee_blob"
+            "JOIN k ON k.id IS t.id LEFT JOIN ev ON ev.task_id = t.id "
+            f"WHERE {where} AND k.assignee_type = 'text' "
+            "ORDER BY k.assignee_blob",
+            params,
         )
     ]
     tenants = [
@@ -858,9 +865,10 @@ def read_summary(conn: sqlite3.Connection, *, board: str, filters: Filters,
         for row in conn.execute(
             _BASE_CTE
             + "SELECT DISTINCT k.tenant_blob AS tenant_blob FROM tasks t "
-            "JOIN k ON k.id IS t.id "
-            "WHERE t.status IS NOT 'archived' AND k.tenant_type = 'text' "
-            "ORDER BY k.tenant_blob"
+            "JOIN k ON k.id IS t.id LEFT JOIN ev ON ev.task_id = t.id "
+            f"WHERE {where} AND k.tenant_type = 'text' "
+            "ORDER BY k.tenant_blob",
+            params,
         )
     ]
 
@@ -995,7 +1003,7 @@ def read_task(conn: sqlite3.Connection, *, board: str, task_id: str,
     }
 
     events = [
-        {"kind": _decode_text(r["kind"]), "created_at": r["created_at"]}
+        {"kind": _decode_text(r["kind_blob"]), "created_at": r["created_at"]}
         for r in conn.execute(
             "SELECT typeof(kind) AS kind_type, CAST(kind AS BLOB) AS kind_blob, "
             "created_at FROM task_events WHERE task_id = ? "
