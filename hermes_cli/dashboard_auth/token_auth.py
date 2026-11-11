@@ -54,18 +54,66 @@ _log = logging.getLogger(__name__)
 # Exact paths that accept non-interactive bearer-token auth. A route registers
 # itself here at import/startup; the seam only acts on registered paths.
 _token_routes: set[str] = set()
+# Route-local verifiers. A path registered with its own verifier NEVER consults
+# the global provider stack: that keeps a route-scoped credential from
+# authenticating anywhere else (e.g. the gateway drain route).
+TokenVerifier = Callable[[Request], Tuple[Optional[TokenPrincipal], Optional[str]]]
+_route_verifiers: dict[str, TokenVerifier] = {}
 _lock = threading.Lock()
 
+# Canonical token-route paths are narrow by construction: ASCII, absolute, no
+# percent-encoding, query/fragment, empty or dot segments, or trailing slash.
+# Anything else could alias another path once a proxy or router normalises it.
+_UNSAFE_PATH_CHARS = frozenset("%?#\\")
 
-def register_token_route(path: str) -> None:
+
+def _is_canonical_route_path(path: object) -> bool:
+    if not isinstance(path, str) or not path.isascii() or not path.startswith("/"):
+        return False
+    if path.endswith("/") or "//" in path:
+        return False
+    if _UNSAFE_PATH_CHARS.intersection(path):
+        return False
+    if any(ord(char) <= 0x20 or ord(char) == 0x7F for char in path):
+        return False
+    return not any(segment in {".", ".."} for segment in path.split("/"))
+
+
+def register_token_route(path: str, *, verifier: Optional[TokenVerifier] = None) -> None:
     """Mark ``path`` (exact match) as token-authable.
 
     Idempotent. Call at module import / app setup so the seam knows which
     routes to guard. Registering a route does NOT make it public — it makes
     it authenticate by token instead of by session cookie.
+
+    When ``verifier`` is supplied the route is authenticated *only* by that
+    verifier; the global provider stack is never consulted for it. The
+    verifier binding is immutable for the lifetime of the registration:
+    re-registering the same path with a different verifier (including
+    switching between ``None`` and a verifier) raises :class:`ValueError`
+    so a later plugin cannot silently take over an existing route.
     """
+    if not _is_canonical_route_path(path):
+        raise ValueError(
+            "token route must be a canonical exact ASCII path "
+            "(absolute, no percent-encoding, query, fragment, empty/dot "
+            "segments or trailing slash)"
+        )
     with _lock:
+        if path in _route_verifiers:
+            existing = _route_verifiers[path]
+            if existing is not verifier:
+                raise ValueError(
+                    f"token route {path!r} is already registered with a "
+                    "different verifier"
+                )
+        elif path in _token_routes and verifier is not None:
+            raise ValueError(
+                f"token route {path!r} is already registered without a verifier"
+            )
         _token_routes.add(path)
+        if verifier is not None:
+            _route_verifiers[path] = verifier
 
 
 def is_token_route(path: str) -> bool:
@@ -74,10 +122,21 @@ def is_token_route(path: str) -> bool:
         return path in _token_routes
 
 
+def route_verifier(path: str) -> Optional[TokenVerifier]:
+    """Return the verifier bound to ``path``, or ``None``.
+
+    Shared by the middleware and by handler-level identity guards so the two
+    can never disagree about which paths are route-scoped.
+    """
+    with _lock:
+        return _route_verifiers.get(path)
+
+
 def clear_token_routes() -> None:
-    """Test-only: drop all registered token routes."""
+    """Test-only: drop all registered token routes and their verifiers."""
     with _lock:
         _token_routes.clear()
+        _route_verifiers.clear()
 
 
 def _client_ip(request: Request) -> str:
@@ -141,6 +200,72 @@ def authenticate_token(
     return None, unreachable
 
 
+async def _route_scoped_token_request(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+    path: str,
+    verifier: TokenVerifier,
+) -> Response:
+    """Authorize one request on a route that carries its own verifier.
+
+    Order matters and is deliberate:
+
+    1. Raw-path identity first. ``request.url.path`` is percent-decoded by the
+       ASGI server, so ``/x%2Fy`` and ``/x/y`` can collapse to the same string.
+       A route-scoped credential must only ever unlock the exact bytes the
+       caller sent, and a non-empty ``root_path`` (a mount prefix) means the
+       app is not serving this path directly.
+    2. The route verifier, and *only* it. No global provider is consulted, so a
+       scoped read credential can never authenticate on another token route.
+    3. Method check *after* authentication: an unauthenticated caller learns
+       nothing about the route's method set, and an authorized non-GET is
+       refused here rather than in a handler that may mutate state.
+
+    HEAD/OPTIONS are included in the refusal: Starlette would otherwise answer
+    them without ever invoking the handler.
+    """
+    if request.scope.get("root_path", "") != "":
+        return _unauthorized(request, path, reason="non_empty_root_path")
+    if request.scope.get("raw_path") != path.encode("ascii"):
+        return _unauthorized(request, path, reason="raw_path_mismatch")
+
+    try:
+        principal, _unreachable = verifier(request)
+    except Exception as exc:  # noqa: BLE001 — auth boundary: fail closed, no text
+        _log.warning(
+            "dashboard-auth: route verifier for %s raised %s",
+            path,
+            type(exc).__name__,
+        )
+        return JSONResponse({"error": "auth_unavailable"}, status_code=503)
+
+    if principal is None:
+        return _unauthorized(request, path, reason="route_credential_rejected")
+
+    if request.method != "GET":
+        return JSONResponse(
+            {"error": "method_not_allowed"},
+            status_code=405,
+            headers={"Allow": "GET"},
+        )
+
+    request.state.token_principal = principal
+    request.state.token_authenticated = True
+    return await call_next(request)
+
+
+def _unauthorized(request: Request, path: str, *, reason: str) -> JSONResponse:
+    """Uniform 401 for route-scoped credentials (reason is audit-only)."""
+    audit_log(
+        AuditEvent.TOKEN_AUTH_FAILURE,
+        provider="route-scoped",
+        reason=reason,
+        path=path,
+        ip=_client_ip(request),
+    )
+    return JSONResponse({"error": "unauthenticated"}, status_code=401)
+
+
 async def token_auth_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
@@ -162,6 +287,10 @@ async def token_auth_middleware(
     path = request.url.path
     if not is_token_route(path):
         return await call_next(request)
+
+    verifier = route_verifier(path)
+    if verifier is not None:
+        return await _route_scoped_token_request(request, call_next, path, verifier)
 
     principal, unreachable = authenticate_token(request)
     if principal is not None:

@@ -2588,3 +2588,27 @@ async def stream_events(ws: WebSocket):
             await ws.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# OCC read-only machine contract (dagyrox/or7-platform#263)
+# ---------------------------------------------------------------------------
+#
+# Three static GET endpoints under /occ/v1/ serve the Or7 Command Center a
+# bounded, sanitized projection of THIS board. They are deliberately not part
+# of the dashboard's session-authenticated surface above: they authenticate a
+# dedicated service credential on their own exact paths (see
+# ``hermes_cli.kanban_occ_api``), read a read-only connection, and never expose
+# task bodies, comments, event payloads, logs, PIDs or host paths.
+#
+# Nothing is activated here. The provider config ``kanban.occ_read.enabled``
+# defaults to false, so these routes answer 401 until an operator provisions
+# the credential and enables the surface.
+try:  # pragma: no cover - import-time wiring, exercised by the API tests
+    from hermes_cli.kanban_occ_api import register_routes as _register_occ_routes
+    from hermes_cli.kanban_occ_api import router as occ_router
+
+    router.include_router(occ_router)
+    _register_occ_routes()
+except Exception as _occ_exc:  # noqa: BLE001 - plugin load must never crash
+    log.warning("kanban: OCC read contract not mounted (%s)", type(_occ_exc).__name__)
