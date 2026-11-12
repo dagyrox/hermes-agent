@@ -1,0 +1,275 @@
+{
+  "witness_version": 1,
+  "provider": "dagyrox/hermes-agent",
+  "consumer": "dagyrox/or7-platform",
+  "issue": "dagyrox/or7-platform#263",
+  "card": "t_1174b82d",
+  "run": 927,
+  "packet": "docs/work-packets/occ-kanban-provider-implementation.md",
+  "schema_version": 1,
+  "review_status": "changes_required_at_844819cc1_round4_findings_repaired_unreviewed",
+  "review_history": [
+    {
+      "head": "74e5c29526cb7606a54eca7a15924ef41456cfd0",
+      "reviewer": "athena",
+      "round": 2,
+      "verdict": "CHANGES_REQUIRED",
+      "findings": "B1-B10",
+      "record": "docs/work-packets/occ-kanban-visual/athena-provider-review.md"
+    }
+  ],
+  "review_status_note": "Athena round 4 reviewed 844819cc1 and returned CHANGES_REQUIRED for two new defects in the round-3 repair (R4-1 unwindowed alias-probe audit, R4-2 over-broad audit window suppressing credential_mismatch); it accepted B8 and closed B1, B2, B9, B10, R3-1 and R3-2. Both are repaired on 10ce15746ca and Athena has not reviewed that head. Approval is recorded only by Athena's next exact-head review; this file must not self-declare one.",
+  "installation_status": "not_installed",
+  "activation_status": "not_activated",
+  "endpoints": [
+    {
+      "path": "/api/plugins/kanban/occ/v1/summary",
+      "method": "GET",
+      "params": [
+        "q",
+        "status",
+        "status_class",
+        "assignee",
+        "tenant",
+        "exclude_tenant",
+        "order"
+      ]
+    },
+    {
+      "path": "/api/plugins/kanban/occ/v1/tasks",
+      "method": "GET",
+      "params": [
+        "q",
+        "status",
+        "status_class",
+        "assignee",
+        "tenant",
+        "exclude_tenant",
+        "order",
+        "limit",
+        "cursor"
+      ]
+    },
+    {
+      "path": "/api/plugins/kanban/occ/v1/task",
+      "method": "GET",
+      "params": [
+        "task_id"
+      ]
+    }
+  ],
+  "limits": {
+    "limit_default": 50,
+    "limit_max": 100,
+    "q_max_unicode_scalars": 80,
+    "cursor_max_bytes": 512,
+    "response_max_bytes": 1048576,
+    "detail_events_max": 20,
+    "detail_runs_max": 5
+  },
+  "statuses": {
+    "known": [
+      "triage",
+      "todo",
+      "scheduled",
+      "ready",
+      "running",
+      "blocked",
+      "review",
+      "done"
+    ],
+    "count_keys": [
+      "triage",
+      "todo",
+      "scheduled",
+      "ready",
+      "running",
+      "blocked",
+      "review",
+      "done",
+      "unknown",
+      "invalid"
+    ],
+    "archived_excluded": true,
+    "classifier": "one classifier over (typeof(status), CAST(status AS BLOB)) is used by the summary, the list and the detail; the class of a row never differs between views",
+    "unknown_means": "TEXT storage whose value decodes to a string that is not one of the eight known statuses",
+    "invalid_means": "non-TEXT storage (BLOB/INTEGER/REAL/NULL), an empty TEXT value, undecodable bytes, or a control/format character. A BLOB whose bytes spell a known word is still invalid.",
+    "status_field_note": "task.status on the wire is the stored text for TEXT storage and null for every other storage class"
+  },
+  "orders": {
+    "values": [
+      "oldest_status",
+      "heartbeat_attention",
+      "priority_age",
+      "scheduled",
+      "updated_desc",
+      "completed_desc"
+    ],
+    "status_requirements": {
+      "heartbeat_attention": [
+        "running"
+      ],
+      "priority_age": [
+        "ready"
+      ],
+      "completed_desc": [
+        "done"
+      ]
+    },
+    "tiebreaker": "task id ascending, then internal rowid"
+  },
+  "status_filters": {
+    "status": "one of the eight known statuses only",
+    "status_class": [
+      "known",
+      "unknown",
+      "invalid",
+      "unknown,invalid"
+    ],
+    "mutually_exclusive": true,
+    "non_text_storage": "included: status_class=invalid and status_class=unknown,invalid match non-TEXT storage rows"
+  },
+  "null_fields": {
+    "status_entered_at": "unsupported: no complete status-transition event log",
+    "scheduled_at": "unsupported: no scheduled_at column",
+    "reason_preview": "unsupported: tasks.block_reason does not exist; block_kind is not mapped",
+    "links": "empty in v1: no authoritative typed-reference storage"
+  },
+  "task_row_fields": [
+    "id",
+    "title",
+    "status",
+    "status_class",
+    "assignee",
+    "tenant",
+    "priority",
+    "created_at",
+    "updated_at",
+    "status_entered_at",
+    "scheduled_at",
+    "completed_at",
+    "parent_id",
+    "child_count",
+    "links",
+    "reason_preview",
+    "running"
+  ],
+  "running_fields": [
+    "run_id",
+    "claimed_at",
+    "last_heartbeat_at",
+    "claim_stale"
+  ],
+  "claim_stale_rule": "status == running AND current_run_id matches a task_runs row with status running AND claim_expires < now AND last_heartbeat_at is not null AND now - last_heartbeat_at > kanban_db.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS",
+  "forbidden_payload_fields": [
+    "body",
+    "result",
+    "last_failure_error",
+    "worker_pid",
+    "worker_pid_run",
+    "workspace_path",
+    "branch_name",
+    "claim_lock",
+    "session_id",
+    "event_payload",
+    "comment_body",
+    "attachment_stored_path",
+    "run_summary",
+    "run_metadata",
+    "run_error",
+    "model_override",
+    "provider_override",
+    "command_line",
+    "environment"
+  ],
+  "auth": {
+    "scheme": "bearer",
+    "credential_env": "HERMES_KANBAN_OCC_READ_TOKEN",
+    "credential_shape": "ASCII token68, 43-256 chars, must not equal the dashboard session token",
+    "route_scope": "exact static path only; raw_path byte equality and empty root_path required",
+    "global_provider_stack": "never consulted for these three paths",
+    "cookies": "refused",
+    "session_header": "refused",
+    "query_credentials": "refused",
+    "forwarding_headers": "refused: any header name starting with x-forwarded-, plus forwarded and x-real-ip; matched by prefix on the raw header name, so an unlisted x-forwarded-* spelling cannot pass",
+    "peers": [
+      "loopback",
+      "rfc1918",
+      "fc00::/7"
+    ],
+    "peer_rule": "explicit allowlist membership in 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, ::1/128, fc00::/7 after unwrapping IPv4-mapped addresses; read from the transport peer (scope.client) only, never from a header",
+    "comparison": "hmac.compare_digest over sha256 digests",
+    "budget": {
+      "authorized_per_minute": 120,
+      "authorized_burst": 30,
+      "failed_per_minute": 30,
+      "failed_debited_on": "wrong credential only; a passing request does not consume failure capacity and a correct credential is never refused because another caller is guessing",
+      "exhausted_response": "429 {\"error\":\"rate_limited\"} with a Retry-After header, for either bucket",
+      "audit_while_exhausted": "at most one audit record per reason per peer per window; the exhausted-budget records (failure_budget_exhausted, authorized_budget_exhausted) are suppressed on the (reason, peer) pair, and the pre-comparison reasons on the reason alone"
+    },
+    "audit": "attributed to the transport peer, never X-Forwarded-For. The route verifier writes the record for its own rejections: the pre-comparison reasons (config, peer, header, query, syntax) at most once per reason per 60s window, and a credential_mismatch on every attempt that is actually compared and debited. The auth seam writes it for the root_path/raw_path alias probes, which never reach the verifier, at most once per reason per 60s window. No rejection is written twice. Writing a record is not the same as writing one per attempt: an unauthenticated loop is summarized, never fully recorded.",
+    "rotation": "token read, validated and frozen on the first request after startup; from then on no os.environ rewrite can swap it and no hot reload exists, so rotation requires a restart. It cannot be read during route registration: registration runs inside the plugin import that web_server performs while still executing its own module body, and validation consults web_server._SESSION_TOKEN, so an eager read there deadlocks the import (measured).",
+    "audit_volume": "summarized for the reasons that precede the credential comparison, and for alias probes: each of those reasons writes at most one record per 60s window (the pre-comparison set and the alias probes window on the reason alone, so one peer's probe can suppress another peer's record of the same reason), so an unauthenticated loop cannot amplify the audit log. credential_mismatch is NOT windowed: while failure-budget capacity remains, every wrong credential is recorded with its peer, because that record is what describes who was guessing. Once the failure budget is exhausted, however, no credential_mismatch is written at all: each further wrong credential is answered 429 {\"error\":\"rate_limited\"} and recorded as failure_budget_exhausted at most once per reason per peer per 60s window, with the suppressed attempts not logged. So the peer of a wrong credential is recorded only for attempts within the budget; beyond it the audit shows only that the source was throttled (one record per peer per window), not how many attempts it made."
+  },
+  "config": {
+    "enabled_key": "kanban.occ_read.enabled",
+    "enabled_default": false,
+    "board_key": "kanban.occ_read.board",
+    "board_default": null,
+    "board_must_exist": true,
+    "board_must_be_normalised": true
+  },
+  "cursors": {
+    "binding": [
+      "board",
+      "filter_digest",
+      "order",
+      "limit",
+      "offset",
+      "snapshot_digest",
+      "latest_event_id",
+      "process_epoch"
+    ],
+    "stale": "409 when the process epoch is not this process, or when the snapshot digest, latest event id, board, filter, order or limit changes",
+    "invalid": "400 when the cursor is malformed or its MAC does not verify in the current epoch"
+  },
+  "counts": {
+    "invariant": "sum(counts_by_status) == total_filtered",
+    "reconcile": "for every status_class filter, the summary total and its class bucket equal the list total for the same filter",
+    "invalid_records": "subset of total_filtered, not additive"
+  },
+  "error_codes": {
+    "401": [
+      "unauthenticated"
+    ],
+    "400": [
+      "invalid_request",
+      "invalid_order",
+      "invalid_task_id",
+      "cursor_invalid"
+    ],
+    "404": [
+      "not_found"
+    ],
+    "409": [
+      "cursor_stale"
+    ],
+    "405": [
+      "method_not_allowed"
+    ],
+    "429": [
+      "rate_limited"
+    ],
+    "503": [
+      "board_unavailable",
+      "schema_unsupported",
+      "response_too_large",
+      "auth_unavailable",
+      "internal_error"
+    ]
+  },
+  "headers": {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff"
+  }
+}

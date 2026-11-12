@@ -2899,6 +2899,17 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Read-only machine contract for the Or7 Command Center (OCC).
+        # Off by default and off unless every condition below holds; the
+        # three /api/plugins/kanban/occ/v1/ routes stay mounted fail-closed.
+        # Enabling this requires a separately approved operator provisioning
+        # step (dedicated HERMES_KANBAN_OCC_READ_TOKEN credential); see
+        # docs/occ-kanban-read-runbook.md. "board" must already exist and must
+        # already equal its normalised slug — it is never created or rewritten.
+        "occ_read": {
+            "enabled": False,
+            "board": None,
+        },
         # Opt-in early admission; unsupported transports fail closed.
         # Live activation is a separate operator decision.
         "worker_preflight": {
