@@ -4747,7 +4747,12 @@ class GatewaySlashCommandsMixin:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            resolve_all=resolve_all,
+            decided_by=source.user_id,
+        )
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -4801,6 +4806,7 @@ class GatewaySlashCommandsMixin:
         count = resolve_gateway_approval(
             session_key, "deny", resolve_all=resolve_all,
             reason=reason or None,
+            decided_by=source.user_id,
         )
         if not count:
             return t("gateway.deny.no_pending")

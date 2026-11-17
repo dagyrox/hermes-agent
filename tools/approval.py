@@ -224,6 +224,35 @@ def _get_session_platform() -> str:
         return os.getenv("HERMES_SESSION_PLATFORM", "") or ""
 
 
+def get_interactive_owner_context() -> Optional[dict]:
+    """Return authenticated gateway-owner identity for a live owner turn.
+
+    Platform context is inherited by cron jobs, Kanban workers, and delegated
+    children, so platform presence alone is not proof that an owner can answer
+    an authorization prompt. Those unattended contexts fail closed here.
+    """
+    from agent.delegation_context import is_delegated_child_process_context
+
+    if (
+        env_var_enabled("HERMES_CRON_SESSION")
+        or bool(os.environ.get("HERMES_KANBAN_TASK"))
+        or is_delegated_child_process_context()
+    ):
+        return None
+    from gateway.session_context import get_session_env
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "") or ""
+    owner_id = get_session_env("HERMES_SESSION_USER_ID", "") or ""
+    if not platform or not owner_id:
+        return None
+    return {
+        "platform": platform,
+        "owner_id": owner_id,
+        "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", "") or "",
+        "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "") or "",
+    }
+
+
 def _is_gateway_approval_context() -> bool:
     """True when this call is inside a gateway/API session.
 
@@ -2029,7 +2058,7 @@ _permanent_approved: set = set()
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "result", "reason", "decided_by")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2039,6 +2068,8 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        # Authenticated platform user id supplied by the resolving adapter.
+        self.decided_by: Optional[str] = None
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -2072,7 +2103,8 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             decided_by: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2083,6 +2115,9 @@ def resolve_gateway_approval(session_key: str, choice: str,
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
+
+    *decided_by* is the authenticated platform user id supplied by the
+    adapter. It is never inferred from the shared session key.
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
@@ -2100,6 +2135,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     for entry in targets:
         entry.result = choice
+        entry.decided_by = decided_by or None
         if reason:
             entry.reason = reason
         entry.event.set()
@@ -3173,6 +3209,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         session_key=session_key,
         surface=surface,
         choice=_outcome,
+        decided_by=entry.decided_by,
     )
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 

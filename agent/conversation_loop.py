@@ -1795,28 +1795,31 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
+                from hermes_cli.middleware import apply_llm_request_middleware
+                from hermes_cli.providers import (
+                    is_aggregator,
+                    is_routing_aggregator,
+                )
 
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
-                    _original_api_kwargs = dict(api_kwargs)
-                    _llm_middleware_trace = []
+                _llm_request_mw = apply_llm_request_middleware(
+                    api_kwargs,
+                    task_id=effective_task_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    session_id=agent.session_id or "",
+                    platform=agent.platform or "",
+                    model=agent.model,
+                    provider=agent.provider,
+                    base_url=agent.base_url,
+                    api_mode=agent.api_mode,
+                    api_call_count=api_call_count,
+                    is_aggregator=is_aggregator(agent.provider),
+                    is_routing_aggregator=is_routing_aggregator(agent.provider),
+                    egress_path="conversation",
+                )
+                api_kwargs = _llm_request_mw.payload
+                _original_api_kwargs = _llm_request_mw.original_payload
+                _llm_middleware_trace = _llm_request_mw.trace
 
                 try:
                     from hermes_cli.plugins import (

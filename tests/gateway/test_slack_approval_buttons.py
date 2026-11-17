@@ -218,7 +218,9 @@ class TestSlackApprovalAction:
             await adapter._handle_approval_action(ack, body, action)
 
         ack.assert_called_once()
-        mock_resolve.assert_called_once_with("agent:main:slack:group:C1:1111", "once")
+        mock_resolve.assert_called_once_with(
+            "agent:main:slack:group:C1:1111", "once", decided_by="U_NORBERT",
+        )
 
         # Message should be updated with decision
         mock_client.chat_update.assert_called_once()
@@ -271,7 +273,9 @@ class TestSlackApprovalAction:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._handle_approval_action(ack, body, action)
 
-        mock_resolve.assert_called_once_with("session-key", "deny")
+        mock_resolve.assert_called_once_with(
+            "session-key", "deny", decided_by="U_ALICE",
+        )
         update_kwargs = mock_client.chat_update.call_args[1]
         assert "Denied by alice" in update_kwargs["text"]
 

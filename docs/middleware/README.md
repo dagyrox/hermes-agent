@@ -72,9 +72,13 @@ def on_tool_execution(**kwargs):
 ```
 
 If multiple plugins register the same execution middleware kind, Hermes runs
-them as a nested chain in registration order. Middleware failures are fail-open:
-Hermes logs a warning and continues with the next middleware or the base
-runtime path.
+them as a nested chain in registration order. Middleware failures are fail-open
+by default: Hermes logs a warning and continues with the next middleware or the
+base runtime path. Security request middleware can set ``fails_closed = True``
+on its registered callback. Fail-closed request middleware runs after ordinary
+request transformers as an immutable validator: it may return no request (or
+the identical request), and an exception aborts the operation before provider
+transport.
 
 ## Execution Order
 

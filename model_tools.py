@@ -1189,23 +1189,20 @@ def handle_function_call(
 
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:
-        try:
-            from hermes_cli.middleware import apply_tool_request_middleware
+        from hermes_cli.middleware import apply_tool_request_middleware
 
-            _tool_request_mw = apply_tool_request_middleware(
-                function_name,
-                function_args,
-                task_id=task_id or "",
-                session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=turn_id or "",
-                api_request_id=api_request_id or "",
-            )
-            function_args = _tool_request_mw.payload
-            _tool_original_args = _tool_request_mw.original_payload
-            _tool_middleware_trace = _tool_request_mw.trace
-        except Exception as _mw_err:
-            logger.debug("tool_request middleware error: %s", _mw_err)
+        _tool_request_mw = apply_tool_request_middleware(
+            function_name,
+            function_args,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=turn_id or "",
+            api_request_id=api_request_id or "",
+        )
+        function_args = _tool_request_mw.payload
+        _tool_original_args = _tool_request_mw.original_payload
+        _tool_middleware_trace = _tool_request_mw.trace
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:

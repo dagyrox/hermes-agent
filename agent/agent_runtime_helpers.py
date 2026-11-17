@@ -2423,23 +2423,20 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         function_args = {}
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
-    try:
-        from hermes_cli.middleware import apply_tool_request_middleware
+    from hermes_cli.middleware import apply_tool_request_middleware
 
-        if not skip_tool_request_middleware:
-            _tool_request_mw = apply_tool_request_middleware(
-                function_name,
-                function_args,
-                task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-            )
-            function_args = _tool_request_mw.payload
-            _tool_middleware_trace = _tool_request_mw.trace
-    except Exception as _mw_err:
-        logger.debug("tool_request middleware error: %s", _mw_err)
+    if not skip_tool_request_middleware:
+        _tool_request_mw = apply_tool_request_middleware(
+            function_name,
+            function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
+        function_args = _tool_request_mw.payload
+        _tool_middleware_trace = _tool_request_mw.trace
 
     # Check plugin hooks for a block or approval directive before executing.
     block_message: Optional[str] = None

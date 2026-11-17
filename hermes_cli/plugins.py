@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.metadata
 import importlib.util
 import inspect
@@ -1952,18 +1953,66 @@ class PluginManager:
     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
         """Call registered middleware callbacks for *kind*.
 
-        Each callback is isolated so one plugin cannot break the base runtime
-        path. Middleware that wants to change behavior must return the shape
+        Callbacks remain fail-open by default for compatibility. A security
+        middleware may opt into fail-closed behavior by setting a truthy
+        ``fails_closed`` attribute on the registered callback; its exception
+        then aborts the protected operation before the transport boundary.
+        Middleware that wants to change behavior must return the shape
         documented by the caller-specific contract.
         """
         callbacks = self._middleware.get(kind, [])
+        payload_key = (
+            "request" if kind in {"llm_request", "api_request"}
+            else "args" if kind == "tool_request"
+            else None
+        )
+        # Request transformers run first. Fail-closed callbacks are final,
+        # immutable validators so no later plugin can rewrite a request after
+        # security policy approved it.
+        if payload_key:
+            callbacks = sorted(
+                callbacks,
+                key=lambda cb: bool(getattr(cb, "fails_closed", False)),
+            )
+        current_kwargs = dict(kwargs)
         results: List[Any] = []
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
+                call_kwargs = current_kwargs
+                validator_payload = None
+                if payload_key and getattr(cb, "fails_closed", False):
+                    validator_payload = copy.deepcopy(current_kwargs.get(payload_key))
+                    call_kwargs = dict(current_kwargs)
+                    call_kwargs[payload_key] = copy.deepcopy(validator_payload)
+                ret = cb(**call_kwargs)
+                if (
+                    validator_payload is not None
+                    and call_kwargs[payload_key] != validator_payload
+                ):
+                    raise RuntimeError(
+                        "fail-closed request middleware mutated its validation payload"
+                    )
                 if ret is not None:
+                    if payload_key and isinstance(ret, dict):
+                        replacement = ret.get(payload_key)
+                        if isinstance(replacement, dict):
+                            if getattr(cb, "fails_closed", False):
+                                if replacement != current_kwargs.get(payload_key):
+                                    raise RuntimeError(
+                                        "fail-closed request middleware must be a validator, not a transformer"
+                                    )
+                            else:
+                                current_kwargs[payload_key] = replacement
                     results.append(ret)
             except Exception as exc:
+                if getattr(cb, "fails_closed", False):
+                    logger.error(
+                        "Fail-closed middleware '%s' callback %s raised; aborting request: %s",
+                        kind,
+                        getattr(cb, "__name__", repr(cb)),
+                        exc,
+                    )
+                    raise
                 logger.warning(
                     "Middleware '%s' callback %s raised: %s",
                     kind,
