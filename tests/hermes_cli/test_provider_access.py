@@ -59,7 +59,7 @@ def test_explicit_mode_changes_only_primary_and_snapshot_survives_revert(tmp_pat
     root, _ = _root(tmp_path, monkeypatch)
     cfg = yaml.safe_load((root / "config.yaml").read_text())
     cfg["agent_backend_failover"] = {"enabled": True, "roles": {"talos": [
-        {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+        {"kind": "api", "provider": "openai-codex", "model": "gpt-6-luna"},
         {"kind": "claude_code", "model": "claude-sonnet-5-5"},
         {"kind": "api", "provider": "deepseek", "model": "deepseek-flash"},
     ]}}

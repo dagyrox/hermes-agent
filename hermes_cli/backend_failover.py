@@ -43,7 +43,7 @@ _CANONICAL_ROUTES = {
     "default": (("api", "openai-codex", "gpt-6.1-sol"), ("claude_code", None, "claude-sonnet-5-5"), ("api", "deepseek", "deepseek-flash")),
     "hyperion": (("api", "openai-codex", "gpt-6-luna"), ("claude_code", None, "claude-sonnet-5-5"), ("api", "deepseek", "deepseek-flash")),
     "athena": (("claude_code", None, "claude-opus-5-5"), ("api", "openai-codex", "gpt-6.1-sol"), ("api", "deepseek", "deepseek-flash")),
-    "talos": (("api", "openai-codex", "gpt-6.1-sol"), ("claude_code", None, "claude-sonnet-5-5"), ("api", "deepseek", "deepseek-flash")),
+    "talos": (("api", "openai-codex", "gpt-6-luna"), ("claude_code", None, "claude-sonnet-5-5"), ("api", "deepseek", "deepseek-flash")),
     "apollo": (("claude_code", None, "claude-sonnet-5-5"), ("api", "openai-codex", "gpt-6.1-sol"), ("api", "deepseek", "deepseek-flash")),
 }
 _TOP_LEVEL_KEYS = frozenset({"enabled", "max_attempts_per_leg", "roles"})

@@ -13,13 +13,13 @@ def test_canonical_chain_requires_exactly_three_legs_and_flash_final():
     from hermes_cli.backend_failover import ConfigError, resolve_role_chain
 
     valid = _chain(
-        {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+        {"kind": "api", "provider": "openai-codex", "model": "gpt-6-luna"},
         {"kind": "claude_code", "model": "claude-sonnet-5-5"},
         {"kind": "api", "provider": "deepseek", "model": "deepseek-flash"},
     )
     chain = resolve_role_chain(valid, "talos")
     assert [(leg.kind, leg.provider, leg.model) for leg in chain] == [
-        ("api", "openai-codex", "gpt-6.1-sol"),
+        ("api", "openai-codex", "gpt-6-luna"),
         ("claude_code", None, "claude-sonnet-5-5"),
         ("api", "deepseek", "deepseek-flash"),
     ]
@@ -283,7 +283,7 @@ def test_config_validation_does_not_self_certify_runtime_capabilities():
     from hermes_cli import backend_failover as failover
 
     chain = failover.resolve_role_chain(_chain(
-            {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+            {"kind": "api", "provider": "openai-codex", "model": "gpt-6-luna"},
             {"kind": "claude_code", "model": "claude-sonnet-5-5"},
             {"kind": "api", "provider": "deepseek", "model": "deepseek-flash"},
         ), "talos")
@@ -358,7 +358,7 @@ def test_status_distinguishes_requested_activation_from_live_activation():
     from hermes_cli.backend_failover import build_status
 
     cfg = _chain(
-        {"kind": "api", "provider": "openai-codex", "model": "gpt-6.1-sol"},
+        {"kind": "api", "provider": "openai-codex", "model": "gpt-6-luna"},
         {"kind": "claude_code", "model": "claude-sonnet-5-5"},
         {"kind": "api", "provider": "deepseek", "model": "deepseek-flash"},
     )

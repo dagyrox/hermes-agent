@@ -87,10 +87,12 @@ def native_protocol(tmp_path, monkeypatch):
             json.dumps({
                 PROVIDER_TO_MODELS_DEV["openai-codex"]: {
                     "models": {
-                        "gpt-6.1-sol": {
+                        model: {
                             "tool_call": True,
                             "limit": {"context": 200000, "output": 8192},
                         }
+                        for kind, provider, model in _CANONICAL_ROUTES[name]
+                        if provider == "openai-codex"
                     }
                 }
             })
@@ -448,6 +450,8 @@ def test_healthy_codex_supervisor_executes_real_terminal(native_protocol):
     f["state"]["status"] = 200
     task, events = f["launch"]()
     assert task.status == "done", f["kb"].worker_log_path(task.id).read_text()[-5000:]
+    assert task.model_override is None and task.provider_override is None
+    assert all(request["model"] == "gpt-6-luna" for request in f["requests"])
     assert (f["workspace"] / "preflight_proof.txt").read_text().strip() == str(
         f["workspace"]
     )
@@ -458,6 +462,7 @@ def test_healthy_codex_supervisor_executes_real_terminal(native_protocol):
     assert not any(c in json.dumps(probe) for c in CANARIES)
     passed = next(e for e in events if e.kind == "preflight_passed")
     assert passed.payload["route"] == "supervisor"
+    assert passed.payload["model"] == "gpt-6-luna"
     attempt = next(e for e in events if e.kind == "commented")
     assert passed.id < attempt.id < next(e.id for e in events if e.kind == "completed")
     assert not any("oauth" in path for path in f["paths"])
@@ -567,7 +572,7 @@ def test_availability_timeout_advances_supervisor_to_next_leg(native_protocol):
     # The primary leg is recorded as degraded with stage and code.
     assert any(
         "Backend degraded before tool execution: kind=api, provider=openai-codex, "
-        "model=gpt-6.1-sol, stage=probe, code=probe_timeout" in body
+        "model=gpt-6-luna, stage=probe, code=probe_timeout" in body
         for body in comments
     )
     # The supervisor advanced to the Claude subscription leg AND admitted it:

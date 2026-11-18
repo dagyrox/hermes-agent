@@ -1,0 +1,106 @@
+{
+  "project": "Agent routing / Or7 QBO protection",
+  "repository": "dagyrox/hermes-agent",
+  "consumer_repository": "dagyrox/or7-platform",
+  "related_issue": 270,
+  "related_qbo_pr": 31,
+  "acting_lane": "Talos",
+  "card": "t_b67a5d5d",
+  "run": 985,
+  "work_packet": "/root/.hermes/work-packets/talos-luna-primary-migration.md",
+  "baseline_commit": "2a785350583a848c856ce1f36e4f61b156beab77",
+  "self_excluded": true,
+  "successor_commit": "Resolved from published PR head; manifest cannot self-hash its containing commit.",
+  "activation": {
+    "candidate_configured": "openai-codex/gpt-6-luna",
+    "live_config_changed": false,
+    "worker_live_luna": false,
+    "implementation_worker": "openai-codex/gpt-6.1-sol"
+  },
+  "verification": {
+    "python": "/usr/local/lib/hermes-agent/venv/bin/python",
+    "red_command": "HERMES_PYTHON=/usr/local/lib/hermes-agent/venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_talos_luna_routing.py --file-retries 0 -q",
+    "red_exit": 1,
+    "red_expected_failures": 5,
+    "final_command": "HERMES_PYTHON=/usr/local/lib/hermes-agent/venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_talos_luna_routing.py tests/hermes_cli/test_backend_failover.py tests/hermes_cli/test_backend_failover_worker.py tests/hermes_cli/test_provider_access.py tests/hermes_cli/test_worker_only_failover_e2e.py tests/hermes_cli/test_kanban_worker_preflight_native_e2e.py tests/hermes_cli/test_native_worker_cli.py tests/hermes_cli/test_kanban_worker_preflight.py tests/hermes_cli/test_kanban_worker_spawn_toolsets.py tests/hermes_cli/test_kanban_worker_preflight_e2e.py -j 4 --file-retries 0 -q",
+    "final_exit": 0,
+    "test_files": [
+      "tests/hermes_cli/test_talos_luna_routing.py",
+      "tests/hermes_cli/test_backend_failover.py",
+      "tests/hermes_cli/test_backend_failover_worker.py",
+      "tests/hermes_cli/test_provider_access.py",
+      "tests/hermes_cli/test_worker_only_failover_e2e.py",
+      "tests/hermes_cli/test_kanban_worker_preflight_native_e2e.py",
+      "tests/hermes_cli/test_native_worker_cli.py",
+      "tests/hermes_cli/test_kanban_worker_preflight.py",
+      "tests/hermes_cli/test_kanban_worker_spawn_toolsets.py",
+      "tests/hermes_cli/test_kanban_worker_preflight_e2e.py"
+    ],
+    "passed": 248,
+    "failed": 0,
+    "retries": 0,
+    "elapsed_seconds": 91.9,
+    "lint_command": "/usr/local/lib/hermes-agent/venv/bin/python -m ruff check .",
+    "lint_exit": 0,
+    "lint_warning": "Pre-existing invalid noqa directive at run_agent.py:107.",
+    "full_suite_run": false,
+    "hosted_ci": "Read live exact-head run at publication; not claimed by this local receipt."
+  },
+  "files": [
+    {
+      "path": "hermes_cli/backend_failover.py",
+      "bytes": 19121,
+      "sha256": "e9ebeb0f4bdc1aa4c54ff45c16d8290cd297fc5d5be23e6b170870a64bcd8647"
+    },
+    {
+      "path": "docs/agentic-operations/backend-failover.canonical.yaml",
+      "bytes": 2066,
+      "sha256": "13a0037d0dae229c7019d0fea75bdad090fecbd47136638c5ccda0e0e7a4b80b"
+    },
+    {
+      "path": "docs/agentic-operations/agent-backend-failover.md",
+      "bytes": 39299,
+      "sha256": "2b260ebbd72934b9450eec5fc520ce8cb2c0801fa65d7deedc9b35f52645aa68"
+    },
+    {
+      "path": "docs/agentic-operations/talos-luna-activation.md",
+      "bytes": 8789,
+      "sha256": "add97ee07e01a6dc2ebbfb56741726a070f852640743e4f0cc04a4a86fc5f465"
+    },
+    {
+      "path": "docs/agentic-operations/talos-luna-verification.log",
+      "bytes": 2943,
+      "sha256": "046ee0e491b76f96d0f866e9808b12eb203a90abea5be508920193c26ae255f0"
+    },
+    {
+      "path": "tests/hermes_cli/test_talos_luna_routing.py",
+      "bytes": 6098,
+      "sha256": "e0827c52194f06617e77a0f587b250202dd02ffa27a066377f5dd3cdd243e635"
+    },
+    {
+      "path": "tests/hermes_cli/test_backend_failover.py",
+      "bytes": 14514,
+      "sha256": "55c570cb602619da693e6844b55a742601e14bf29cf20c15c62ca763a21cf513"
+    },
+    {
+      "path": "tests/hermes_cli/test_backend_failover_worker.py",
+      "bytes": 67734,
+      "sha256": "e3f79f4ac7ced4f03c6a9fda5252ed0ca0d575018e8523818619e4f02b6088f3"
+    },
+    {
+      "path": "tests/hermes_cli/test_provider_access.py",
+      "bytes": 7674,
+      "sha256": "3fcba10e65315f89ba574f6cc891dce200d3e6b74077d17a87eb656fe4b7d9fd"
+    },
+    {
+      "path": "tests/hermes_cli/test_worker_only_failover_e2e.py",
+      "bytes": 11711,
+      "sha256": "d8dc95f8e265fd03e17908b1aacc4ecded7ac33f105ec0da8fea906bc131f2bd"
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_worker_preflight_native_e2e.py",
+      "bytes": 27217,
+      "sha256": "4ba80f095b60982c21aeae4c411bbce6f83763fe562d421d8dff97de150a62dd"
+    }
+  ]
+}

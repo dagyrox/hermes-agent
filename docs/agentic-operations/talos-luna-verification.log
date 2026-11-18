@@ -1,0 +1,36 @@
+▶ no local venv — using Nix dev venv via HERMES_PYTHON: /usr/local/lib/hermes-agent/venv/bin/python
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+▶ pre-compiling bytecode cache
+▶ launching test runner
+Discovered 10 test files (~160 tests) under ['tests/hermes_cli/test_talos_luna_routing.py', 'tests/hermes_cli/test_backend_failover.py', 'tests/hermes_cli/test_backend_failover_worker.py', 'tests/hermes_cli/test_provider_access.py', 'tests/hermes_cli/test_worker_only_failover_e2e.py', 'tests/hermes_cli/test_kanban_worker_preflight_native_e2e.py', 'tests/hermes_cli/test_native_worker_cli.py', 'tests/hermes_cli/test_kanban_worker_preflight.py', 'tests/hermes_cli/test_kanban_worker_spawn_toolsets.py', 'tests/hermes_cli/test_kanban_worker_preflight_e2e.py']; running with -j 4
+[ 13.8% |    22/~160 | ✓36 | ✗ 0] ✓ tests/hermes_cli/test_backend_failover.py (36✓, 0.9s)
+[ 56.2% |    90/~160 | ✓130 | ✗  0] ✓ tests/hermes_cli/test_backend_failover_worker.py (94✓, 4.4s)
+[ 70.6% |   113/~160 | ✓177 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_preflight.py (47✓, 7.1s)
+[ 78.1% |   125/~160 | ✓190 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_spawn_toolsets.py (13✓, 3.1s)
+[ 80.6% |   129/~160 | ✓194 | ✗  0] ✓ tests/hermes_cli/test_provider_access.py (4✓, 0.9s)
+[ 83.8% |   134/~160 | ✓200 | ✗  0] ✓ tests/hermes_cli/test_talos_luna_routing.py (6✓, 0.7s)
+[ 86.9% |   139/~160 | ✓210 | ✗  0] ✓ tests/hermes_cli/test_native_worker_cli.py (10✓, 3.8s)
+[ 88.8% |   142/~160 | ✓213 | ✗  0] ✓ tests/hermes_cli/test_worker_only_failover_e2e.py (3✓, 4.8s)
+[ 94.4% |   151/~160 | ✓229 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_preflight_e2e.py (16✓, 39.5s)
+[100.0% |   160/~160 | ✓248 | ✗  0] ✓ tests/hermes_cli/test_kanban_worker_preflight_native_e2e.py (19✓, 91.0s)
+
+=== Summary: 10 files, 248 tests passed, 0 failed (100% complete) in 91.9s (4 workers) ===
+  Durations cached to test_durations.json (10 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   10
+  Total subprocess CPU-wall: 156.1s  (runner wall: 91.9s, parallelism: 4x)
+  P50: 4.43s  P90: 90.96s  P95: 90.96s  P99: 90.96s  Max: 90.96s
+  <1s: 3 files (30%)  <2s: 3 files (30%)
+  Top 10 slowest:
+     90.96s  tests/hermes_cli/test_kanban_worker_preflight_native_e2e.py
+     39.47s  tests/hermes_cli/test_kanban_worker_preflight_e2e.py
+      7.07s  tests/hermes_cli/test_kanban_worker_preflight.py
+      4.81s  tests/hermes_cli/test_worker_only_failover_e2e.py
+      4.43s  tests/hermes_cli/test_backend_failover_worker.py
+      3.79s  tests/hermes_cli/test_native_worker_cli.py
+      3.11s  tests/hermes_cli/test_kanban_worker_spawn_toolsets.py
+      0.93s  tests/hermes_cli/test_backend_failover.py
+      0.87s  tests/hermes_cli/test_provider_access.py
+      0.68s  tests/hermes_cli/test_talos_luna_routing.py

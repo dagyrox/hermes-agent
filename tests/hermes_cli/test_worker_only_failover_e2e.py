@@ -151,7 +151,7 @@ def _talos_chain_json() -> str:
         {
             "kind": "api",
             "provider": "openai-codex",
-            "model": "gpt-6.1-sol",
+            "model": "gpt-6-luna",
             "reasoning_effort": "high",
         },
         {

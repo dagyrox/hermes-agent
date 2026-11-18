@@ -51,8 +51,12 @@ Frozen role chains (not open for debate, reproduced verbatim as the implementati
 | Hermes/default | `openai-codex` `gpt-6.1-sol` | Claude Code subscription `Sonnet5.5` | `deepseek` `deepseek-flash` |
 | Hyperion | `openai-codex` `gpt-6-luna` | Claude Code subscription `Sonnet5.5` | `deepseek` `deepseek-flash` |
 | Athena | Claude Code subscription `Opus5.5` | `openai-codex` `gpt-6.1-sol` | `deepseek` `deepseek-flash` |
-| Talos | `openai-codex` `gpt-6.1-sol` | Claude Code subscription `Sonnet5.5` | `deepseek` `deepseek-flash` |
+| Talos | `openai-codex` `gpt-6-luna` | Claude Code subscription `Sonnet5.5` | `deepseek` `deepseek-flash` |
 | Apollo | Claude Code subscription `Sonnet5.5` | `openai-codex` `gpt-6.1-sol` | `deepseek` `deepseek-flash` |
+
+Talos's owner-approved Luna migration is staged in the canonical map. See
+[`talos-luna-activation.md`](talos-luna-activation.md) for the coordinated
+code/config activation and rollback gates; this table is not live-worker evidence.
 
 Hard constraints carried into every section below:
 
@@ -305,7 +309,7 @@ agent_backend_failover:
       - {kind: api, provider: openai-codex, model: "gpt-6.1-sol"}
       - {kind: api, provider: deepseek, model: "deepseek-flash"}
     talos:
-      - {kind: api, provider: openai-codex, model: "gpt-6.1-sol"}
+      - {kind: api, provider: openai-codex, model: "gpt-6-luna"}
       - {kind: claude_code, model: "claude-sonnet-5-5", capability_mode: full}
       - {kind: api, provider: deepseek, model: "deepseek-flash"}
     apollo:

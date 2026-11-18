@@ -44,7 +44,7 @@ def test_read_only_smoke_commands_expose_no_write_or_lifecycle_tools(monkeypatch
 
     monkeypatch.setattr(backend_smoke, "_resolve_hermes_argv", lambda: ["/opt/hermes"])
     api = backend_smoke.build_smoke_command(
-        profile="talos", provider="openai-codex", model="gpt-6.1-sol"
+        profile="talos", provider="openai-codex", model="gpt-6-luna"
     )
     claude = backend_smoke.build_smoke_command(
         profile="athena", provider="claude-code-cli", model="claude-opus-5-5"
@@ -852,7 +852,7 @@ def test_workspace_execution_path_runs_real_edit_and_test(tmp_path):
     [
         ("talos", "anthropic", "claude-sonnet-5-5"),
         ("talos", "openai", "gpt-6.1-sol"),
-        ("talos", "openai-codex", "gpt-6-luna"),
+        ("talos", "openai-codex", "gpt-6.1-sol"),
         ("sentinel", "deepseek", "deepseek-flash"),
     ],
 )
